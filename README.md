@@ -53,3 +53,8 @@ The first product target is local S3-compatible development and debugging. Other
 The current roadmap starts with project documentation and specification, then moves toward a minimal local S3-compatible server, request signing diagnostics, presigned URLs, snapshots, multipart uploads, an embedded local UI, compatibility testing, replay, failure injection, and eventually trusted packaged releases.
 
 Compatibility should be treated as something to prove, not something to claim in advance.
+
+## License
+
+Licensed under the Apache License, Version 2.0.
+See [LICENSE](./LICENSE.txt).
