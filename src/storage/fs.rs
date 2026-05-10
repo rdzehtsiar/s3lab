@@ -1069,8 +1069,9 @@ fn corrupt_state(path: impl Into<PathBuf>, message: impl Into<String>) -> Storag
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_object_files, temporary_sibling_path, write_new_bucket_state, BucketRecord,
-        FilesystemStorage, StorageClock, StorageError, OBJECTS_DIR, TEMPORARY_FILE_COUNTER,
+        commit_object_files, replace_file_with_temporary, restore_path_backup,
+        temporary_sibling_path, write_new_bucket_state, BucketRecord, FilesystemStorage,
+        StorageClock, StorageError, OBJECTS_DIR, TEMPORARY_FILE_COUNTER,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::object::ObjectKey;
@@ -1130,6 +1131,68 @@ mod tests {
             fs::read(&metadata_path).expect("read restored metadata"),
             b"old-metadata"
         );
+    }
+
+    #[test]
+    fn object_commit_restores_backups_when_content_temp_is_missing() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let content_path = temp_dir.path().join("content.bin");
+        let metadata_path = temp_dir.path().join("metadata.json");
+        let content_temporary_path = temp_dir.path().join("missing-content.tmp");
+        let metadata_temporary_path = temp_dir.path().join("metadata.tmp");
+        fs::write(&content_path, b"old-content").expect("write old content");
+        fs::write(&metadata_path, b"old-metadata").expect("write old metadata");
+        fs::write(&metadata_temporary_path, b"new-metadata").expect("write new metadata");
+
+        let error = commit_object_files(
+            &content_path,
+            &content_temporary_path,
+            &metadata_path,
+            &metadata_temporary_path,
+        )
+        .expect_err("missing content temp fails commit");
+
+        assert!(matches!(error, StorageError::Io { .. }));
+        assert_eq!(
+            fs::read(&content_path).expect("read restored content"),
+            b"old-content"
+        );
+        assert_eq!(
+            fs::read(&metadata_path).expect("read restored metadata"),
+            b"old-metadata"
+        );
+        assert_eq!(
+            fs::read(&metadata_temporary_path).expect("read uncommitted metadata temp"),
+            b"new-metadata"
+        );
+    }
+
+    #[test]
+    fn replace_file_with_temporary_restores_backup_when_rename_fails() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let target_path = temp_dir.path().join("metadata.json");
+        let temporary_path = temp_dir.path().join("missing-metadata.tmp");
+        fs::write(&target_path, b"current").expect("write current target");
+
+        let error = replace_file_with_temporary(&target_path, &temporary_path)
+            .expect_err("file replacement fails with missing temporary file");
+
+        assert!(matches!(error, StorageError::Io { .. }));
+        assert_eq!(
+            fs::read(&target_path).expect("read restored target"),
+            b"current"
+        );
+    }
+
+    #[test]
+    fn restore_path_backup_without_backup_leaves_existing_path_untouched() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("content.bin");
+        fs::write(&path, b"current").expect("write current path");
+
+        restore_path_backup(&path, None);
+
+        assert_eq!(fs::read(path).expect("read current path"), b"current");
     }
 
     #[test]
