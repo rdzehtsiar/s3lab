@@ -21,7 +21,7 @@ fn default_runtime_config_matches_phase1_local_defaults() {
 
     assert_eq!(config.host, DEFAULT_HOST);
     assert_eq!(config.port, DEFAULT_PORT);
-    assert_eq!(config.data_dir, DEFAULT_DATA_DIR);
+    assert_eq!(config.data_dir, std::path::PathBuf::from(DEFAULT_DATA_DIR));
 }
 
 #[test]
