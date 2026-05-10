@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn cli_error_implements_error_trait() {
-        fn assert_error_trait(error: &dyn std::error::Error) -> String {
+        fn assert_error_trait(error: &dyn Error) -> String {
             error.to_string()
         }
 

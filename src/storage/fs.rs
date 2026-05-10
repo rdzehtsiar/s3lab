@@ -226,17 +226,6 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         Ok(metadata)
     }
 
-    fn get_object_metadata(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<StoredObjectMetadata, StorageError> {
-        let _guard = lock_storage(&self.root, "get_object_metadata")?;
-        self.ensure_bucket(bucket)?;
-        let encoded_key = encode_object_key(key)?;
-        self.read_object_metadata(bucket, key, &encoded_key)
-    }
-
     fn get_object(
         &self,
         bucket: &BucketName,
@@ -246,6 +235,17 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         self.ensure_bucket(bucket)?;
         let encoded_key = encode_object_key(key)?;
         self.read_object(bucket, key, &encoded_key)
+    }
+
+    fn get_object_metadata(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<StoredObjectMetadata, StorageError> {
+        let _guard = lock_storage(&self.root, "get_object_metadata")?;
+        self.ensure_bucket(bucket)?;
+        let encoded_key = encode_object_key(key)?;
+        self.read_object_metadata(bucket, key, &encoded_key)
     }
 
     fn get_object_bytes(
@@ -882,7 +882,7 @@ fn write_new_object_state(
     metadata: &ObjectMetadataRecord,
 ) -> Result<(), StorageError> {
     #[cfg(test)]
-    if FAIL_NEXT_NEW_OBJECT_STATE_WRITE.with(|fail| fail.replace(false)) {
+    if FAIL_NEXT_NEW_OBJECT_STATE_WRITE.replace(false) {
         return Err(StorageError::Io {
             path: object_dir.join(OBJECT_CONTENT_FILE),
             source: io::Error::other("forced new object write failure"),
@@ -898,7 +898,7 @@ fn write_new_object_state(
 
 #[cfg(test)]
 fn fail_next_new_object_state_write_for_test() {
-    FAIL_NEXT_NEW_OBJECT_STATE_WRITE.with(|fail| fail.set(true));
+    FAIL_NEXT_NEW_OBJECT_STATE_WRITE.set(true);
 }
 
 fn write_object_files_atomically(
