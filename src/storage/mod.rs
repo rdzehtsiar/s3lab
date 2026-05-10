@@ -105,6 +105,12 @@ pub enum StorageError {
     #[error("invalid storage argument: {message}")]
     InvalidArgument { message: String },
 
+    #[error("corrupt storage state at {path}: {message}")]
+    CorruptState {
+        path: std::path::PathBuf,
+        message: String,
+    },
+
     #[error("storage I/O error at {path}: {source}")]
     Io {
         path: std::path::PathBuf,
@@ -124,7 +130,7 @@ impl From<&StorageError> for S3ErrorCode {
             StorageError::InvalidObjectKey { .. } | StorageError::InvalidArgument { .. } => {
                 Self::InvalidArgument
             }
-            StorageError::Io { .. } => Self::InternalError,
+            StorageError::CorruptState { .. } | StorageError::Io { .. } => Self::InternalError,
         }
     }
 }
@@ -274,7 +280,14 @@ mod tests {
             (
                 StorageError::Io {
                     path: PathBuf::from("metadata.json"),
-                    source: std::io::Error::new(std::io::ErrorKind::Other, "disk error"),
+                    source: std::io::Error::other("disk error"),
+                },
+                S3ErrorCode::InternalError,
+            ),
+            (
+                StorageError::CorruptState {
+                    path: PathBuf::from("metadata.json"),
+                    message: "invalid json".to_owned(),
                 },
                 S3ErrorCode::InternalError,
             ),
