@@ -1,5 +1,8 @@
 # S3Lab
 
+[![Tests](https://github.com/rdzehtsiar/s3lab/actions/workflows/tests.yml/badge.svg)](https://github.com/rdzehtsiar/s3lab/actions/workflows/tests.yml)
+[![codecov](https://codecov.io/gh/rdzehtsiar/s3lab/graph/badge.svg)](https://codecov.io/gh/rdzehtsiar/s3lab)
+
 S3Lab is planned as a fully offline S3 compatibility and protocol debugging lab for engineers who build, test, or troubleshoot S3-compatible workflows locally.
 
 The intended experience is simple: download one binary, run it, point an AWS SDK or CLI at localhost, then inspect requests, debug compatibility issues, replay behavior, snapshot local state, and test failure scenarios without needing cloud access.

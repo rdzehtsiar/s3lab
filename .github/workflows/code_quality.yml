@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-name: Qodana
+name: Code Quality
 
 on:
   workflow_dispatch:
@@ -11,14 +11,19 @@ on:
       - "releases/*"
 
 permissions:
-  contents: write
-  pull-requests: write
-  checks: write
+  contents: read
 
 jobs:
   qodana:
     name: Qodana
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    env:
+      QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
 
     steps:
       - name: Checkout
@@ -28,9 +33,9 @@ jobs:
           fetch-depth: 0
 
       - name: Qodana Scan
+        if: env.QODANA_TOKEN != ''
         uses: JetBrains/qodana-action@v2026.1
         env:
-          QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
           CARGO_HOME: /data/cache/cargo
         with:
           args: |

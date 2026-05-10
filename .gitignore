@@ -1,3 +1,4 @@
 /target/
 /s3lab-data/
 /.plan/
+/lcov.info
