@@ -369,6 +369,137 @@ async fn storage_errors_return_s3_xml_with_status_and_request_id() {
 }
 
 #[tokio::test]
+async fn bucket_lifecycle_for_empty_bucket_returns_s3_statuses_and_empty_bodies() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+    assert!(body_bytes(create).await.is_empty());
+
+    let head = app
+        .clone()
+        .oneshot(request(Method::HEAD, "/bucket", Body::empty()))
+        .await
+        .expect("head bucket");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert!(body_bytes(head).await.is_empty());
+
+    let list = app
+        .clone()
+        .oneshot(request(Method::GET, "/", Body::empty()))
+        .await
+        .expect("list buckets");
+    assert_eq!(list.status(), StatusCode::OK);
+    assert_eq!(
+        list.headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/xml")
+    );
+    let body = String::from_utf8(body_bytes(list).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<ListAllMyBucketsResult>"));
+    assert!(body.contains("<Name>bucket</Name>"));
+
+    let delete = app
+        .oneshot(request(Method::DELETE, "/bucket", Body::empty()))
+        .await
+        .expect("delete bucket");
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    assert!(body_bytes(delete).await.is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_bucket_create_returns_409_bucket_already_owned_by_you() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let duplicate = app
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("duplicate create bucket");
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    let body = String::from_utf8(body_bytes(duplicate).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>BucketAlreadyOwnedByYou</Code>"));
+    assert!(body.contains("<Resource>/bucket</Resource>"));
+}
+
+#[tokio::test]
+async fn missing_bucket_head_and_delete_return_expected_errors() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let head = app
+        .clone()
+        .oneshot(request(Method::HEAD, "/missing-bucket", Body::empty()))
+        .await
+        .expect("head missing bucket");
+    assert_eq!(head.status(), StatusCode::NOT_FOUND);
+    assert!(body_bytes(head).await.is_empty());
+
+    let delete = app
+        .oneshot(request(Method::DELETE, "/missing-bucket", Body::empty()))
+        .await
+        .expect("delete missing bucket");
+    assert_eq!(delete.status(), StatusCode::NOT_FOUND);
+    let body = String::from_utf8(body_bytes(delete).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>NoSuchBucket</Code>"));
+    assert!(body.contains("<Resource>/missing-bucket</Resource>"));
+}
+
+#[tokio::test]
+async fn delete_non_empty_bucket_returns_409_bucket_not_empty() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/object.txt",
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object");
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let delete = app
+        .clone()
+        .oneshot(request(Method::DELETE, "/bucket", Body::empty()))
+        .await
+        .expect("delete non-empty bucket");
+    assert_eq!(delete.status(), StatusCode::CONFLICT);
+    let body = String::from_utf8(body_bytes(delete).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>BucketNotEmpty</Code>"));
+    assert!(body.contains("<Resource>/bucket</Resource>"));
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get object after failed bucket delete");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(body_bytes(get).await, Bytes::from_static(b"hello"));
+}
+
+#[tokio::test]
 async fn filesystem_backed_router_supports_basic_bucket_and_object_flow() {
     let temp_dir = TempDir::new().expect("temp dir");
     let app = router(ServerState::filesystem(temp_dir.path()));
