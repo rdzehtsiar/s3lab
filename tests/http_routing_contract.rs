@@ -1,0 +1,632 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use axum::body::{to_bytes, Body, Bytes};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
+use axum::http::{Method, Request, StatusCode, Uri};
+use s3lab::s3::bucket::BucketName;
+use s3lab::s3::error::S3ErrorCode;
+use s3lab::s3::object::ObjectKey;
+use s3lab::s3::operation::S3Operation;
+use s3lab::server::router;
+use s3lab::server::routes::resolve_operation;
+use s3lab::server::state::ServerState;
+use s3lab::storage::{
+    BucketSummary, ListObjectsOptions, ObjectListing, PutObjectRequest, Storage, StorageError,
+    StoredObjectMetadata,
+};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use tempfile::TempDir;
+use time::OffsetDateTime;
+use tower::ServiceExt;
+
+#[test]
+fn supported_routes_resolve_to_explicit_operations() {
+    let cases = [
+        (Method::GET, "/", S3Operation::ListBuckets),
+        (
+            Method::PUT,
+            "/example-bucket",
+            S3Operation::CreateBucket {
+                bucket: "example-bucket".to_owned(),
+            },
+        ),
+        (
+            Method::HEAD,
+            "/example-bucket",
+            S3Operation::HeadBucket {
+                bucket: "example-bucket".to_owned(),
+            },
+        ),
+        (
+            Method::DELETE,
+            "/example-bucket",
+            S3Operation::DeleteBucket {
+                bucket: "example-bucket".to_owned(),
+            },
+        ),
+        (
+            Method::PUT,
+            "/example-bucket/object.txt",
+            S3Operation::PutObject {
+                bucket: "example-bucket".to_owned(),
+                key: "object.txt".to_owned(),
+            },
+        ),
+        (
+            Method::GET,
+            "/example-bucket/object.txt",
+            S3Operation::GetObject {
+                bucket: "example-bucket".to_owned(),
+                key: "object.txt".to_owned(),
+            },
+        ),
+        (
+            Method::HEAD,
+            "/example-bucket/object.txt",
+            S3Operation::HeadObject {
+                bucket: "example-bucket".to_owned(),
+                key: "object.txt".to_owned(),
+            },
+        ),
+        (
+            Method::DELETE,
+            "/example-bucket/object.txt",
+            S3Operation::DeleteObject {
+                bucket: "example-bucket".to_owned(),
+                key: "object.txt".to_owned(),
+            },
+        ),
+        (
+            Method::GET,
+            "/example-bucket?list-type=2",
+            S3Operation::ListObjectsV2 {
+                bucket: "example-bucket".to_owned(),
+                prefix: None,
+                continuation_token: None,
+            },
+        ),
+        (
+            Method::GET,
+            "/example-bucket?list-type=2&prefix=images%2F&continuation-token=page%2F2",
+            S3Operation::ListObjectsV2 {
+                bucket: "example-bucket".to_owned(),
+                prefix: Some("images/".to_owned()),
+                continuation_token: Some("page/2".to_owned()),
+            },
+        ),
+    ];
+
+    for (method, uri, expected_operation) in cases {
+        let route = resolve_operation(&method, &uri.parse::<Uri>().expect("valid URI"))
+            .expect("supported route resolves");
+
+        assert_eq!(route.operation, expected_operation);
+    }
+}
+
+#[test]
+fn object_keys_preserve_paths_spaces_encoded_slashes_and_literal_plus() {
+    let cases = [
+        (
+            "/example-bucket/nested/path/object.txt",
+            "nested/path/object.txt",
+        ),
+        (
+            "/example-bucket/spaces%20in%20name.txt",
+            "spaces in name.txt",
+        ),
+        ("/example-bucket/encoded%2Fslash.txt", "encoded/slash.txt"),
+        ("/example-bucket/literal+plus.txt", "literal+plus.txt"),
+    ];
+
+    for (uri, expected_key) in cases {
+        let route = resolve_operation(&Method::GET, &uri.parse::<Uri>().expect("valid URI"))
+            .expect("object route resolves");
+
+        assert_eq!(
+            route.operation,
+            S3Operation::GetObject {
+                bucket: "example-bucket".to_owned(),
+                key: expected_key.to_owned(),
+            }
+        );
+    }
+}
+
+#[test]
+fn malformed_percent_encoding_is_invalid_argument() {
+    for uri in [
+        "/example-bucket/bad%ZZ",
+        "/example-bucket/%FF",
+        "/example-bucket?list-type=2&prefix=bad%ZZ",
+    ] {
+        let rejection = resolve_operation(&Method::GET, &uri.parse::<Uri>().expect("valid URI"))
+            .expect_err("malformed percent encoding is rejected");
+
+        assert_eq!(rejection.code, S3ErrorCode::InvalidArgument);
+    }
+}
+
+#[test]
+fn unsupported_and_malformed_bucket_routes_are_clear_rejections() {
+    let empty_bucket =
+        resolve_operation(&Method::GET, &Uri::from_static("//key")).expect_err("empty bucket");
+    let empty_key =
+        resolve_operation(&Method::GET, &Uri::from_static("/bucket/")).expect_err("empty key");
+    let method =
+        resolve_operation(&Method::POST, &Uri::from_static("/bucket/key")).expect_err("bad method");
+    let list_v1 =
+        resolve_operation(&Method::GET, &Uri::from_static("/bucket")).expect_err("list v1");
+    let bad_list_type = resolve_operation(&Method::GET, &Uri::from_static("/bucket?list-type=1"))
+        .expect_err("bad list type");
+
+    assert_eq!(empty_bucket.code, S3ErrorCode::InvalidBucketName);
+    assert_eq!(empty_key.code, S3ErrorCode::InvalidArgument);
+    assert_eq!(method.code, S3ErrorCode::MethodNotAllowed);
+    assert_eq!(list_v1.code, S3ErrorCode::NotImplemented);
+    assert_eq!(bad_list_type.code, S3ErrorCode::InvalidArgument);
+}
+
+#[test]
+fn duplicate_and_unknown_query_params_are_invalid_argument() {
+    for uri in [
+        "/bucket?list-type=2&list-type=2",
+        "/bucket?list-type=2&prefix=a&prefix=b",
+        "/bucket?list-type=2&unknown=value",
+        "/bucket/key?unknown=value",
+    ] {
+        let rejection = resolve_operation(&Method::GET, &Uri::from_static(uri))
+            .expect_err("query must be rejected");
+
+        assert_eq!(rejection.code, S3ErrorCode::InvalidArgument);
+    }
+}
+
+#[test]
+fn known_s3_subresources_are_not_implemented() {
+    for subresource in [
+        "acl",
+        "tagging",
+        "uploads",
+        "uploadId",
+        "partNumber",
+        "versionId",
+        "versions",
+        "policy",
+        "location",
+        "cors",
+        "website",
+        "lifecycle",
+        "notification",
+        "replication",
+        "encryption",
+        "retention",
+        "legal-hold",
+        "object-lock",
+    ] {
+        let uri = format!("/bucket?{subresource}=value");
+        let rejection = resolve_operation(&Method::GET, &uri.parse::<Uri>().expect("valid URI"))
+            .expect_err("subresource is unsupported");
+
+        assert_eq!(rejection.code, S3ErrorCode::NotImplemented);
+    }
+}
+
+#[tokio::test]
+async fn unsupported_subresources_return_501_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(ServerState::from_storage(storage));
+
+    let response = app
+        .oneshot(request(Method::GET, "/bucket?acl", Body::empty()))
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
+}
+
+#[tokio::test]
+async fn list_objects_v2_continuation_token_returns_501_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(ServerState::from_storage(storage));
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=2&continuation-token=page-2",
+            Body::empty(),
+        ))
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>NotImplemented</Code>"));
+    assert!(body.contains("continuation-token"));
+}
+
+#[tokio::test]
+async fn head_success_and_error_responses_have_empty_bodies() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create response");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/object.txt",
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put response");
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let head = app
+        .clone()
+        .oneshot(request(Method::HEAD, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("head response");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(
+        head.headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
+    );
+    assert!(body_bytes(head).await.is_empty());
+
+    let missing = app
+        .oneshot(request(Method::HEAD, "/bucket/missing.txt", Body::empty()))
+        .await
+        .expect("missing head response");
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(body_bytes(missing).await.is_empty());
+}
+
+#[tokio::test]
+async fn head_object_includes_available_metadata_headers() {
+    let storage = RecordingStorage {
+        metadata: metadata_with_content_type("bucket", "object.txt", 5, Some("text/plain")),
+        ..RecordingStorage::default()
+    };
+    let app = router(ServerState::from_storage(storage));
+
+    let head = app
+        .oneshot(request(Method::HEAD, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("head response");
+
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(
+        head.headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
+    );
+    assert_eq!(
+        head.headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        head.headers().get(ETAG).and_then(|v| v.to_str().ok()),
+        Some("\"d41d8cd98f00b204e9800998ecf8427e\"")
+    );
+    assert_eq!(
+        head.headers()
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok()),
+        Some("Thu, 01 Jan 1970 00:00:00 GMT")
+    );
+    assert!(body_bytes(head).await.is_empty());
+}
+
+#[tokio::test]
+async fn storage_errors_return_s3_xml_with_status_and_request_id() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/missing-bucket?list-type=2",
+            Body::empty(),
+        ))
+        .await
+        .expect("list response");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/xml")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>NoSuchBucket</Code>"));
+    assert!(body.contains("<Resource>/missing-bucket</Resource>"));
+}
+
+#[tokio::test]
+async fn filesystem_backed_router_supports_basic_bucket_and_object_flow() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+    assert!(body_bytes(create).await.is_empty());
+
+    let put = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/nested%2Fobject.txt",
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert!(body_bytes(put).await.is_empty());
+
+    let get = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/bucket/nested%2Fobject.txt",
+            Body::empty(),
+        ))
+        .await
+        .expect("get object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(body_bytes(get).await, Bytes::from_static(b"hello"));
+
+    let head = app
+        .clone()
+        .oneshot(request(
+            Method::HEAD,
+            "/bucket/nested%2Fobject.txt",
+            Body::empty(),
+        ))
+        .await
+        .expect("head object");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(
+        head.headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
+    );
+    assert!(body_bytes(head).await.is_empty());
+
+    let delete = app
+        .oneshot(request(
+            Method::DELETE,
+            "/bucket/nested%2Fobject.txt",
+            Body::empty(),
+        ))
+        .await
+        .expect("delete object");
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    assert!(body_bytes(delete).await.is_empty());
+}
+
+#[tokio::test]
+async fn delete_bucket_and_object_successes_return_204_no_content() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/object.txt",
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object");
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let delete_object = app
+        .clone()
+        .oneshot(request(Method::DELETE, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("delete object");
+    assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+    assert!(body_bytes(delete_object).await.is_empty());
+
+    let delete_bucket = app
+        .oneshot(request(Method::DELETE, "/bucket", Body::empty()))
+        .await
+        .expect("delete bucket");
+    assert_eq!(delete_bucket.status(), StatusCode::NO_CONTENT);
+    assert!(body_bytes(delete_bucket).await.is_empty());
+}
+
+#[tokio::test]
+async fn delete_object_is_idempotent_for_existing_bucket_only() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let missing_object = app
+        .clone()
+        .oneshot(request(
+            Method::DELETE,
+            "/bucket/missing.txt",
+            Body::empty(),
+        ))
+        .await
+        .expect("delete missing object");
+    assert_eq!(missing_object.status(), StatusCode::NO_CONTENT);
+    assert!(body_bytes(missing_object).await.is_empty());
+
+    let missing_bucket = app
+        .oneshot(request(
+            Method::DELETE,
+            "/missing-bucket/missing.txt",
+            Body::empty(),
+        ))
+        .await
+        .expect("delete object from missing bucket");
+    assert_eq!(missing_bucket.status(), StatusCode::NOT_FOUND);
+    let body =
+        String::from_utf8(body_bytes(missing_bucket).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>NoSuchBucket</Code>"));
+}
+
+fn request(method: Method, uri: &str, body: Body) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(body)
+        .expect("valid request")
+}
+
+async fn body_bytes(response: axum::http::Response<Body>) -> Bytes {
+    to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read response body")
+}
+
+#[derive(Clone)]
+struct RecordingStorage {
+    calls: Arc<Mutex<Vec<&'static str>>>,
+    metadata: StoredObjectMetadata,
+}
+
+impl RecordingStorage {
+    fn record(&self, call: &'static str) {
+        self.calls.lock().expect("calls lock").push(call);
+    }
+}
+
+impl Storage for RecordingStorage {
+    fn create_bucket(&self, _bucket: &BucketName) -> Result<(), StorageError> {
+        self.record("create_bucket");
+        Ok(())
+    }
+
+    fn list_buckets(&self) -> Result<Vec<BucketSummary>, StorageError> {
+        self.record("list_buckets");
+        Ok(Vec::new())
+    }
+
+    fn bucket_exists(&self, _bucket: &BucketName) -> Result<bool, StorageError> {
+        self.record("bucket_exists");
+        Ok(true)
+    }
+
+    fn delete_bucket(&self, _bucket: &BucketName) -> Result<(), StorageError> {
+        self.record("delete_bucket");
+        Ok(())
+    }
+
+    fn put_object(&self, _request: PutObjectRequest) -> Result<StoredObjectMetadata, StorageError> {
+        self.record("put_object");
+        Ok(self.metadata.clone())
+    }
+
+    fn get_object_metadata(
+        &self,
+        _bucket: &BucketName,
+        _key: &ObjectKey,
+    ) -> Result<StoredObjectMetadata, StorageError> {
+        self.record("get_object_metadata");
+        Ok(self.metadata.clone())
+    }
+
+    fn get_object_bytes(
+        &self,
+        _bucket: &BucketName,
+        _key: &ObjectKey,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.record("get_object_bytes");
+        Ok(Vec::new())
+    }
+
+    fn list_objects(
+        &self,
+        bucket: &BucketName,
+        _options: ListObjectsOptions,
+    ) -> Result<ObjectListing, StorageError> {
+        self.record("list_objects");
+        Ok(ObjectListing {
+            bucket: bucket.clone(),
+            objects: Vec::new(),
+            next_continuation_token: None,
+        })
+    }
+
+    fn delete_object(&self, _bucket: &BucketName, _key: &ObjectKey) -> Result<(), StorageError> {
+        self.record("delete_object");
+        Ok(())
+    }
+}
+
+fn metadata(bucket: &str, key: &str, content_length: u64) -> StoredObjectMetadata {
+    metadata_with_content_type(bucket, key, content_length, None)
+}
+
+fn metadata_with_content_type(
+    bucket: &str,
+    key: &str,
+    content_length: u64,
+    content_type: Option<&str>,
+) -> StoredObjectMetadata {
+    StoredObjectMetadata {
+        bucket: BucketName::new(bucket),
+        key: ObjectKey::new(key),
+        etag: "\"d41d8cd98f00b204e9800998ecf8427e\"".to_owned(),
+        content_length,
+        content_type: content_type.map(str::to_owned),
+        last_modified: OffsetDateTime::UNIX_EPOCH,
+        user_metadata: BTreeMap::new(),
+    }
+}
+
+impl Default for RecordingStorage {
+    fn default() -> Self {
+        Self {
+            calls: Arc::default(),
+            metadata: metadata("bucket", "key", 0),
+        }
+    }
+}

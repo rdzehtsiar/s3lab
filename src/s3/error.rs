@@ -49,6 +49,17 @@ impl S3ErrorCode {
             Self::InternalError => "We encountered an internal error. Please try again.",
         }
     }
+
+    pub fn http_status_code(&self) -> u16 {
+        match self {
+            Self::NoSuchBucket | Self::NoSuchKey => 404,
+            Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => 409,
+            Self::InvalidBucketName | Self::InvalidArgument => 400,
+            Self::MethodNotAllowed => 405,
+            Self::NotImplemented => 501,
+            Self::InternalError => 500,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -161,6 +172,25 @@ mod tests {
     #[test]
     fn error_code_strings_match_s3_names() {
         assert_eq!(S3ErrorCode::MethodNotAllowed.as_str(), "MethodNotAllowed");
+    }
+
+    #[test]
+    fn error_codes_map_to_http_status_codes() {
+        let cases = [
+            (S3ErrorCode::NoSuchBucket, 404),
+            (S3ErrorCode::NoSuchKey, 404),
+            (S3ErrorCode::BucketAlreadyOwnedByYou, 409),
+            (S3ErrorCode::BucketNotEmpty, 409),
+            (S3ErrorCode::InvalidBucketName, 400),
+            (S3ErrorCode::InvalidArgument, 400),
+            (S3ErrorCode::MethodNotAllowed, 405),
+            (S3ErrorCode::NotImplemented, 501),
+            (S3ErrorCode::InternalError, 500),
+        ];
+
+        for (code, expected) in cases {
+            assert_eq!(code.http_status_code(), expected);
+        }
     }
 
     #[test]
