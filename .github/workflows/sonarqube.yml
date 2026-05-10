@@ -27,8 +27,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run tests with coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
       - name: SonarQube Scan
-        if: env.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
         env:
           SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
