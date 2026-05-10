@@ -148,9 +148,27 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{run_with_writer, Cli, CliError};
+    use super::{run, run_with_writer, Cli, CliError};
     use clap::{CommandFactory, Parser};
+    use std::error::Error;
+    use std::io::Write;
     use std::path::PathBuf;
+    use std::process::ExitCode;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test writer failed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn default_serve_config_prints_local_startup_output() {
@@ -272,6 +290,94 @@ mod tests {
         assert!(matches!(error, CliError::Config(_)));
         assert!(error.to_string().contains("not a directory"));
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn run_uses_stdout_and_validates_serve_config() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let data_dir = parent.path().join("s3lab-data");
+
+        run([
+            "s3lab",
+            "serve",
+            "--data-dir",
+            data_dir.to_str().expect("utf-8 temp path"),
+        ])
+        .expect("serve should run through stdout path");
+
+        assert!(data_dir.is_dir());
+    }
+
+    #[test]
+    fn writer_failures_become_output_errors() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let data_dir = parent.path().join("s3lab-data");
+        let mut writer = FailingWriter;
+
+        let error = run_with_writer(
+            [
+                "s3lab",
+                "serve",
+                "--data-dir",
+                data_dir.to_str().expect("utf-8 temp path"),
+            ],
+            &mut writer,
+        )
+        .expect_err("failing writer should fail command");
+
+        assert!(matches!(error, CliError::Output(_)));
+        assert!(error.to_string().contains("failed to write command output"));
+        assert_eq!(error.exit_code(), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn parse_help_error_uses_success_exit_code() {
+        let error = CliError::Parse(Cli::try_parse_from(["s3lab", "--help"]).unwrap_err());
+
+        assert_eq!(error.exit_code(), ExitCode::SUCCESS);
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn parse_usage_error_uses_failure_exit_code() {
+        let error = CliError::Parse(Cli::try_parse_from(["s3lab", "unknown"]).unwrap_err());
+
+        assert_eq!(error.exit_code(), ExitCode::FAILURE);
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn config_error_source_is_preserved() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let file_path = parent.path().join("s3lab-data");
+        std::fs::write(&file_path, b"not a directory").expect("write test file");
+        let mut output = Vec::new();
+
+        let error = run_with_writer(
+            [
+                "s3lab",
+                "serve",
+                "--data-dir",
+                file_path.to_str().expect("utf-8 temp path"),
+            ],
+            &mut output,
+        )
+        .expect_err("file data dir should fail");
+
+        assert_eq!(error.exit_code(), ExitCode::FAILURE);
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn print_handles_parse_and_non_parse_errors() {
+        let parse_error = CliError::Parse(Cli::try_parse_from(["s3lab", "--help"]).unwrap_err());
+        parse_error.print();
+
+        let output_error = CliError::Output(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "test writer failed",
+        ));
+        output_error.print();
     }
 
     #[test]

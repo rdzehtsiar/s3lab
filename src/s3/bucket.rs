@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fmt::{Display, Formatter};
+
 #[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BucketName(String);
 
@@ -10,6 +12,12 @@ impl BucketName {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl Display for BucketName {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -45,5 +53,13 @@ mod tests {
         let bucket = BucketName::new("example-bucket");
 
         assert_eq!(bucket.clone(), bucket);
+    }
+
+    #[test]
+    fn bucket_name_displays_inner_value() {
+        assert_eq!(
+            BucketName::new("example-bucket").to_string(),
+            "example-bucket"
+        );
     }
 }

@@ -98,6 +98,7 @@ mod tests {
     use super::{
         ensure_data_dir, ConfigError, RuntimeConfig, DEFAULT_DATA_DIR, DEFAULT_HOST, DEFAULT_PORT,
     };
+    use std::error::Error;
     use std::path::PathBuf;
 
     #[test]
@@ -171,5 +172,34 @@ mod tests {
 
         assert!(matches!(error, ConfigError::DataDirIsFile { ref path } if path == &file_path));
         assert!(error.to_string().contains("not a directory"));
+    }
+
+    #[test]
+    fn ensure_data_dir_reports_create_failures() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let file_path = parent.path().join("not-a-directory");
+        let data_dir = file_path.join("s3lab-data");
+        std::fs::write(&file_path, b"not a directory").expect("write test file");
+
+        let error = ensure_data_dir(&data_dir).expect_err("nested path under file should fail");
+
+        assert!(matches!(error, ConfigError::CreateDataDir { ref path, .. } if path == &data_dir));
+        assert!(error.source().is_some());
+        assert!(error
+            .to_string()
+            .contains("failed to create or open data dir"));
+    }
+
+    #[test]
+    fn runtime_config_ensure_data_dir_delegates_to_configured_path() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let data_dir = parent.path().join("configured-data");
+        let config = RuntimeConfig::new(DEFAULT_HOST, DEFAULT_PORT, data_dir.clone());
+
+        config
+            .ensure_data_dir()
+            .expect("configured dir should be created");
+
+        assert!(data_dir.is_dir());
     }
 }

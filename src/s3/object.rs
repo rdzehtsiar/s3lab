@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fmt::{Display, Formatter};
+
 #[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ObjectKey(String);
 
@@ -10,6 +12,12 @@ impl ObjectKey {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl Display for ObjectKey {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -45,5 +53,13 @@ mod tests {
         let key = ObjectKey::new("prefix/example.txt");
 
         assert_eq!(key.clone(), key);
+    }
+
+    #[test]
+    fn object_key_displays_inner_value() {
+        assert_eq!(
+            ObjectKey::new("prefix/example.txt").to_string(),
+            "prefix/example.txt"
+        );
     }
 }

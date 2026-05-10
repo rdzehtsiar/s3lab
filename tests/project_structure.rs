@@ -33,7 +33,7 @@ fn planned_module_boundaries_are_available_to_tests() {
 
     assert_eq!(bucket.as_str(), "example-bucket");
     assert_eq!(object.as_str(), "prefix/example.txt");
-    assert_eq!(state.data_dir, storage.root);
+    assert_eq!(std::path::PathBuf::from(state.data_dir), storage.root);
     assert_eq!(support::TEST_SUPPORT_MARKER, "offline-deterministic-tests");
 }
 

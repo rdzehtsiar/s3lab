@@ -2,6 +2,13 @@
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum S3ErrorCode {
+    BucketAlreadyOwnedByYou,
+    BucketNotEmpty,
+    InternalError,
+    InvalidArgument,
+    InvalidBucketName,
+    NoSuchBucket,
+    NoSuchKey,
     NotImplemented,
 }
 
@@ -26,6 +33,23 @@ mod tests {
         assert_eq!(
             format!("{:?}", S3ErrorCode::NotImplemented),
             "NotImplemented"
+        );
+    }
+
+    #[test]
+    fn storage_related_error_codes_are_available() {
+        assert_eq!(
+            [
+                S3ErrorCode::BucketAlreadyOwnedByYou,
+                S3ErrorCode::BucketNotEmpty,
+                S3ErrorCode::InternalError,
+                S3ErrorCode::InvalidArgument,
+                S3ErrorCode::InvalidBucketName,
+                S3ErrorCode::NoSuchBucket,
+                S3ErrorCode::NoSuchKey,
+            ]
+            .len(),
+            7
         );
     }
 }
