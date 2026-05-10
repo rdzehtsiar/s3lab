@@ -371,6 +371,44 @@ async fn list_objects_v2_delimiter_is_invalid_argument() {
 }
 
 #[tokio::test]
+async fn route_invalid_argument_error_xml_escapes_query_resource_exactly() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(ServerState::from_storage(storage));
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=1&marker=a%26b%3Ctag%3E",
+            Body::empty(),
+        ))
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/xml")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert_eq!(
+        body,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidArgument</Code><Message>Invalid argument.</Message><Resource>/bucket?list-type=1&amp;marker=a%26b%3Ctag%3E</Resource><RequestId>s3lab-test-request-id</RequestId></Error>"
+    );
+    assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
+}
+
+#[tokio::test]
 async fn head_success_and_error_responses_have_empty_bodies() {
     let temp_dir = TempDir::new().expect("temp dir");
     let app = router(ServerState::filesystem(temp_dir.path()));
@@ -545,8 +583,10 @@ async fn bucket_lifecycle_for_empty_bucket_returns_s3_statuses_and_empty_bodies(
         Some("application/xml")
     );
     let body = String::from_utf8(body_bytes(list).await.to_vec()).expect("utf-8 XML body");
-    assert!(body.contains("<ListAllMyBucketsResult>"));
-    assert!(body.contains("<Name>bucket</Name>"));
+    assert_eq!(
+        body,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListAllMyBucketsResult><Buckets><Bucket><Name>bucket</Name></Bucket></Buckets></ListAllMyBucketsResult>"
+    );
 
     let delete = app
         .oneshot(request(Method::DELETE, "/bucket", Body::empty()))
