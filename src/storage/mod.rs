@@ -85,13 +85,26 @@ pub struct StoredObjectMetadata {
 pub struct ObjectListing {
     pub bucket: BucketName,
     pub objects: Vec<StoredObjectMetadata>,
+    pub max_keys: usize,
+    pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ListObjectsOptions {
     pub prefix: Option<ObjectKey>,
     pub continuation_token: Option<String>,
+    pub max_keys: usize,
+}
+
+impl Default for ListObjectsOptions {
+    fn default() -> Self {
+        Self {
+            prefix: None,
+            continuation_token: None,
+            max_keys: 1000,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -166,6 +179,7 @@ mod tests {
             ListObjectsOptions {
                 prefix: None,
                 continuation_token: None,
+                max_keys: 1000,
             }
         );
     }
@@ -219,11 +233,15 @@ mod tests {
         let listing = ObjectListing {
             bucket: BucketName::new("example-bucket"),
             objects: Vec::new(),
+            max_keys: 2,
+            is_truncated: true,
             next_continuation_token: Some("token-1".to_owned()),
         };
 
         assert_eq!(listing.bucket.as_str(), "example-bucket");
         assert!(listing.objects.is_empty());
+        assert_eq!(listing.max_keys, 2);
+        assert!(listing.is_truncated);
         assert_eq!(listing.next_continuation_token.as_deref(), Some("token-1"));
     }
 

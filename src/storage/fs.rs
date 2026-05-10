@@ -25,6 +25,7 @@ const OBJECTS_DIR: &str = "objects";
 const OBJECT_CONTENT_FILE: &str = "content.bin";
 const OBJECT_METADATA_FILE: &str = "metadata.json";
 const OBJECT_METADATA_SCHEMA_VERSION: u32 = 1;
+const CONTINUATION_TOKEN_PREFIX: &str = "s3lab-v1:";
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Process-local serialization keeps filesystem transitions invisible to other
 // public storage operations while the storage layout is intentionally simple.
@@ -243,19 +244,20 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         options: ListObjectsOptions,
     ) -> Result<ObjectListing, StorageError> {
         let _guard = lock_storage(&self.root, "list_objects")?;
-        if options.continuation_token.is_some() {
-            return Err(StorageError::InvalidArgument {
-                message: "list_objects continuation tokens are not supported yet".to_owned(),
-            });
-        }
-
         self.ensure_bucket(bucket)?;
+        let resume_key = options
+            .continuation_token
+            .as_deref()
+            .map(decode_continuation_token)
+            .transpose()?;
 
         let objects_dir = self.bucket_dir(bucket).join(OBJECTS_DIR);
         if !path_exists(&objects_dir)? {
             return Ok(ObjectListing {
                 bucket: bucket.clone(),
                 objects: Vec::new(),
+                max_keys: options.max_keys,
+                is_truncated: false,
                 next_continuation_token: None,
             });
         }
@@ -308,10 +310,31 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         }
 
         objects.sort_by(|left, right| left.key.cmp(&right.key));
+        let start_index = resume_key.as_ref().map_or(0, |resume_key| {
+            objects.partition_point(|object| object.key < *resume_key)
+        });
+        if options.max_keys == 0 {
+            return Ok(ObjectListing {
+                bucket: bucket.clone(),
+                objects: Vec::new(),
+                max_keys: options.max_keys,
+                is_truncated: false,
+                next_continuation_token: None,
+            });
+        }
+
+        let remaining_objects = &objects[start_index..];
+        let page_count = remaining_objects.len().min(options.max_keys);
+        let next_continuation_token = remaining_objects
+            .get(page_count)
+            .map(|object| encode_continuation_token(&object.key));
+
         Ok(ObjectListing {
             bucket: bucket.clone(),
-            objects,
-            next_continuation_token: None,
+            objects: remaining_objects[..page_count].to_vec(),
+            max_keys: options.max_keys,
+            is_truncated: next_continuation_token.is_some(),
+            next_continuation_token,
         })
     }
 
@@ -555,6 +578,60 @@ fn lower_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
+}
+
+fn encode_continuation_token(key: &ObjectKey) -> String {
+    format!(
+        "{CONTINUATION_TOKEN_PREFIX}{}",
+        lower_hex(key.as_str().as_bytes())
+    )
+}
+
+fn decode_continuation_token(token: &str) -> Result<ObjectKey, StorageError> {
+    let Some(hex_key) = token.strip_prefix(CONTINUATION_TOKEN_PREFIX) else {
+        return Err(invalid_continuation_token());
+    };
+    if hex_key.is_empty() || hex_key.len() % 2 != 0 || !hex_key.is_ascii() {
+        return Err(invalid_continuation_token());
+    }
+    if !hex_key
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_continuation_token());
+    }
+
+    let mut key_bytes = Vec::with_capacity(hex_key.len() / 2);
+    for pair in hex_key.as_bytes().chunks_exact(2) {
+        key_bytes.push(hex_pair_to_byte(pair)?);
+    }
+
+    let key = String::from_utf8(key_bytes).map_err(|_| invalid_continuation_token())?;
+    if key.is_empty() {
+        return Err(invalid_continuation_token());
+    }
+
+    let key = ObjectKey::new(key);
+    encode_object_key(&key).map_err(|_| invalid_continuation_token())?;
+    Ok(key)
+}
+
+fn hex_pair_to_byte(pair: &[u8]) -> Result<u8, StorageError> {
+    Ok(hex_nibble(pair[0])? << 4 | hex_nibble(pair[1])?)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, StorageError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(invalid_continuation_token()),
+    }
+}
+
+fn invalid_continuation_token() -> StorageError {
+    StorageError::InvalidArgument {
+        message: "malformed ListObjectsV2 continuation token".to_owned(),
+    }
 }
 
 fn sorted_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, StorageError> {

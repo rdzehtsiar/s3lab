@@ -66,10 +66,18 @@ pub fn list_objects_v2_response_xml(listing: &ObjectListing, prefix: Option<&str
         .write_event(Event::Start(BytesStart::new("ListBucketResult")))
         .expect("writing XML start element to memory cannot fail");
     write_text_element(&mut writer, "Name", listing.bucket.as_str());
-    if let Some(prefix) = prefix {
-        write_text_element(&mut writer, "Prefix", prefix);
-    }
+    write_text_element(&mut writer, "Prefix", prefix.unwrap_or(""));
     write_text_element(&mut writer, "KeyCount", &listing.objects.len().to_string());
+    write_text_element(&mut writer, "MaxKeys", &listing.max_keys.to_string());
+    write_text_element(
+        &mut writer,
+        "IsTruncated",
+        if listing.is_truncated {
+            "true"
+        } else {
+            "false"
+        },
+    );
 
     for object in &listing.objects {
         writer
@@ -82,8 +90,10 @@ pub fn list_objects_v2_response_xml(listing: &ObjectListing, prefix: Option<&str
             .expect("writing XML end element to memory cannot fail");
     }
 
-    if let Some(token) = &listing.next_continuation_token {
-        write_text_element(&mut writer, "NextContinuationToken", token);
+    if listing.is_truncated {
+        if let Some(token) = &listing.next_continuation_token {
+            write_text_element(&mut writer, "NextContinuationToken", token);
+        }
     }
 
     writer

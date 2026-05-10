@@ -25,6 +25,7 @@ const USER_METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
 const LIST_TYPE: &str = "list-type";
 const PREFIX: &str = "prefix";
 const CONTINUATION_TOKEN: &str = "continuation-token";
+const MAX_KEYS: &str = "max-keys";
 const X_ID: &str = "x-id";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -132,7 +133,11 @@ fn resolve_bucket_get_operation(
     query: &QueryParams,
     resource: &str,
 ) -> Result<S3Operation, RouteRejection> {
-    reject_query_params_except(query, [LIST_TYPE, PREFIX, CONTINUATION_TOKEN], resource)?;
+    reject_query_params_except(
+        query,
+        [LIST_TYPE, PREFIX, CONTINUATION_TOKEN, MAX_KEYS],
+        resource,
+    )?;
 
     let Some(list_type) = query.get(LIST_TYPE) else {
         return Err(RouteRejection::new(
@@ -148,10 +153,13 @@ fn resolve_bucket_get_operation(
         ));
     }
 
+    let max_keys = parse_max_keys(query.get(MAX_KEYS), resource)?;
+
     Ok(S3Operation::ListObjectsV2 {
         bucket,
         prefix: query.get(PREFIX).cloned(),
         continuation_token: query.get(CONTINUATION_TOKEN).cloned(),
+        max_keys,
     })
 }
 
@@ -264,25 +272,14 @@ fn execute_operation(
         },
         S3Operation::ListObjectsV2 {
             bucket,
-            prefix: _,
-            continuation_token: Some(_),
-        } => {
-            let error = S3Error::with_message(
-                S3ErrorCode::NotImplemented,
-                "ListObjectsV2 continuation-token is not implemented yet.",
-                format!("/{bucket}"),
-                S3RequestId::new(TEST_REQUEST_ID),
-            );
-            return s3_error_response(error, is_head);
-        }
-        S3Operation::ListObjectsV2 {
-            bucket,
             prefix,
-            continuation_token: None,
+            continuation_token,
+            max_keys,
         } => {
             let options = ListObjectsOptions {
                 prefix: prefix.clone().map(ObjectKey::new),
-                continuation_token: None,
+                continuation_token,
+                max_keys,
             };
             state
                 .storage()
@@ -417,6 +414,31 @@ fn decode_route_component(raw: &str, resource: &str) -> Result<String, RouteReje
         .decode_utf8()
         .map(|value| value.into_owned())
         .map_err(|_| RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned()))
+}
+
+fn parse_max_keys(value: Option<&String>, resource: &str) -> Result<usize, RouteRejection> {
+    let Some(value) = value else {
+        return Ok(1000);
+    };
+
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        ));
+    }
+
+    let max_keys = value
+        .parse::<usize>()
+        .map_err(|_| RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned()))?;
+    if max_keys > 1000 {
+        return Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        ));
+    }
+
+    Ok(max_keys)
 }
 
 fn has_valid_percent_encoding(raw: &str) -> bool {

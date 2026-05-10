@@ -773,7 +773,7 @@ fn list_objects_filters_by_prefix() {
             &BucketName::new("example-bucket"),
             ListObjectsOptions {
                 prefix: Some(ObjectKey::new("images/")),
-                continuation_token: None,
+                ..ListObjectsOptions::default()
             },
         )
         .expect("list objects with prefix");
@@ -782,6 +782,7 @@ fn list_objects_filters_by_prefix() {
         object_keys(&listing.objects),
         ["images/a.png", "images/b.png"]
     );
+    assert!(!listing.is_truncated);
 }
 
 #[test]
@@ -979,22 +980,161 @@ fn storage_reopens_from_same_root() {
 }
 
 #[test]
-fn list_objects_rejects_continuation_tokens_for_now() {
-    let (_temp_dir, storage) = storage();
+fn list_objects_paginates_with_tokens_for_next_unreturned_key() {
+    let (_temp_dir, storage) = storage_with_objects(["z.txt", "a.txt", "m.txt"]);
     let bucket = BucketName::new("example-bucket");
-    storage.create_bucket(&bucket).expect("create bucket");
 
-    let error = storage
+    let first_page = storage
         .list_objects(
             &bucket,
             ListObjectsOptions {
                 prefix: None,
-                continuation_token: Some("token".to_owned()),
+                continuation_token: None,
+                max_keys: 2,
             },
         )
-        .expect_err("continuation token rejected");
+        .expect("list first page");
 
-    assert!(matches!(error, StorageError::InvalidArgument { .. }));
+    assert_eq!(object_keys(&first_page.objects), ["a.txt", "m.txt"]);
+    assert_eq!(first_page.max_keys, 2);
+    assert!(first_page.is_truncated);
+    let expected_token = continuation_token_for("z.txt");
+    assert_eq!(
+        first_page.next_continuation_token.as_deref(),
+        Some(expected_token.as_str())
+    );
+
+    let second_page = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                prefix: None,
+                continuation_token: first_page.next_continuation_token,
+                max_keys: 2,
+            },
+        )
+        .expect("list second page");
+
+    assert_eq!(object_keys(&second_page.objects), ["z.txt"]);
+    assert!(!second_page.is_truncated);
+    assert_eq!(second_page.next_continuation_token, None);
+}
+
+#[test]
+fn list_objects_paginates_after_prefix_filtering() {
+    let (_temp_dir, storage) = storage_with_objects(["images/a.png", "logs/a.txt", "images/b.png"]);
+    let bucket = BucketName::new("example-bucket");
+
+    let first_page = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                prefix: Some(ObjectKey::new("images/")),
+                continuation_token: None,
+                max_keys: 1,
+            },
+        )
+        .expect("list first prefixed page");
+
+    assert_eq!(object_keys(&first_page.objects), ["images/a.png"]);
+    assert!(first_page.is_truncated);
+    let expected_token = continuation_token_for("images/b.png");
+    assert_eq!(
+        first_page.next_continuation_token.as_deref(),
+        Some(expected_token.as_str())
+    );
+
+    let second_page = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                prefix: Some(ObjectKey::new("images/")),
+                continuation_token: first_page.next_continuation_token,
+                max_keys: 1,
+            },
+        )
+        .expect("list second prefixed page");
+
+    assert_eq!(object_keys(&second_page.objects), ["images/b.png"]);
+    assert!(!second_page.is_truncated);
+}
+
+#[test]
+fn list_objects_max_keys_zero_returns_no_objects_without_continuation() {
+    let (_temp_dir, storage) = storage_with_objects(["b.txt", "a.txt"]);
+    let bucket = BucketName::new("example-bucket");
+
+    let listing = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                prefix: None,
+                continuation_token: None,
+                max_keys: 0,
+            },
+        )
+        .expect("list zero max keys");
+
+    assert!(listing.objects.is_empty());
+    assert_eq!(listing.max_keys, 0);
+    assert!(!listing.is_truncated);
+    assert_eq!(listing.next_continuation_token, None);
+}
+
+#[test]
+fn list_objects_rejects_malformed_continuation_tokens() {
+    let (_temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    storage.create_bucket(&bucket).expect("create bucket");
+
+    for token in [
+        "token",
+        "s3lab-v1:",
+        "s3lab-v1:0",
+        "s3lab-v1:5A2E747874",
+        "s3lab-v1:gg",
+        "s3lab-v1:c328",
+    ] {
+        let error = storage
+            .list_objects(
+                &bucket,
+                ListObjectsOptions {
+                    prefix: None,
+                    continuation_token: Some(token.to_owned()),
+                    max_keys: 1000,
+                },
+            )
+            .expect_err("malformed continuation token rejected");
+
+        assert!(
+            matches!(error, StorageError::InvalidArgument { .. }),
+            "token should be invalid: {token}"
+        );
+    }
+}
+
+#[test]
+fn list_objects_resumes_at_next_key_when_token_key_was_deleted() {
+    let (_temp_dir, storage) = storage_with_objects(["a.txt", "b.txt", "c.txt"]);
+    let bucket = BucketName::new("example-bucket");
+
+    storage
+        .delete_object(&bucket, &ObjectKey::new("b.txt"))
+        .expect("delete token key");
+
+    let listing = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                prefix: None,
+                continuation_token: Some(continuation_token_for("b.txt")),
+                max_keys: 1000,
+            },
+        )
+        .expect("list after deleted token key");
+
+    assert_eq!(object_keys(&listing.objects), ["c.txt"]);
+    assert!(!listing.is_truncated);
 }
 
 fn storage() -> (TempDir, FilesystemStorage<FixedClock>) {
@@ -1046,6 +1186,17 @@ fn object_keys(metadata: &[StoredObjectMetadata]) -> Vec<&str> {
         .iter()
         .map(|object| object.key.as_str())
         .collect::<Vec<_>>()
+}
+
+fn continuation_token_for(key: &str) -> String {
+    format!("s3lab-v1:{}", lower_hex(key.as_bytes()))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 fn filesystem_path_components(root: &Path) -> Vec<String> {

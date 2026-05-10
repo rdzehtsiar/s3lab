@@ -84,15 +84,27 @@ fn supported_routes_resolve_to_explicit_operations() {
                 bucket: "example-bucket".to_owned(),
                 prefix: None,
                 continuation_token: None,
+                max_keys: 1000,
             },
         ),
         (
             Method::GET,
-            "/example-bucket?list-type=2&prefix=images%2F&continuation-token=page%2F2",
+            "/example-bucket?list-type=2&prefix=images%2F&continuation-token=page%2F2&max-keys=25",
             S3Operation::ListObjectsV2 {
                 bucket: "example-bucket".to_owned(),
                 prefix: Some("images/".to_owned()),
                 continuation_token: Some("page/2".to_owned()),
+                max_keys: 25,
+            },
+        ),
+        (
+            Method::GET,
+            "/example-bucket?list-type=2&max-keys=0",
+            S3Operation::ListObjectsV2 {
+                bucket: "example-bucket".to_owned(),
+                prefix: None,
+                continuation_token: None,
+                max_keys: 0,
             },
         ),
     ];
@@ -229,7 +241,7 @@ async fn unsupported_subresources_return_501_without_storage_call() {
 }
 
 #[tokio::test]
-async fn list_objects_v2_continuation_token_returns_501_without_storage_call() {
+async fn list_objects_v2_continuation_token_calls_storage() {
     let storage = RecordingStorage::default();
     let calls = Arc::clone(&storage.calls);
     let app = router(ServerState::from_storage(storage));
@@ -243,11 +255,119 @@ async fn list_objects_v2_continuation_token_returns_501_without_storage_call() {
         .await
         .expect("route response");
 
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        calls.lock().expect("calls lock").as_slice(),
+        ["list_objects"]
+    );
     let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
-    assert!(body.contains("<Code>NotImplemented</Code>"));
-    assert!(body.contains("continuation-token"));
+    assert!(body.contains("<ListBucketResult>"));
+    assert!(body.contains("<IsTruncated>false</IsTruncated>"));
+}
+
+#[tokio::test]
+async fn list_objects_v2_max_keys_two_returns_paged_xml() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    assert_eq!(
+        app.clone()
+            .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+            .await
+            .expect("create bucket")
+            .status(),
+        StatusCode::OK
+    );
+    for (key, body) in [("z.txt", "z"), ("a.txt", "a"), ("c.txt", "cc")] {
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::PUT,
+                    &format!("/bucket/{key}"),
+                    Body::from(body),
+                ))
+                .await
+                .expect("put object")
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    let first = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=2&max-keys=2",
+            Body::empty(),
+        ))
+        .await
+        .expect("first list page");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = String::from_utf8(body_bytes(first).await.to_vec()).expect("utf-8 XML body");
+    assert_eq!(
+        first_body,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>bucket</Name><Prefix></Prefix><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated><Contents><Key>a.txt</Key><Size>1</Size></Contents><Contents><Key>c.txt</Key><Size>2</Size></Contents><NextContinuationToken>s3lab-v1:7a2e747874</NextContinuationToken></ListBucketResult>"
+    );
+
+    let second = app
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=2&max-keys=2&continuation-token=s3lab-v1%3A7a2e747874",
+            Body::empty(),
+        ))
+        .await
+        .expect("second list page");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = String::from_utf8(body_bytes(second).await.to_vec()).expect("utf-8 XML body");
+    assert_eq!(
+        second_body,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>bucket</Name><Prefix></Prefix><KeyCount>1</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>z.txt</Key><Size>1</Size></Contents></ListBucketResult>"
+    );
+}
+
+#[tokio::test]
+async fn malformed_list_objects_v2_max_keys_values_are_invalid_argument() {
+    for uri in [
+        "/bucket?list-type=2&max-keys=",
+        "/bucket?list-type=2&max-keys=-1",
+        "/bucket?list-type=2&max-keys=%2B1",
+        "/bucket?list-type=2&max-keys=%201",
+        "/bucket?list-type=2&max-keys=1.5",
+        "/bucket?list-type=2&max-keys=abc",
+        "/bucket?list-type=2&max-keys=1001",
+        "/bucket?list-type=2&max-keys=999999999999999999999999999999",
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request(Method::GET, uri, Body::empty()))
+            .await
+            .expect("route response");
+
+        assert_invalid_argument_xml(response, uri).await;
+        assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
+    }
+}
+
+#[tokio::test]
+async fn list_objects_v2_delimiter_is_invalid_argument() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(ServerState::from_storage(storage));
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=2&delimiter=%2F",
+            Body::empty(),
+        ))
+        .await
+        .expect("route response");
+
+    assert_invalid_argument_xml(response, "/bucket?list-type=2&delimiter=%2F").await;
+    assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
 }
 
 #[tokio::test]
@@ -1033,7 +1153,14 @@ async fn assert_invalid_argument_xml(response: axum::http::Response<Body>, resou
     );
     let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
     assert!(body.contains("<Code>InvalidArgument</Code>"));
-    assert!(body.contains(&format!("<Resource>{resource}</Resource>")));
+    assert!(body.contains(&format!("<Resource>{}</Resource>", xml_text(resource))));
+}
+
+fn xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn assert_object_metadata_headers(
@@ -1205,12 +1332,14 @@ impl Storage for RecordingStorage {
     fn list_objects(
         &self,
         bucket: &BucketName,
-        _options: ListObjectsOptions,
+        options: ListObjectsOptions,
     ) -> Result<ObjectListing, StorageError> {
         self.record("list_objects");
         Ok(ObjectListing {
             bucket: bucket.clone(),
             objects: Vec::new(),
+            max_keys: options.max_keys,
+            is_truncated: false,
             next_continuation_token: None,
         })
     }

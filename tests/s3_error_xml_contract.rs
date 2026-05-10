@@ -60,29 +60,49 @@ fn list_objects_v2_xml_represents_empty_prefixed_listing() {
     let listing = ObjectListing {
         bucket: BucketName::new("empty-bucket"),
         objects: Vec::new(),
+        max_keys: 1000,
+        is_truncated: false,
         next_continuation_token: None,
     };
 
     assert_eq!(
         list_objects_v2_response_xml(&listing, Some("logs/&<today>")),
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>empty-bucket</Name><Prefix>logs/&amp;&lt;today&gt;</Prefix><KeyCount>0</KeyCount></ListBucketResult>"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>empty-bucket</Name><Prefix>logs/&amp;&lt;today&gt;</Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"
     );
 }
 
 #[test]
-fn list_objects_v2_xml_preserves_object_order_sizes_and_continuation_token() {
+fn list_objects_v2_xml_preserves_object_order_sizes_and_truncated_token() {
     let listing = ObjectListing {
         bucket: BucketName::new("example-bucket"),
         objects: vec![
             object_metadata("photos/a&b.txt", 11),
             object_metadata("photos/z<last>.txt", 42),
         ],
+        max_keys: 2,
+        is_truncated: true,
         next_continuation_token: Some("next&page<2>".to_owned()),
     };
 
     assert_eq!(
         list_objects_v2_response_xml(&listing, None),
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>example-bucket</Name><KeyCount>2</KeyCount><Contents><Key>photos/a&amp;b.txt</Key><Size>11</Size></Contents><Contents><Key>photos/z&lt;last&gt;.txt</Key><Size>42</Size></Contents><NextContinuationToken>next&amp;page&lt;2&gt;</NextContinuationToken></ListBucketResult>"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>example-bucket</Name><Prefix></Prefix><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated><Contents><Key>photos/a&amp;b.txt</Key><Size>11</Size></Contents><Contents><Key>photos/z&lt;last&gt;.txt</Key><Size>42</Size></Contents><NextContinuationToken>next&amp;page&lt;2&gt;</NextContinuationToken></ListBucketResult>"
+    );
+}
+
+#[test]
+fn list_objects_v2_xml_omits_token_when_not_truncated() {
+    let listing = ObjectListing {
+        bucket: BucketName::new("example-bucket"),
+        objects: vec![object_metadata("photos/a.txt", 11)],
+        max_keys: 1000,
+        is_truncated: false,
+        next_continuation_token: Some("ignored-token".to_owned()),
+    };
+
+    assert_eq!(
+        list_objects_v2_response_xml(&listing, None),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>example-bucket</Name><Prefix></Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>photos/a.txt</Key><Size>11</Size></Contents></ListBucketResult>"
     );
 }
 

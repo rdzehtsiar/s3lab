@@ -32,6 +32,7 @@ pub enum S3Operation {
         bucket: String,
         prefix: Option<String>,
         continuation_token: Option<String>,
+        max_keys: usize,
     },
 }
 
