@@ -3,9 +3,11 @@
 use s3lab::s3::bucket::BucketName;
 use s3lab::s3::error::{S3Error, S3ErrorCode, S3RequestId, TEST_REQUEST_ID};
 use s3lab::s3::object::ObjectKey;
-use s3lab::s3::xml::error_response_xml;
-use s3lab::storage::StorageError;
+use s3lab::s3::xml::{error_response_xml, list_buckets_response_xml, list_objects_v2_response_xml};
+use s3lab::storage::{BucketSummary, ObjectListing, StorageError, StoredObjectMetadata};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use time::OffsetDateTime;
 
 #[test]
 fn no_such_bucket_error_xml_has_stable_field_order() {
@@ -33,6 +35,54 @@ fn error_xml_escapes_resource_and_custom_message_text() {
     assert_eq!(
         error_response_xml(&error),
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidArgument</Code><Message>bad &amp; unsupported &lt;header&gt; value &gt; limit</Message><Resource>/bucket/key?a=1&amp;b=&lt;value&gt;</Resource><RequestId>s3lab-test-request-id</RequestId></Error>"
+    );
+}
+
+#[test]
+fn list_buckets_xml_has_stable_order_and_escapes_bucket_names() {
+    let buckets = [
+        BucketSummary {
+            name: BucketName::new("a&b"),
+        },
+        BucketSummary {
+            name: BucketName::new("z<bucket>"),
+        },
+    ];
+
+    assert_eq!(
+        list_buckets_response_xml(&buckets),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListAllMyBucketsResult><Buckets><Bucket><Name>a&amp;b</Name></Bucket><Bucket><Name>z&lt;bucket&gt;</Name></Bucket></Buckets></ListAllMyBucketsResult>"
+    );
+}
+
+#[test]
+fn list_objects_v2_xml_represents_empty_prefixed_listing() {
+    let listing = ObjectListing {
+        bucket: BucketName::new("empty-bucket"),
+        objects: Vec::new(),
+        next_continuation_token: None,
+    };
+
+    assert_eq!(
+        list_objects_v2_response_xml(&listing, Some("logs/&<today>")),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>empty-bucket</Name><Prefix>logs/&amp;&lt;today&gt;</Prefix><KeyCount>0</KeyCount></ListBucketResult>"
+    );
+}
+
+#[test]
+fn list_objects_v2_xml_preserves_object_order_sizes_and_continuation_token() {
+    let listing = ObjectListing {
+        bucket: BucketName::new("example-bucket"),
+        objects: vec![
+            object_metadata("photos/a&b.txt", 11),
+            object_metadata("photos/z<last>.txt", 42),
+        ],
+        next_continuation_token: Some("next&page<2>".to_owned()),
+    };
+
+    assert_eq!(
+        list_objects_v2_response_xml(&listing, None),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>example-bucket</Name><KeyCount>2</KeyCount><Contents><Key>photos/a&amp;b.txt</Key><Size>11</Size></Contents><Contents><Key>photos/z&lt;last&gt;.txt</Key><Size>42</Size></Contents><NextContinuationToken>next&amp;page&lt;2&gt;</NextContinuationToken></ListBucketResult>"
     );
 }
 
@@ -140,4 +190,16 @@ fn internal_storage_error_conversion_uses_generic_message() {
 #[test]
 fn method_not_allowed_code_string_is_available() {
     assert_eq!(S3ErrorCode::MethodNotAllowed.as_str(), "MethodNotAllowed");
+}
+
+fn object_metadata(key: &str, content_length: u64) -> StoredObjectMetadata {
+    StoredObjectMetadata {
+        bucket: BucketName::new("example-bucket"),
+        key: ObjectKey::new(key),
+        etag: "\"d41d8cd98f00b204e9800998ecf8427e\"".to_owned(),
+        content_length,
+        content_type: Some("text/plain".to_owned()),
+        last_modified: OffsetDateTime::UNIX_EPOCH,
+        user_metadata: BTreeMap::new(),
+    }
 }

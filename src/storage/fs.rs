@@ -9,6 +9,8 @@ use crate::s3::bucket::BucketName;
 use crate::s3::object::ObjectKey;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -27,6 +29,11 @@ static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Process-local serialization keeps filesystem transitions invisible to other
 // public storage operations while the storage layout is intentionally simple.
 static STORAGE_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_NEW_OBJECT_STATE_WRITE: Cell<bool> = const { Cell::new(false) };
+}
 
 pub trait StorageClock {
     fn now_utc(&self) -> OffsetDateTime;
@@ -700,11 +707,24 @@ fn write_new_object_state(
     content: &[u8],
     metadata: &ObjectMetadataRecord,
 ) -> Result<(), StorageError> {
+    #[cfg(test)]
+    if FAIL_NEXT_NEW_OBJECT_STATE_WRITE.with(|fail| fail.replace(false)) {
+        return Err(StorageError::Io {
+            path: object_dir.join(OBJECT_CONTENT_FILE),
+            source: io::Error::other("forced new object write failure"),
+        });
+    }
+
     write_bytes_synced(&object_dir.join(OBJECT_CONTENT_FILE), content)?;
     let metadata_path = object_dir.join(OBJECT_METADATA_FILE);
     write_bytes_synced(&metadata_path, &json_bytes(&metadata_path, metadata)?)?;
     sync_parent_dir_best_effort(&metadata_path);
     Ok(())
+}
+
+#[cfg(test)]
+fn fail_next_new_object_state_write_for_test() {
+    FAIL_NEXT_NEW_OBJECT_STATE_WRITE.with(|fail| fail.set(true));
 }
 
 fn write_object_files_atomically(
@@ -1069,9 +1089,9 @@ fn corrupt_state(path: impl Into<PathBuf>, message: impl Into<String>) -> Storag
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_object_files, replace_file_with_temporary, restore_path_backup,
-        temporary_sibling_path, write_new_bucket_state, BucketRecord, FilesystemStorage,
-        StorageClock, StorageError, OBJECTS_DIR, TEMPORARY_FILE_COUNTER,
+        commit_object_files, fail_next_new_object_state_write_for_test,
+        replace_file_with_temporary, restore_path_backup, write_new_bucket_state, BucketRecord,
+        FilesystemStorage, StorageClock, StorageError, OBJECTS_DIR,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::object::ObjectKey;
@@ -1079,7 +1099,6 @@ mod tests {
     use crate::storage::{PutObjectRequest, Storage};
     use std::collections::BTreeMap;
     use std::fs;
-    use std::sync::atomic::Ordering;
     use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
     #[test]
@@ -1226,10 +1245,7 @@ mod tests {
 
         let encoded_key = encode_object_key(&key).expect("valid key");
         let object_dir = storage.object_dir(&bucket, &encoded_key);
-        TEMPORARY_FILE_COUNTER.store(50_000, Ordering::Relaxed);
-        let blocking_temp_dir = temporary_sibling_path(&object_dir);
-        TEMPORARY_FILE_COUNTER.store(50_000, Ordering::Relaxed);
-        fs::create_dir_all(&blocking_temp_dir).expect("create blocking temp directory");
+        fail_next_new_object_state_write_for_test();
 
         let error = storage
             .put_object(PutObjectRequest {
