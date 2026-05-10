@@ -2,6 +2,7 @@
 
 [![Tests](https://github.com/rdzehtsiar/s3lab/actions/workflows/tests.yml/badge.svg)](https://github.com/rdzehtsiar/s3lab/actions/workflows/tests.yml)
 [![codecov](https://codecov.io/gh/rdzehtsiar/s3lab/graph/badge.svg)](https://codecov.io/gh/rdzehtsiar/s3lab)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=rdzehtsiar_s3lab&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=rdzehtsiar_s3lab)
 
 S3Lab is planned as a fully offline S3 compatibility and protocol debugging lab for engineers who build, test, or troubleshoot S3-compatible workflows locally.
 
