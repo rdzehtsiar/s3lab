@@ -1,0 +1,8 @@
+[package]
+name = "s3lab"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Offline S3 compatibility and protocol debugging lab."
+
+[dependencies]
