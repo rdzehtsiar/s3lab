@@ -6,6 +6,7 @@ use hyper::body::Bytes;
 use hyper::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG};
 use hyper::http::{Method, Response, StatusCode};
 use support::{request, response_bytes, response_text, TestServer, TEST_SUPPORT_MARKER};
+use tempfile::TempDir;
 
 #[tokio::test]
 async fn bucket_lifecycle_over_real_http() {
@@ -191,6 +192,96 @@ async fn list_objects_prefix_over_real_http() {
     );
 
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn server_recreation_preserves_bucket_and_object_state_over_real_http() {
+    let data_dir = TempDir::new().expect("create externally owned data dir");
+    let first_server = TestServer::start_with_data_dir(data_dir.path().to_path_buf()).await;
+
+    for bucket in ["bucket-b", "bucket-a"] {
+        assert_eq!(
+            request(
+                Method::PUT,
+                &first_server.url(&format!("/{bucket}")),
+                Bytes::new(),
+                &[]
+            )
+            .await
+            .expect("create bucket")
+            .status(),
+            StatusCode::OK
+        );
+    }
+
+    let put = request(
+        Method::PUT,
+        &first_server.url("/bucket-a/prefix/object.txt"),
+        Bytes::from_static(b"hello"),
+        &[("content-type", "text/plain"), ("x-amz-meta-case", "value")],
+    )
+    .await
+    .expect("put object before recreation");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert!(response_bytes(put).await.expect("put body").is_empty());
+
+    first_server.shutdown().await;
+
+    let second_server = TestServer::start_with_data_dir(data_dir.path().to_path_buf()).await;
+
+    let list_buckets = request(Method::GET, &second_server.url("/"), Bytes::new(), &[])
+        .await
+        .expect("list buckets after recreation");
+    assert_eq!(list_buckets.status(), StatusCode::OK);
+    assert_eq!(
+        response_text(list_buckets).await.expect("list buckets body"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListAllMyBucketsResult><Buckets><Bucket><Name>bucket-a</Name></Bucket><Bucket><Name>bucket-b</Name></Bucket></Buckets></ListAllMyBucketsResult>"
+    );
+
+    let head = request(
+        Method::HEAD,
+        &second_server.url("/bucket-a/prefix/object.txt"),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("head object after recreation");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_object_headers(&head);
+    assert!(response_bytes(head).await.expect("head body").is_empty());
+
+    let get = request(
+        Method::GET,
+        &second_server.url("/bucket-a/prefix/object.txt"),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("get object after recreation");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_object_headers(&get);
+    assert_eq!(
+        response_bytes(get).await.expect("get body"),
+        Bytes::from_static(b"hello")
+    );
+
+    let list_objects = request(
+        Method::GET,
+        &second_server.url("/bucket-a?list-type=2&prefix=prefix%2F"),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("list objects after recreation");
+    assert_eq!(list_objects.status(), StatusCode::OK);
+    assert_eq!(
+        response_text(list_objects)
+            .await
+            .expect("list objects body"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>bucket-a</Name><Prefix>prefix/</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>prefix/object.txt</Key><Size>5</Size></Contents></ListBucketResult>"
+    );
+
+    second_server.shutdown().await;
 }
 
 #[tokio::test]

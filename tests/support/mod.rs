@@ -10,6 +10,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use s3lab::server::router;
 use s3lab::server::state::ServerState;
+use std::path::PathBuf;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -20,7 +21,7 @@ pub const TEST_SUPPORT_MARKER: &str = "offline-deterministic-tests";
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct TestServer {
-    _temp_dir: TempDir,
+    _temp_dir: Option<TempDir>,
     base_url: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<std::io::Result<()>>>,
@@ -29,13 +30,23 @@ pub struct TestServer {
 impl TestServer {
     pub async fn start() -> Self {
         let temp_dir = TempDir::new().expect("create test server data dir");
+        let data_dir = temp_dir.path().to_path_buf();
+
+        Self::start_inner(data_dir, Some(temp_dir)).await
+    }
+
+    pub async fn start_with_data_dir(path: impl Into<PathBuf>) -> Self {
+        Self::start_inner(path.into(), None).await
+    }
+
+    async fn start_inner(data_dir: PathBuf, temp_dir: Option<TempDir>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind test server to loopback ephemeral port");
         let address = listener
             .local_addr()
             .expect("read bound test server address");
-        let app = router(ServerState::filesystem(temp_dir.path()));
+        let app = router(ServerState::filesystem(data_dir));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let task = tokio::spawn(async move {
