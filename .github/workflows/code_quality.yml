@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-name: Code Quality
+name: Qodana
 
 on:
   workflow_dispatch:
