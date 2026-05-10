@@ -226,18 +226,105 @@ fn known_s3_subresources_are_not_implemented() {
 }
 
 #[tokio::test]
+async fn method_not_allowed_route_errors_return_s3_xml_without_storage_call() {
+    for (method, uri) in [
+        (Method::POST, "/"),
+        (Method::POST, "/bucket"),
+        (Method::PATCH, "/bucket/key"),
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request(method, uri, Body::empty()))
+            .await
+            .expect("route response");
+
+        assert_s3_error_xml(
+            response,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            uri,
+        )
+        .await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
 async fn unsupported_subresources_return_501_without_storage_call() {
-    let storage = RecordingStorage::default();
-    let calls = Arc::clone(&storage.calls);
-    let app = router(ServerState::from_storage(storage));
+    for (method, uri) in [
+        (Method::GET, "/bucket?acl"),
+        (Method::PUT, "/bucket/key?tagging"),
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
 
-    let response = app
-        .oneshot(request(Method::GET, "/bucket?acl", Body::empty()))
-        .await
-        .expect("route response");
+        let response = app
+            .oneshot(request(method, uri, Body::empty()))
+            .await
+            .expect("route response");
 
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
+        assert_s3_error_xml(response, StatusCode::NOT_IMPLEMENTED, "NotImplemented", uri).await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn head_route_errors_have_request_id_and_no_body() {
+    for (uri, status) in [
+        ("/bucket?acl", StatusCode::NOT_IMPLEMENTED),
+        ("/bucket?unknown=value", StatusCode::BAD_REQUEST),
+        ("/bucket/key?unknown=value", StatusCode::BAD_REQUEST),
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request(Method::HEAD, uri, Body::empty()))
+            .await
+            .expect("route response");
+
+        assert_head_error(response, status).await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn bucket_list_query_without_list_type_remains_not_implemented() {
+    for uri in ["/bucket?prefix=a", "/bucket?max-keys=10"] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request(Method::GET, uri, Body::empty()))
+            .await
+            .expect("route response");
+
+        assert_s3_error_xml(response, StatusCode::NOT_IMPLEMENTED, "NotImplemented", uri).await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn malformed_query_names_are_invalid_argument() {
+    for uri in ["/bucket?=value", "/bucket?bad%ZZ=value"] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request(Method::GET, uri, Body::empty()))
+            .await
+            .expect("route response");
+
+        assert_s3_error_xml(response, StatusCode::BAD_REQUEST, "InvalidArgument", uri).await;
+        assert_no_storage_calls(&calls);
+    }
 }
 
 #[tokio::test]
@@ -1187,6 +1274,13 @@ async fn assert_invalid_argument_xml(response: axum::http::Response<Body>, resou
     assert_eq!(
         response
             .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/xml")
+    );
+    assert_eq!(
+        response
+            .headers()
             .get("x-amz-request-id")
             .and_then(|v| v.to_str().ok()),
         Some("s3lab-test-request-id")
@@ -1194,6 +1288,48 @@ async fn assert_invalid_argument_xml(response: axum::http::Response<Body>, resou
     let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
     assert!(body.contains("<Code>InvalidArgument</Code>"));
     assert!(body.contains(&format!("<Resource>{}</Resource>", xml_text(resource))));
+}
+
+async fn assert_s3_error_xml(
+    response: axum::http::Response<Body>,
+    status: StatusCode,
+    code: &str,
+    resource: &str,
+) {
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/xml")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains(&format!("<Code>{code}</Code>")));
+    assert!(body.contains(&format!("<Resource>{}</Resource>", xml_text(resource))));
+}
+
+async fn assert_head_error(response: axum::http::Response<Body>, status: StatusCode) {
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    assert!(body_bytes(response).await.is_empty());
+}
+
+fn assert_no_storage_calls(calls: &Arc<Mutex<Vec<&'static str>>>) {
+    assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
 }
 
 fn xml_text(value: &str) -> String {
