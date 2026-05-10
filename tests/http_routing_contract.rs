@@ -567,6 +567,203 @@ async fn filesystem_backed_router_supports_basic_bucket_and_object_flow() {
 }
 
 #[tokio::test]
+async fn object_lifecycle_put_overwrite_get_head_delete_contract() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/object.bin",
+            Body::from(vec![0, 1, 2, 255]),
+        ))
+        .await
+        .expect("put object");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert!(body_bytes(put).await.is_empty());
+
+    let get = app
+        .clone()
+        .oneshot(request(Method::GET, "/bucket/object.bin", Body::empty()))
+        .await
+        .expect("get object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(
+        body_bytes(get).await,
+        Bytes::from_static(b"\x00\x01\x02\xff")
+    );
+
+    let head = app
+        .clone()
+        .oneshot(request(Method::HEAD, "/bucket/object.bin", Body::empty()))
+        .await
+        .expect("head object");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(
+        head.headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some("4")
+    );
+    assert!(body_bytes(head).await.is_empty());
+
+    let overwrite = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/object.bin",
+            Body::from(vec![9, 8, 7]),
+        ))
+        .await
+        .expect("overwrite object");
+    assert_eq!(overwrite.status(), StatusCode::OK);
+    assert!(body_bytes(overwrite).await.is_empty());
+
+    let overwritten_get = app
+        .clone()
+        .oneshot(request(Method::GET, "/bucket/object.bin", Body::empty()))
+        .await
+        .expect("get overwritten object");
+    assert_eq!(overwritten_get.status(), StatusCode::OK);
+    assert_eq!(
+        body_bytes(overwritten_get).await,
+        Bytes::from_static(b"\x09\x08\x07")
+    );
+
+    let overwritten_head = app
+        .clone()
+        .oneshot(request(Method::HEAD, "/bucket/object.bin", Body::empty()))
+        .await
+        .expect("head overwritten object");
+    assert_eq!(overwritten_head.status(), StatusCode::OK);
+    assert_eq!(
+        overwritten_head
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert!(body_bytes(overwritten_head).await.is_empty());
+
+    let delete = app
+        .clone()
+        .oneshot(request(Method::DELETE, "/bucket/object.bin", Body::empty()))
+        .await
+        .expect("delete object");
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    assert!(body_bytes(delete).await.is_empty());
+
+    let missing_get = app
+        .clone()
+        .oneshot(request(Method::GET, "/bucket/object.bin", Body::empty()))
+        .await
+        .expect("get deleted object");
+    assert_eq!(missing_get.status(), StatusCode::NOT_FOUND);
+    let body = String::from_utf8(body_bytes(missing_get).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>NoSuchKey</Code>"));
+    assert!(body.contains("<Resource>/bucket/object.bin</Resource>"));
+
+    let repeated_delete = app
+        .oneshot(request(Method::DELETE, "/bucket/object.bin", Body::empty()))
+        .await
+        .expect("delete already missing object");
+    assert_eq!(repeated_delete.status(), StatusCode::NO_CONTENT);
+    assert!(body_bytes(repeated_delete).await.is_empty());
+}
+
+#[tokio::test]
+async fn object_lifecycle_missing_bucket_and_key_errors_are_s3_errors() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let missing_bucket_put = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/missing-bucket/object.txt",
+            Body::from("body"),
+        ))
+        .await
+        .expect("put missing bucket object");
+    assert_eq!(missing_bucket_put.status(), StatusCode::NOT_FOUND);
+    let body =
+        String::from_utf8(body_bytes(missing_bucket_put).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>NoSuchBucket</Code>"));
+
+    let missing_bucket_get = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/missing-bucket/object.txt",
+            Body::empty(),
+        ))
+        .await
+        .expect("get missing bucket object");
+    assert_eq!(missing_bucket_get.status(), StatusCode::NOT_FOUND);
+    let body =
+        String::from_utf8(body_bytes(missing_bucket_get).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>NoSuchBucket</Code>"));
+
+    let missing_bucket_head = app
+        .clone()
+        .oneshot(request(
+            Method::HEAD,
+            "/missing-bucket/object.txt",
+            Body::empty(),
+        ))
+        .await
+        .expect("head missing bucket object");
+    assert_eq!(missing_bucket_head.status(), StatusCode::NOT_FOUND);
+    assert!(body_bytes(missing_bucket_head).await.is_empty());
+
+    let missing_bucket_delete = app
+        .clone()
+        .oneshot(request(
+            Method::DELETE,
+            "/missing-bucket/object.txt",
+            Body::empty(),
+        ))
+        .await
+        .expect("delete missing bucket object");
+    assert_eq!(missing_bucket_delete.status(), StatusCode::NOT_FOUND);
+    let body = String::from_utf8(body_bytes(missing_bucket_delete).await.to_vec())
+        .expect("utf-8 XML body");
+    assert!(body.contains("<Code>NoSuchBucket</Code>"));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let missing_key_get = app
+        .clone()
+        .oneshot(request(Method::GET, "/bucket/missing.txt", Body::empty()))
+        .await
+        .expect("get missing key");
+    assert_eq!(missing_key_get.status(), StatusCode::NOT_FOUND);
+    let body =
+        String::from_utf8(body_bytes(missing_key_get).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>NoSuchKey</Code>"));
+
+    let missing_key_head = app
+        .oneshot(request(Method::HEAD, "/bucket/missing.txt", Body::empty()))
+        .await
+        .expect("head missing key");
+    assert_eq!(missing_key_head.status(), StatusCode::NOT_FOUND);
+    assert!(body_bytes(missing_key_head).await.is_empty());
+}
+
+#[tokio::test]
 async fn delete_bucket_and_object_successes_return_204_no_content() {
     let temp_dir = TempDir::new().expect("temp dir");
     let app = router(ServerState::filesystem(temp_dir.path()));
