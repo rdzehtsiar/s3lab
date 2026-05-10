@@ -1,6 +1,6 @@
 # Phase 1 Smoke Tests
 
-This page documents a narrow AWS CLI smoke recipe for S3Lab Phase 1. It is intended to produce local evidence that the current Phase 1 endpoint can accept a basic AWS CLI bucket and object lifecycle against `localhost`.
+This page documents narrow AWS CLI and Python boto3 smoke recipes for S3Lab Phase 1. It is intended to produce local evidence that the current Phase 1 endpoint can accept a basic bucket and object lifecycle against `localhost`.
 
 This is not a general compatibility claim. Phase 1 smoke evidence only covers the operations exercised below.
 
@@ -8,10 +8,11 @@ This is not a general compatibility claim. Phase 1 smoke evidence only covers th
 
 - S3Lab is running locally and listening on a loopback endpoint such as `http://127.0.0.1:9000`.
 - The smoke test uses a temporary local data directory.
-- The AWS CLI is installed and available as `aws`.
-- The AWS CLI uses dummy credentials. No cloud account is required.
-- Requests stay offline and target only the local S3Lab endpoint through `--endpoint-url`.
-- Phase 1 accepts signed AWS CLI requests but does not validate SigV4 signatures yet.
+- The AWS CLI is installed and available as `aws` for the AWS CLI recipe.
+- Python and boto3 are installed for the boto3 recipe.
+- Clients use dummy credentials. No cloud account is required.
+- Requests stay offline and target only the local S3Lab endpoint through `--endpoint-url` or boto3 `endpoint_url`.
+- Phase 1 accepts signed client requests but does not validate SigV4 signatures yet.
 - Phase 1 supports path-style localhost routing, for example `http://127.0.0.1:9000/s3lab-smoke-bucket/object.txt`.
 - Virtual-host style routing, presigned URLs, and multipart uploads are deferred.
 
@@ -31,7 +32,7 @@ S3 endpoint:  http://127.0.0.1:9000
 Data dir:     <temporary data directory>
 ```
 
-Leave this terminal running while using the AWS CLI commands below.
+Leave this terminal running while using the smoke commands below.
 
 ## AWS CLI Smoke Recipe
 
@@ -66,9 +67,54 @@ The downloaded file should contain:
 hello from s3lab phase 1
 ```
 
+## Python boto3 Smoke Recipe
+
+Run this Python script in a second terminal:
+
+```python
+import boto3
+from botocore.config import Config
+
+endpoint_url = "http://127.0.0.1:9000"
+bucket = "s3lab-smoke-boto3-bucket"
+key = "hello.txt"
+body = b"hello from s3lab phase 1"
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=endpoint_url,
+    region_name="us-east-1",
+    aws_access_key_id="s3lab",
+    aws_secret_access_key="s3lab-secret",
+    config=Config(
+        signature_version="s3v4",
+        s3={"addressing_style": "path"},
+    ),
+)
+
+s3.create_bucket(Bucket=bucket)
+s3.put_object(Bucket=bucket, Key=key, Body=body)
+
+listed = s3.list_objects_v2(Bucket=bucket)
+print([item["Key"] for item in listed.get("Contents", [])])
+
+downloaded = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+print(downloaded.decode("utf-8"))
+
+s3.delete_object(Bucket=bucket, Key=key)
+s3.delete_bucket(Bucket=bucket)
+```
+
+The output should include:
+
+```text
+['hello.txt']
+hello from s3lab phase 1
+```
+
 ## What This Exercises
 
-This recipe exercises only this local Phase 1 path:
+These recipes exercise only this local Phase 1 path:
 
 - create one bucket
 - put one object
