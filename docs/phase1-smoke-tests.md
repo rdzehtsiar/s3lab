@@ -1,6 +1,6 @@
 # Phase 1 Smoke Tests
 
-This page documents narrow AWS CLI and Python boto3 smoke recipes for S3Lab Phase 1. It is intended to produce local evidence that the current Phase 1 endpoint can accept a basic bucket and object lifecycle against `localhost`.
+This page documents narrow AWS CLI, Python boto3, and Go SDK smoke recipes for S3Lab Phase 1. It is intended to produce local evidence that the current Phase 1 endpoint can accept a basic bucket and object lifecycle against `localhost`.
 
 This is not a general compatibility claim. Phase 1 smoke evidence only covers the operations exercised below.
 
@@ -10,8 +10,9 @@ This is not a general compatibility claim. Phase 1 smoke evidence only covers th
 - The smoke test uses a temporary local data directory.
 - The AWS CLI is installed and available as `aws` for the AWS CLI recipe.
 - Python and boto3 are installed for the boto3 recipe.
+- Go is installed for the Go SDK recipe.
 - Clients use dummy credentials. No cloud account is required.
-- Requests stay offline and target only the local S3Lab endpoint through `--endpoint-url` or boto3 `endpoint_url`.
+- Requests stay offline and target only the local S3Lab endpoint through `--endpoint-url`, boto3 `endpoint_url`, or the Go SDK local endpoint configuration.
 - Phase 1 accepts signed client requests but does not validate SigV4 signatures yet.
 - Phase 1 supports path-style localhost routing, for example `http://127.0.0.1:9000/s3lab-smoke-bucket/object.txt`.
 - Virtual-host style routing, presigned URLs, and multipart uploads are deferred.
@@ -109,6 +110,124 @@ The output should include:
 
 ```text
 ['hello.txt']
+hello from s3lab phase 1
+```
+
+## Go SDK Smoke Recipe
+
+Create a temporary Go module in a second terminal:
+
+```powershell
+$SmokeDir = Join-Path $env:TEMP "s3lab-go-smoke-$([guid]::NewGuid())"
+New-Item -ItemType Directory -Path $SmokeDir | Out-Null
+Set-Location $SmokeDir
+go mod init s3lab-go-smoke
+go get github.com/aws/aws-sdk-go-v2/config github.com/aws/aws-sdk-go-v2/credentials github.com/aws/aws-sdk-go-v2/service/s3
+```
+
+Create `main.go` in that directory:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"strings"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+)
+
+func main() {
+	ctx := context.Background()
+	endpoint := "http://127.0.0.1:9000"
+	bucket := "s3lab-smoke-go-bucket"
+	key := "hello.txt"
+	body := "hello from s3lab phase 1"
+
+	cfg, err := config.LoadDefaultConfig(
+		ctx,
+		config.WithRegion("us-east-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("s3lab", "s3lab-secret", "")),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	client := s3.NewFromConfig(cfg, func(options *s3.Options) {
+		options.BaseEndpoint = aws.String(endpoint)
+		options.UsePathStyle = true
+	})
+
+	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String(bucket),
+	}); err != nil {
+		log.Fatal(err)
+	}
+
+	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   strings.NewReader(body),
+	}); err != nil {
+		log.Fatal(err)
+	}
+
+	listed, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, object := range listed.Contents {
+		fmt.Println(*object.Key)
+	}
+
+	downloaded, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer downloaded.Body.Close()
+
+	content, err := io.ReadAll(downloaded.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(content))
+
+	if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	}); err != nil {
+		log.Fatal(err)
+	}
+
+	if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{
+		Bucket: aws.String(bucket),
+	}); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+Run it:
+
+```powershell
+go run .
+```
+
+The output should include:
+
+```text
+hello.txt
 hello from s3lab phase 1
 ```
 
