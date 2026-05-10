@@ -2,3 +2,4 @@
 /s3lab-data/
 /.plan/
 /lcov.info
+/codecov.json
