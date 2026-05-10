@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod fs;
-pub mod key;
+pub(crate) mod key;
 
 use crate::s3::bucket::BucketName;
-use crate::s3::error::S3ErrorCode;
 use crate::s3::object::ObjectKey;
 use std::collections::BTreeMap;
 use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const STORAGE_ROOT_DIR: &str = "buckets";
+pub const DEFAULT_OBJECT_CONTENT_TYPE: &str = "binary/octet-stream";
 
 pub trait Storage {
     fn create_bucket(&self, bucket: &BucketName) -> Result<(), StorageError>;
@@ -144,32 +144,14 @@ pub enum StorageError {
     },
 }
 
-impl From<&StorageError> for S3ErrorCode {
-    fn from(error: &StorageError) -> Self {
-        match error {
-            StorageError::BucketAlreadyExists { .. } => Self::BucketAlreadyOwnedByYou,
-            StorageError::BucketNotEmpty { .. } => Self::BucketNotEmpty,
-            StorageError::NoSuchBucket { .. } => Self::NoSuchBucket,
-            StorageError::NoSuchKey { .. } => Self::NoSuchKey,
-            StorageError::InvalidBucketName { .. } => Self::InvalidBucketName,
-            StorageError::InvalidObjectKey { .. } | StorageError::InvalidArgument { .. } => {
-                Self::InvalidArgument
-            }
-            StorageError::CorruptState { .. } | StorageError::Io { .. } => Self::InternalError,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ListObjectsOptions, ObjectListing, PutObjectRequest, StorageError, StoredObjectMetadata,
     };
     use crate::s3::bucket::BucketName;
-    use crate::s3::error::S3ErrorCode;
     use crate::s3::object::ObjectKey;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
     use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
     #[test]
@@ -258,74 +240,6 @@ mod tests {
         assert!(bucket_error.to_string().contains("example-bucket"));
         assert!(key_error.to_string().contains("example-bucket"));
         assert!(key_error.to_string().contains("missing.txt"));
-    }
-
-    #[test]
-    fn storage_errors_map_to_s3_error_codes() {
-        let bucket = BucketName::new("example-bucket");
-        let key = ObjectKey::new("missing.txt");
-
-        let cases = [
-            (
-                StorageError::BucketAlreadyExists {
-                    bucket: bucket.clone(),
-                },
-                S3ErrorCode::BucketAlreadyOwnedByYou,
-            ),
-            (
-                StorageError::BucketNotEmpty {
-                    bucket: bucket.clone(),
-                },
-                S3ErrorCode::BucketNotEmpty,
-            ),
-            (
-                StorageError::NoSuchBucket {
-                    bucket: bucket.clone(),
-                },
-                S3ErrorCode::NoSuchBucket,
-            ),
-            (
-                StorageError::NoSuchKey {
-                    bucket: bucket.clone(),
-                    key,
-                },
-                S3ErrorCode::NoSuchKey,
-            ),
-            (
-                StorageError::InvalidBucketName {
-                    bucket: "bad_bucket".to_owned(),
-                },
-                S3ErrorCode::InvalidBucketName,
-            ),
-            (
-                StorageError::InvalidObjectKey { key: String::new() },
-                S3ErrorCode::InvalidArgument,
-            ),
-            (
-                StorageError::InvalidArgument {
-                    message: "bad continuation token".to_owned(),
-                },
-                S3ErrorCode::InvalidArgument,
-            ),
-            (
-                StorageError::Io {
-                    path: PathBuf::from("metadata.json"),
-                    source: std::io::Error::other("disk error"),
-                },
-                S3ErrorCode::InternalError,
-            ),
-            (
-                StorageError::CorruptState {
-                    path: PathBuf::from("metadata.json"),
-                    message: "invalid json".to_owned(),
-                },
-                S3ErrorCode::InternalError,
-            ),
-        ];
-
-        for (error, expected) in cases {
-            assert_eq!(S3ErrorCode::from(&error), expected);
-        }
     }
 
     fn fixed_last_modified() -> OffsetDateTime {

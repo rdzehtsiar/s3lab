@@ -8,8 +8,9 @@ use hyper::http::{HeaderValue, Method, Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use s3lab::server::router;
+use s3lab::server::serve_listener_until;
 use s3lab::server::state::ServerState;
+use s3lab::storage::fs::FilesystemStorage;
 use std::path::PathBuf;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -22,6 +23,7 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct TestServer {
     _temp_dir: Option<TempDir>,
+    data_dir: Option<PathBuf>,
     base_url: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<std::io::Result<()>>>,
@@ -40,25 +42,38 @@ impl TestServer {
     }
 
     async fn start_inner(data_dir: PathBuf, temp_dir: Option<TempDir>) -> Self {
+        Self::start_with_state(
+            ServerState::from_storage(FilesystemStorage::new(data_dir.clone())),
+            temp_dir,
+            Some(data_dir),
+        )
+        .await
+    }
+
+    pub async fn start_with_state(
+        state: ServerState,
+        temp_dir: Option<TempDir>,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind test server to loopback ephemeral port");
         let address = listener
             .local_addr()
             .expect("read bound test server address");
-        let app = router(ServerState::filesystem(data_dir));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
+            serve_listener_until(listener, state, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .map_err(std::io::Error::other)
         });
 
         Self {
             _temp_dir: temp_dir,
+            data_dir,
             base_url: format!("http://{address}"),
             shutdown_tx: Some(shutdown_tx),
             task: Some(task),
@@ -67,6 +82,10 @@ impl TestServer {
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.data_dir.as_deref()
     }
 
     pub fn url(&self, path_and_query: &str) -> String {

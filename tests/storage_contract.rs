@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use s3lab::s3::bucket::BucketName;
-use s3lab::s3::object::ObjectKey;
+use s3lab::s3::object::{ObjectKey, MAX_OBJECT_KEY_UTF8_BYTES};
 use s3lab::storage::fs::{FilesystemStorage, StorageClock};
-use s3lab::storage::key::{encode_bucket_name, encode_object_key};
 use s3lab::storage::{
     ListObjectsOptions, PutObjectRequest, Storage, StorageError, StoredObjectMetadata,
     STORAGE_ROOT_DIR,
 };
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -53,6 +55,45 @@ fn duplicate_bucket_create_returns_bucket_already_exists() {
         StorageError::BucketAlreadyExists { bucket: failed_bucket }
             if failed_bucket == bucket
     ));
+}
+
+#[test]
+fn create_bucket_rejects_invalid_bucket_names_without_storing_them() {
+    for name in [
+        "ab",
+        "Uppercase",
+        "bad_bucket",
+        "bucket..name",
+        "bucket.-name",
+        "bucket-.name",
+        "192.168.0.1",
+        "bucket/name",
+        "xn--bucket",
+        "sthree-bucket",
+        "amzn-s3-demo-bucket",
+        "bucket-s3alias",
+        "bucket--ol-s3",
+        "bucket.mrap",
+        "bucket--x-s3",
+        "bucket--table-s3",
+    ] {
+        let (temp_dir, storage) = storage();
+        let bucket = BucketName::new(name);
+
+        let error = storage
+            .create_bucket(&bucket)
+            .expect_err("invalid bucket create fails");
+
+        assert!(matches!(
+            error,
+            StorageError::InvalidBucketName { bucket: failed_bucket }
+                if failed_bucket == name
+        ));
+        assert!(
+            !temp_dir.path().join(STORAGE_ROOT_DIR).exists(),
+            "invalid bucket should not create storage root: {name}"
+        );
+    }
 }
 
 #[test]
@@ -134,6 +175,48 @@ fn list_buckets_rejects_mismatched_bucket_metadata_path() {
         .expect_err("mismatched bucket metadata path fails");
 
     assert!(matches!(error, StorageError::CorruptState { .. }));
+}
+
+#[test]
+fn list_buckets_rejects_invalid_bucket_name_metadata_even_when_path_matches() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("bad_bucket");
+    write_bucket_state(temp_dir.path(), &bucket);
+
+    let error = storage
+        .list_buckets()
+        .expect_err("invalid persisted bucket name fails");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+}
+
+#[test]
+fn direct_bucket_operations_reject_invalid_bucket_name_metadata_even_when_path_matches() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("bad_bucket");
+
+    for operation in ["bucket_exists", "delete_bucket", "put_object"] {
+        write_bucket_state(temp_dir.path(), &bucket);
+        let error = match operation {
+            "bucket_exists" => storage
+                .bucket_exists(&bucket)
+                .map(|_| ())
+                .expect_err("bucket_exists rejects invalid persisted bucket name"),
+            "delete_bucket" => storage
+                .delete_bucket(&bucket)
+                .expect_err("delete_bucket rejects invalid persisted bucket name"),
+            "put_object" => storage
+                .put_object(put_request(&bucket, "object.txt", b"body"))
+                .map(|_| ())
+                .expect_err("put_object rejects invalid persisted bucket name"),
+            _ => unreachable!("covered operation"),
+        };
+
+        assert!(
+            matches!(error, StorageError::CorruptState { .. }),
+            "{operation} should report invalid persisted bucket name as corrupt state"
+        );
+    }
 }
 
 #[test]
@@ -219,6 +302,87 @@ fn delete_bucket_fails_when_bucket_contains_objects() {
 }
 
 #[test]
+fn delete_bucket_ignores_hidden_leftovers_and_empty_shard_dirs() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    storage.create_bucket(&bucket).expect("create bucket");
+
+    let objects_dir = bucket_dir(temp_dir.path(), &bucket).join("objects");
+    fs::create_dir_all(
+        objects_dir
+            .join(".staged-shard.tmp-1")
+            .join("incomplete-object"),
+    )
+    .expect("create hidden staged shard");
+    fs::create_dir_all(objects_dir.join("ab")).expect("create empty visible shard");
+    fs::create_dir_all(objects_dir.join("cd").join(".object-dir.tmp-1"))
+        .expect("create hidden staged object dir");
+    fs::write(objects_dir.join(".metadata.json.bak-1"), b"backup")
+        .expect("write hidden backup file");
+
+    assert!(storage
+        .list_objects(&bucket, ListObjectsOptions::default())
+        .expect("hidden leftovers are not listed")
+        .objects
+        .is_empty());
+
+    storage
+        .delete_bucket(&bucket)
+        .expect("delete bucket with only hidden leftovers");
+
+    assert!(!bucket_dir(temp_dir.path(), &bucket).exists());
+}
+
+#[test]
+fn delete_bucket_preserves_bucket_not_empty_for_committed_object_with_hidden_leftovers() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, "object.txt", b"body"))
+        .expect("put object");
+
+    let objects_dir = bucket_dir(temp_dir.path(), &bucket).join("objects");
+    fs::create_dir_all(
+        objects_dir
+            .join(".staged-shard.tmp-1")
+            .join("incomplete-object"),
+    )
+    .expect("create hidden staged shard");
+    fs::create_dir_all(objects_dir.join("ab")).expect("create empty visible shard");
+
+    let error = storage
+        .delete_bucket(&bucket)
+        .expect_err("committed object keeps bucket non-empty");
+
+    assert!(matches!(
+        error,
+        StorageError::BucketNotEmpty { bucket: failed_bucket }
+            if failed_bucket == bucket
+    ));
+}
+
+#[test]
+fn delete_bucket_reports_visible_object_metadata_corruption() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("object.txt");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"body"))
+        .expect("put object");
+    fs::remove_file(object_paths(temp_dir.path(), &bucket, &key).metadata)
+        .expect("remove visible object metadata");
+
+    let error = storage
+        .delete_bucket(&bucket)
+        .expect_err("visible object metadata corruption is not ignored");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+    assert!(bucket_dir(temp_dir.path(), &bucket).exists());
+}
+
+#[test]
 fn delete_object_removes_object_state_and_allows_bucket_delete() {
     let (temp_dir, storage) = storage();
     let bucket = BucketName::new("example-bucket");
@@ -283,18 +447,10 @@ fn delete_object_preserves_shard_directory_with_sibling_object() {
     let (temp_dir, storage) = storage();
     let bucket = BucketName::new("example-bucket");
     let first_key = ObjectKey::new("first.txt");
-    let first_shard = encode_object_key(&first_key)
-        .expect("valid first key")
-        .shard()
-        .to_owned();
+    let first_shard = object_key_shard(&first_key);
     let sibling_key = (0..10_000)
         .map(|index| ObjectKey::new(format!("sibling-{index}.txt")))
-        .find(|candidate| {
-            encode_object_key(candidate)
-                .expect("valid sibling key")
-                .shard()
-                == first_shard
-        })
+        .find(|candidate| object_key_shard(candidate) == first_shard)
         .expect("find key in same shard");
     storage.create_bucket(&bucket).expect("create bucket");
     storage
@@ -372,6 +528,99 @@ fn put_object_persists_bytes_and_metadata() {
 }
 
 #[test]
+fn put_object_accepts_path_like_key_at_utf8_byte_limit() {
+    let (_temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = "nested/".to_owned() + &"a".repeat(MAX_OBJECT_KEY_UTF8_BYTES - "nested/".len());
+    storage.create_bucket(&bucket).expect("create bucket");
+
+    let metadata = storage
+        .put_object(put_request(&bucket, &key, b"body"))
+        .expect("put key at byte limit");
+
+    assert_metadata_matches(&metadata, &bucket, &key, 4);
+    assert_eq!(
+        storage
+            .get_object_bytes(&bucket, &ObjectKey::new(&key))
+            .expect("get object at byte limit"),
+        b"body"
+    );
+}
+
+#[test]
+fn put_object_rejects_keys_over_utf8_byte_limit_without_storing_them() {
+    for key in [
+        "a".repeat(MAX_OBJECT_KEY_UTF8_BYTES + 1),
+        "é".repeat((MAX_OBJECT_KEY_UTF8_BYTES / 2) + 1),
+    ] {
+        let (_temp_dir, storage) = storage();
+        let bucket = BucketName::new("example-bucket");
+        storage.create_bucket(&bucket).expect("create bucket");
+
+        let error = storage
+            .put_object(put_request(&bucket, &key, b"body"))
+            .expect_err("oversized key is invalid");
+
+        assert!(matches!(error, StorageError::InvalidObjectKey { .. }));
+        assert!(
+            storage
+                .list_objects(&bucket, ListObjectsOptions::default())
+                .expect("list objects after rejected put")
+                .objects
+                .is_empty(),
+            "oversized key should not create a listed object"
+        );
+    }
+}
+
+#[test]
+fn put_object_rejects_xml_invalid_control_characters_without_storing_them() {
+    for key in ["prefix/\0object.txt", "prefix/\u{1F}object.txt"] {
+        let (_temp_dir, storage) = storage();
+        let bucket = BucketName::new("example-bucket");
+        storage.create_bucket(&bucket).expect("create bucket");
+
+        let error = storage
+            .put_object(put_request(&bucket, key, b"body"))
+            .expect_err("XML-invalid key is invalid");
+
+        assert!(matches!(error, StorageError::InvalidObjectKey { .. }));
+        assert!(
+            storage
+                .list_objects(&bucket, ListObjectsOptions::default())
+                .expect("list objects after rejected put")
+                .objects
+                .is_empty(),
+            "XML-invalid key should not create a listed object"
+        );
+    }
+}
+
+#[test]
+fn put_and_list_objects_accept_carriage_return_in_keys() {
+    let (_temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = "prefix/\robject.txt";
+    storage.create_bucket(&bucket).expect("create bucket");
+
+    let metadata = storage
+        .put_object(put_request(&bucket, key, b"body"))
+        .expect("put object with CR key");
+
+    assert_metadata_matches(&metadata, &bucket, key, 4);
+    let listing = storage
+        .list_objects(&bucket, ListObjectsOptions::default())
+        .expect("list object with CR key");
+    assert_eq!(object_keys(&listing.objects), [key]);
+    assert_eq!(
+        storage
+            .get_object_bytes(&bucket, &ObjectKey::new(key))
+            .expect("get object with CR key"),
+        b"body"
+    );
+}
+
+#[test]
 fn missing_object_content_is_corrupt_state_for_metadata_reads() {
     let (temp_dir, storage) = storage();
     let bucket = BucketName::new("example-bucket");
@@ -413,6 +662,54 @@ fn list_objects_reports_missing_object_metadata_as_corrupt_state() {
     let error = storage
         .list_objects(&bucket, ListObjectsOptions::default())
         .expect_err("list rejects missing object metadata");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+}
+
+#[test]
+fn list_objects_rejects_object_metadata_with_wrong_bucket_identity() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("object.txt");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"body"))
+        .expect("put object");
+    rewrite_object_metadata_field(
+        temp_dir.path(),
+        &bucket,
+        &key,
+        "bucket",
+        serde_json::json!("other-bucket"),
+    );
+
+    let error = storage
+        .list_objects(&bucket, ListObjectsOptions::default())
+        .expect_err("list rejects object metadata with wrong bucket");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+}
+
+#[test]
+fn list_objects_rejects_object_metadata_with_wrong_key_path_identity() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("object.txt");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"body"))
+        .expect("put object");
+    rewrite_object_metadata_field(
+        temp_dir.path(),
+        &bucket,
+        &key,
+        "key",
+        serde_json::json!("other-object.txt"),
+    );
+
+    let error = storage
+        .list_objects(&bucket, ListObjectsOptions::default())
+        .expect_err("list rejects object metadata stored under the wrong key path");
 
     assert!(matches!(error, StorageError::CorruptState { .. }));
 }
@@ -472,6 +769,87 @@ fn modified_object_content_is_corrupt_state_for_reads_and_listing() {
     assert!(matches!(metadata_error, StorageError::CorruptState { .. }));
     assert!(matches!(list_error, StorageError::CorruptState { .. }));
     assert!(matches!(bytes_error, StorageError::CorruptState { .. }));
+}
+
+#[test]
+fn symlink_object_content_is_corrupt_state_for_reads_writes_and_deletes() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("object.txt");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"body"))
+        .expect("put object");
+
+    let object_paths = object_paths(temp_dir.path(), &bucket, &key);
+    let external_content = temp_dir.path().join("outside-content.bin");
+    fs::write(&external_content, b"body").expect("write external content");
+    fs::remove_file(&object_paths.content).expect("remove stored content");
+    if let Err(skip) = create_file_symlink_or_skip(&external_content, &object_paths.content) {
+        println!("{skip}");
+        return;
+    }
+
+    let metadata_error = storage
+        .get_object_metadata(&bucket, &key)
+        .expect_err("metadata rejects symlinked content");
+    let list_error = storage
+        .list_objects(&bucket, ListObjectsOptions::default())
+        .expect_err("list rejects symlinked content");
+    let put_error = storage
+        .put_object(put_request(&bucket, key.as_str(), b"new body"))
+        .expect_err("put rejects symlinked existing content");
+    let delete_error = storage
+        .delete_object(&bucket, &key)
+        .expect_err("delete rejects symlinked object content");
+
+    assert!(matches!(metadata_error, StorageError::CorruptState { .. }));
+    assert!(matches!(list_error, StorageError::CorruptState { .. }));
+    assert!(matches!(put_error, StorageError::CorruptState { .. }));
+    assert!(matches!(delete_error, StorageError::CorruptState { .. }));
+    assert_eq!(
+        fs::read(&external_content).expect("read external content"),
+        b"body"
+    );
+}
+
+#[test]
+fn symlink_object_directory_is_corrupt_state_for_reads_writes_and_deletes() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("object.txt");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"body"))
+        .expect("put object");
+
+    let object_paths = object_paths(temp_dir.path(), &bucket, &key);
+    let external_object_dir = temp_dir.path().join("outside-object-dir");
+    fs::rename(&object_paths.dir, &external_object_dir).expect("move object dir outside storage");
+    if let Err(skip) = create_dir_symlink_or_skip(&external_object_dir, &object_paths.dir) {
+        println!("{skip}");
+        return;
+    }
+
+    let bytes_error = storage
+        .get_object_bytes(&bucket, &key)
+        .expect_err("bytes read rejects symlinked object dir");
+    let list_error = storage
+        .list_objects(&bucket, ListObjectsOptions::default())
+        .expect_err("list rejects symlinked object dir");
+    let put_error = storage
+        .put_object(put_request(&bucket, key.as_str(), b"new body"))
+        .expect_err("put rejects symlinked object dir");
+    let delete_error = storage
+        .delete_object(&bucket, &key)
+        .expect_err("delete rejects symlinked object dir");
+
+    assert!(matches!(bytes_error, StorageError::CorruptState { .. }));
+    assert!(matches!(list_error, StorageError::CorruptState { .. }));
+    assert!(matches!(put_error, StorageError::CorruptState { .. }));
+    assert!(matches!(delete_error, StorageError::CorruptState { .. }));
+    assert!(external_object_dir.join("content.bin").is_file());
+    assert!(external_object_dir.join("metadata.json").is_file());
 }
 
 #[test]
@@ -739,7 +1117,7 @@ fn list_objects_returns_keys_sorted_by_original_key() {
 }
 
 #[test]
-fn list_objects_ignores_non_directory_entries_under_objects_and_shards() {
+fn list_objects_reports_visible_non_directory_entries_under_objects_as_corrupt_state() {
     let (temp_dir, storage) = storage();
     let bucket = BucketName::new("example-bucket");
     let key = ObjectKey::new("object.txt");
@@ -750,6 +1128,24 @@ fn list_objects_ignores_non_directory_entries_under_objects_and_shards() {
 
     let objects_dir = bucket_dir(temp_dir.path(), &bucket).join("objects");
     fs::write(objects_dir.join("not-a-shard"), b"plain file").expect("write non-shard file");
+
+    let error = storage
+        .list_objects(&bucket, ListObjectsOptions::default())
+        .expect_err("visible non-directory under objects is corrupt state");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+}
+
+#[test]
+fn list_objects_reports_visible_non_directory_entries_under_shards_as_corrupt_state() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("object.txt");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"body"))
+        .expect("put object");
+
     let shard_dir = object_paths(temp_dir.path(), &bucket, &key)
         .dir
         .parent()
@@ -757,11 +1153,47 @@ fn list_objects_ignores_non_directory_entries_under_objects_and_shards() {
         .to_path_buf();
     fs::write(shard_dir.join("not-an-object"), b"plain file").expect("write non-object file");
 
-    let listing = storage
+    let error = storage
         .list_objects(&bucket, ListObjectsOptions::default())
-        .expect("list objects");
+        .expect_err("visible non-directory under shard is corrupt state");
 
-    assert_eq!(object_keys(&listing.objects), ["object.txt"]);
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+}
+
+#[test]
+fn delete_bucket_reports_visible_non_directory_entries_under_objects_as_corrupt_state() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    storage.create_bucket(&bucket).expect("create bucket");
+
+    let objects_dir = bucket_dir(temp_dir.path(), &bucket).join("objects");
+    fs::write(objects_dir.join("not-a-shard"), b"plain file").expect("write non-shard file");
+
+    let error = storage
+        .delete_bucket(&bucket)
+        .expect_err("visible non-directory under objects is corrupt state");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+    assert!(bucket_dir(temp_dir.path(), &bucket).exists());
+}
+
+#[test]
+fn delete_bucket_reports_visible_non_directory_entries_under_shards_as_corrupt_state() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    storage.create_bucket(&bucket).expect("create bucket");
+
+    let objects_dir = bucket_dir(temp_dir.path(), &bucket).join("objects");
+    let shard_dir = objects_dir.join("ab");
+    fs::create_dir_all(&shard_dir).expect("create visible shard");
+    fs::write(shard_dir.join("not-an-object"), b"plain file").expect("write non-object file");
+
+    let error = storage
+        .delete_bucket(&bucket)
+        .expect_err("visible non-directory under shard is corrupt state");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+    assert!(bucket_dir(temp_dir.path(), &bucket).exists());
 }
 
 #[test]
@@ -786,6 +1218,45 @@ fn list_objects_filters_by_prefix() {
 }
 
 #[test]
+fn list_objects_rejects_xml_invalid_prefix() {
+    let (_temp_dir, storage) = storage_with_objects(["images/a.png", "logs/a.txt"]);
+    let bucket = BucketName::new("example-bucket");
+
+    for prefix in ["images/\0", "images/\u{1F}"] {
+        let error = storage
+            .list_objects(
+                &bucket,
+                ListObjectsOptions {
+                    prefix: Some(ObjectKey::new(prefix)),
+                    ..ListObjectsOptions::default()
+                },
+            )
+            .expect_err("XML-invalid prefix is rejected");
+
+        assert!(matches!(error, StorageError::InvalidArgument { .. }));
+        assert!(error.to_string().contains("prefix"));
+    }
+}
+
+#[test]
+fn list_objects_accepts_carriage_return_prefix() {
+    let (_temp_dir, storage) = storage_with_objects(["images/\ra.png", "images/b.png"]);
+    let bucket = BucketName::new("example-bucket");
+
+    let listing = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                prefix: Some(ObjectKey::new("images/\r")),
+                ..ListObjectsOptions::default()
+            },
+        )
+        .expect("list objects with CR prefix");
+
+    assert_eq!(object_keys(&listing.objects), ["images/\ra.png"]);
+}
+
+#[test]
 fn list_objects_ignores_hidden_incomplete_shards_and_object_dirs() {
     let (temp_dir, storage) = storage();
     let bucket = BucketName::new("example-bucket");
@@ -800,7 +1271,7 @@ fn list_objects_ignores_hidden_incomplete_shards_and_object_dirs() {
         .expect("create hidden incomplete shard");
     fs::create_dir_all(
         objects_dir
-            .join(encode_object_key(&key).expect("valid key").shard())
+            .join(object_key_shard(&key))
             .join(".hidden-object.tmp-1"),
     )
     .expect("create hidden incomplete object dir");
@@ -819,11 +1290,10 @@ fn hidden_staged_object_dir_is_not_visible_as_missing_key_or_listing_corruption(
     let key = ObjectKey::new("object.txt");
     storage.create_bucket(&bucket).expect("create bucket");
 
-    let encoded_key = encode_object_key(&key).expect("valid key");
     fs::create_dir_all(
         bucket_dir(temp_dir.path(), &bucket)
             .join("objects")
-            .join(encoded_key.shard())
+            .join(object_key_shard(&key))
             .join(".hidden-object.tmp-1"),
     )
     .expect("create hidden staged object dir");
@@ -896,15 +1366,13 @@ fn raw_key_segments_are_not_used_in_object_paths() {
         .put_object(put_request(&bucket, key.as_str(), b"body"))
         .expect("put object");
 
-    let encoded_bucket = encode_bucket_name(&bucket);
-    let encoded_key = encode_object_key(&key).expect("valid key");
     let expected_object_dir = temp_dir
         .path()
         .join(STORAGE_ROOT_DIR)
-        .join(encoded_bucket.as_path_component())
+        .join(encoded_bucket_path_component(&bucket))
         .join("objects")
-        .join(encoded_key.shard())
-        .join(encoded_key.as_path_component());
+        .join(object_key_shard(&key))
+        .join(encoded_object_key_path_component(&key));
 
     assert!(expected_object_dir.join("content.bin").is_file());
     assert!(expected_object_dir.join("metadata.json").is_file());
@@ -1060,7 +1528,7 @@ fn list_objects_paginates_after_prefix_filtering() {
 }
 
 #[test]
-fn list_objects_max_keys_zero_returns_no_objects_without_continuation() {
+fn list_objects_max_keys_zero_returns_truncated_token_when_matching_objects_exist() {
     let (_temp_dir, storage) = storage_with_objects(["b.txt", "a.txt"]);
     let bucket = BucketName::new("example-bucket");
 
@@ -1077,8 +1545,118 @@ fn list_objects_max_keys_zero_returns_no_objects_without_continuation() {
 
     assert!(listing.objects.is_empty());
     assert_eq!(listing.max_keys, 0);
+    assert!(listing.is_truncated);
+    assert_eq!(
+        listing.next_continuation_token.as_deref(),
+        Some(continuation_token_for("a.txt").as_str())
+    );
+}
+
+#[test]
+fn list_objects_max_keys_zero_continuation_token_advances_to_next_key() {
+    let (_temp_dir, storage) = storage_with_objects(["c.txt", "a.txt", "b.txt"]);
+    let bucket = BucketName::new("example-bucket");
+
+    let first_page = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                prefix: None,
+                continuation_token: None,
+                max_keys: 0,
+            },
+        )
+        .expect("list first zero max keys page");
+
+    assert!(first_page.objects.is_empty());
+    assert!(first_page.is_truncated);
+    assert_eq!(
+        first_page.next_continuation_token.as_deref(),
+        Some(continuation_token_for("a.txt").as_str())
+    );
+
+    let second_page = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                prefix: None,
+                continuation_token: first_page.next_continuation_token,
+                max_keys: 0,
+            },
+        )
+        .expect("list second zero max keys page");
+
+    assert!(second_page.objects.is_empty());
+    assert!(second_page.is_truncated);
+    assert_eq!(
+        second_page.next_continuation_token.as_deref(),
+        Some(continuation_token_for("b.txt").as_str())
+    );
+}
+
+#[test]
+fn list_objects_max_keys_zero_is_not_truncated_without_matching_objects() {
+    let (_temp_dir, storage) = storage_with_objects(["b.txt", "a.txt"]);
+    let bucket = BucketName::new("example-bucket");
+
+    let listing = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                prefix: Some(ObjectKey::new("missing/")),
+                continuation_token: None,
+                max_keys: 0,
+            },
+        )
+        .expect("list zero max keys with non-matching prefix");
+
+    assert!(listing.objects.is_empty());
+    assert_eq!(listing.max_keys, 0);
     assert!(!listing.is_truncated);
     assert_eq!(listing.next_continuation_token, None);
+}
+
+#[test]
+fn public_operations_reject_symlink_root_when_platform_allows_it() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let target = temp_dir.path().join("target-root");
+    let link = temp_dir.path().join("linked-root");
+    fs::create_dir(&target).expect("create root symlink target");
+    if let Err(skip) = create_dir_symlink_or_skip(&target, &link) {
+        println!("{skip}");
+        return;
+    }
+
+    let storage = FilesystemStorage::with_clock(link, FixedClock(fixed_time()));
+    let error = storage
+        .list_buckets()
+        .expect_err("symlink root is rejected before storage access");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+}
+
+#[test]
+fn public_operations_reject_symlink_root_ancestor_when_platform_allows_it() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let target = temp_dir.path().join("target-root");
+    let link = temp_dir.path().join("linked-root");
+    let root = link.join("nested-root");
+    fs::create_dir(&target).expect("create root symlink target");
+    if let Err(skip) = create_dir_symlink_or_skip(&target, &link) {
+        println!("{skip}");
+        return;
+    }
+
+    let storage = FilesystemStorage::with_clock(root, FixedClock(fixed_time()));
+    let error = storage
+        .create_bucket(&BucketName::new("example-bucket"))
+        .expect_err("symlink root ancestor is rejected before storage access");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+    assert!(
+        !target.join("nested-root").exists(),
+        "storage creation must not follow a symlinked root ancestor"
+    );
 }
 
 #[test]
@@ -1158,6 +1736,64 @@ fn storage_with_objects<const N: usize>(
     (temp_dir, storage)
 }
 
+fn create_file_symlink_or_skip(target: &Path, link: &Path) -> Result<(), SymlinkTestSkipped> {
+    try_create_file_symlink(target, link).map_err(|source| SymlinkTestSkipped {
+        test: "object content symlink safety",
+        target: target.to_path_buf(),
+        link: link.to_path_buf(),
+        source,
+    })
+}
+
+fn create_dir_symlink_or_skip(target: &Path, link: &Path) -> Result<(), SymlinkTestSkipped> {
+    try_create_dir_symlink(target, link).map_err(|source| SymlinkTestSkipped {
+        test: "object directory symlink safety",
+        target: target.to_path_buf(),
+        link: link.to_path_buf(),
+        source,
+    })
+}
+
+struct SymlinkTestSkipped {
+    test: &'static str,
+    target: PathBuf,
+    link: PathBuf,
+    source: io::Error,
+}
+
+impl Display for SymlinkTestSkipped {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "skipped {} test: symlink creation unavailable from {} to {}: {}",
+            self.test,
+            self.link.display(),
+            self.target.display(),
+            self.source
+        )
+    }
+}
+
+#[cfg(unix)]
+fn try_create_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn try_create_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(unix)]
+fn try_create_dir_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn try_create_dir_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
 fn put_request(bucket: &BucketName, key: &str, bytes: &[u8]) -> PutObjectRequest {
     PutObjectRequest {
         bucket: bucket.clone(),
@@ -1220,6 +1856,16 @@ fn write_bucket_metadata(root: &Path, bucket: &BucketName, json: &str) {
     fs::write(bucket_dir(root, bucket).join("bucket.json"), json).expect("write bucket metadata");
 }
 
+fn write_bucket_state(root: &Path, bucket: &BucketName) {
+    let bucket_dir = bucket_dir(root, bucket);
+    fs::create_dir_all(bucket_dir.join("objects")).expect("create bucket state");
+    write_bucket_metadata(
+        root,
+        bucket,
+        &format!(r#"{{"bucket":"{}"}}"#, bucket.as_str()),
+    );
+}
+
 fn rewrite_object_metadata_field(
     root: &Path,
     bucket: &BucketName,
@@ -1245,15 +1891,14 @@ fn rewrite_object_metadata_field(
 
 fn bucket_dir(root: &Path, bucket: &BucketName) -> PathBuf {
     root.join(STORAGE_ROOT_DIR)
-        .join(encode_bucket_name(bucket).as_path_component())
+        .join(encoded_bucket_path_component(bucket))
 }
 
 fn object_paths(root: &Path, bucket: &BucketName, key: &ObjectKey) -> ObjectPaths {
-    let encoded_key = encode_object_key(key).expect("valid key");
     let object_dir = bucket_dir(root, bucket)
         .join("objects")
-        .join(encoded_key.shard())
-        .join(encoded_key.as_path_component());
+        .join(object_key_shard(key))
+        .join(encoded_object_key_path_component(key));
     ObjectPaths {
         dir: object_dir.clone(),
         content: object_dir.join("content.bin"),
@@ -1265,6 +1910,23 @@ struct ObjectPaths {
     dir: PathBuf,
     content: PathBuf,
     metadata: PathBuf,
+}
+
+fn encoded_bucket_path_component(bucket: &BucketName) -> String {
+    format!("bucket-{}", sha256_lower_hex(bucket.as_str()))
+}
+
+fn encoded_object_key_path_component(key: &ObjectKey) -> String {
+    format!("key-{}", sha256_lower_hex(key.as_str()))
+}
+
+fn object_key_shard(key: &ObjectKey) -> String {
+    sha256_lower_hex(key.as_str())[..2].to_owned()
+}
+
+fn sha256_lower_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    lower_hex(&digest)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

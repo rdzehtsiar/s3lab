@@ -12,8 +12,7 @@ use s3lab::server::routes::RouteScope;
 use s3lab::server::state::ServerState;
 use s3lab::server::PHASE1_SERVER_SCOPE;
 use s3lab::storage::fs::FilesystemStorage;
-use s3lab::storage::key::raw_keys_are_not_filesystem_paths;
-use s3lab::storage::{Storage, STORAGE_ROOT_DIR};
+use s3lab::storage::STORAGE_ROOT_DIR;
 
 #[test]
 fn default_runtime_config_matches_phase1_local_defaults() {
@@ -28,8 +27,8 @@ fn default_runtime_config_matches_phase1_local_defaults() {
 fn planned_module_boundaries_are_available_to_tests() {
     let bucket = BucketName::new("example-bucket");
     let object = ObjectKey::new("prefix/example.txt");
-    let state = ServerState::new("./s3lab-data");
     let storage = FilesystemStorage::new("./s3lab-data");
+    let state = ServerState::from_storage(storage);
 
     assert_eq!(bucket.as_str(), "example-bucket");
     assert_eq!(object.as_str(), "prefix/example.txt");
@@ -38,9 +37,7 @@ fn planned_module_boundaries_are_available_to_tests() {
             .storage()
             .list_buckets()
             .expect("server state exposes storage"),
-        storage
-            .list_buckets()
-            .expect("filesystem storage lists buckets")
+        []
     );
     assert_eq!(support::TEST_SUPPORT_MARKER, "offline-deterministic-tests");
 }
@@ -50,7 +47,6 @@ fn placeholder_constants_match_phase1_structure_contract() {
     assert_eq!(PHASE1_SERVER_SCOPE, "path-style-local-s3");
     assert_eq!(STORAGE_ROOT_DIR, "buckets");
     assert_eq!(XML_CONTENT_TYPE, "application/xml");
-    assert!(raw_keys_are_not_filesystem_paths());
 }
 
 #[test]

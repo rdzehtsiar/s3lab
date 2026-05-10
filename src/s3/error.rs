@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::storage::StorageError;
-
-pub const TEST_REQUEST_ID: &str = "s3lab-test-request-id";
+pub const STATIC_REQUEST_ID: &str = "s3lab-test-request-id";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum S3ErrorCode {
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
+    EntityTooLarge,
     InternalError,
     InvalidArgument,
     InvalidBucketName,
@@ -22,6 +21,7 @@ impl S3ErrorCode {
         match self {
             Self::BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou",
             Self::BucketNotEmpty => "BucketNotEmpty",
+            Self::EntityTooLarge => "EntityTooLarge",
             Self::InternalError => "InternalError",
             Self::InvalidArgument => "InvalidArgument",
             Self::InvalidBucketName => "InvalidBucketName",
@@ -40,6 +40,7 @@ impl S3ErrorCode {
                 "Your previous request to create the named bucket succeeded and you already own it."
             }
             Self::BucketNotEmpty => "The bucket you tried to delete is not empty.",
+            Self::EntityTooLarge => "Your proposed upload exceeds the maximum allowed object size.",
             Self::InvalidBucketName => "The specified bucket is not valid.",
             Self::InvalidArgument => "Invalid argument.",
             Self::MethodNotAllowed => "The specified method is not allowed against this resource.",
@@ -54,6 +55,7 @@ impl S3ErrorCode {
         match self {
             Self::NoSuchBucket | Self::NoSuchKey => 404,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => 409,
+            Self::EntityTooLarge => 400,
             Self::InvalidBucketName | Self::InvalidArgument => 400,
             Self::MethodNotAllowed => 405,
             Self::NotImplemented => 501,
@@ -108,28 +110,11 @@ impl S3Error {
             request_id,
         }
     }
-
-    pub fn from_storage_error(
-        error: &StorageError,
-        resource: impl Into<String>,
-        request_id: S3RequestId,
-    ) -> Self {
-        let code = S3ErrorCode::from(error);
-        let resource = resource.into();
-
-        match code {
-            S3ErrorCode::InternalError => Self::new(code, resource, request_id),
-            S3ErrorCode::InvalidArgument => {
-                Self::with_message(code, error.to_string(), resource, request_id)
-            }
-            _ => Self::new(code, resource, request_id),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{S3Error, S3ErrorCode, S3RequestId, TEST_REQUEST_ID};
+    use super::{S3Error, S3ErrorCode, S3RequestId, STATIC_REQUEST_ID};
 
     #[test]
     fn not_implemented_error_code_is_comparable() {
@@ -157,6 +142,7 @@ mod tests {
             [
                 S3ErrorCode::BucketAlreadyOwnedByYou,
                 S3ErrorCode::BucketNotEmpty,
+                S3ErrorCode::EntityTooLarge,
                 S3ErrorCode::InternalError,
                 S3ErrorCode::InvalidArgument,
                 S3ErrorCode::InvalidBucketName,
@@ -165,7 +151,7 @@ mod tests {
                 S3ErrorCode::NoSuchKey,
             ]
             .len(),
-            8
+            9
         );
     }
 
@@ -181,6 +167,7 @@ mod tests {
             (S3ErrorCode::NoSuchKey, 404),
             (S3ErrorCode::BucketAlreadyOwnedByYou, 409),
             (S3ErrorCode::BucketNotEmpty, 409),
+            (S3ErrorCode::EntityTooLarge, 400),
             (S3ErrorCode::InvalidBucketName, 400),
             (S3ErrorCode::InvalidArgument, 400),
             (S3ErrorCode::MethodNotAllowed, 405),
@@ -198,12 +185,12 @@ mod tests {
         let error = S3Error::new(
             S3ErrorCode::NoSuchBucket,
             "/missing-bucket",
-            S3RequestId::new(TEST_REQUEST_ID),
+            S3RequestId::new(STATIC_REQUEST_ID),
         );
 
         assert_eq!(error.code, S3ErrorCode::NoSuchBucket);
         assert_eq!(error.message, "The specified bucket does not exist.");
         assert_eq!(error.resource, "/missing-bucket");
-        assert_eq!(error.request_id.as_str(), TEST_REQUEST_ID);
+        assert_eq!(error.request_id.as_str(), STATIC_REQUEST_ID);
     }
 }

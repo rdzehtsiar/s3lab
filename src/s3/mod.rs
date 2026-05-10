@@ -4,4 +4,5 @@ pub mod bucket;
 pub mod error;
 pub mod object;
 pub mod operation;
+pub mod time;
 pub mod xml;

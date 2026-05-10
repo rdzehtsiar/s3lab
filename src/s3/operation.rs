@@ -1,36 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::s3::bucket::BucketName;
+use crate::s3::object::ObjectKey;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum S3Operation {
     ListBuckets,
     CreateBucket {
-        bucket: String,
+        bucket: BucketName,
     },
     HeadBucket {
-        bucket: String,
+        bucket: BucketName,
     },
     DeleteBucket {
-        bucket: String,
+        bucket: BucketName,
     },
     PutObject {
-        bucket: String,
-        key: String,
+        bucket: BucketName,
+        key: ObjectKey,
     },
     GetObject {
-        bucket: String,
-        key: String,
+        bucket: BucketName,
+        key: ObjectKey,
     },
     HeadObject {
-        bucket: String,
-        key: String,
+        bucket: BucketName,
+        key: ObjectKey,
     },
     DeleteObject {
-        bucket: String,
-        key: String,
+        bucket: BucketName,
+        key: ObjectKey,
     },
     ListObjectsV2 {
-        bucket: String,
-        prefix: Option<String>,
+        bucket: BucketName,
+        prefix: Option<ObjectKey>,
         continuation_token: Option<String>,
         max_keys: usize,
     },
@@ -39,19 +42,21 @@ pub enum S3Operation {
 #[cfg(test)]
 mod tests {
     use super::S3Operation;
+    use crate::s3::bucket::BucketName;
+    use crate::s3::object::ObjectKey;
 
     #[test]
     fn object_operations_preserve_owned_route_values() {
         let operation = S3Operation::GetObject {
-            bucket: "example-bucket".to_owned(),
-            key: "nested/object.txt".to_owned(),
+            bucket: BucketName::new("example-bucket"),
+            key: ObjectKey::new("nested/object.txt"),
         };
 
         assert_eq!(
             operation.clone(),
             S3Operation::GetObject {
-                bucket: "example-bucket".to_owned(),
-                key: "nested/object.txt".to_owned(),
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("nested/object.txt"),
             }
         );
     }

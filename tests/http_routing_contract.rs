@@ -8,8 +8,9 @@ use s3lab::s3::error::S3ErrorCode;
 use s3lab::s3::object::ObjectKey;
 use s3lab::s3::operation::S3Operation;
 use s3lab::server::router;
-use s3lab::server::routes::resolve_operation;
+use s3lab::server::routes::{resolve_operation, PHASE1_MAX_PUT_OBJECT_BODY_BYTES};
 use s3lab::server::state::ServerState;
+use s3lab::storage::fs::{FilesystemStorage, StorageClock};
 use s3lab::storage::{
     BucketSummary, ListObjectsOptions, ObjectListing, PutObjectRequest, Storage, StorageError,
     StoredObject, StoredObjectMetadata,
@@ -17,7 +18,7 @@ use s3lab::storage::{
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use time::OffsetDateTime;
+use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use tower::ServiceExt;
 
 #[test]
@@ -28,60 +29,60 @@ fn supported_routes_resolve_to_explicit_operations() {
             Method::PUT,
             "/example-bucket",
             S3Operation::CreateBucket {
-                bucket: "example-bucket".to_owned(),
+                bucket: BucketName::new("example-bucket"),
             },
         ),
         (
             Method::HEAD,
             "/example-bucket",
             S3Operation::HeadBucket {
-                bucket: "example-bucket".to_owned(),
+                bucket: BucketName::new("example-bucket"),
             },
         ),
         (
             Method::DELETE,
             "/example-bucket",
             S3Operation::DeleteBucket {
-                bucket: "example-bucket".to_owned(),
+                bucket: BucketName::new("example-bucket"),
             },
         ),
         (
             Method::PUT,
             "/example-bucket/object.txt",
             S3Operation::PutObject {
-                bucket: "example-bucket".to_owned(),
-                key: "object.txt".to_owned(),
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("object.txt"),
             },
         ),
         (
             Method::GET,
             "/example-bucket/object.txt",
             S3Operation::GetObject {
-                bucket: "example-bucket".to_owned(),
-                key: "object.txt".to_owned(),
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("object.txt"),
             },
         ),
         (
             Method::HEAD,
             "/example-bucket/object.txt",
             S3Operation::HeadObject {
-                bucket: "example-bucket".to_owned(),
-                key: "object.txt".to_owned(),
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("object.txt"),
             },
         ),
         (
             Method::DELETE,
             "/example-bucket/object.txt",
             S3Operation::DeleteObject {
-                bucket: "example-bucket".to_owned(),
-                key: "object.txt".to_owned(),
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("object.txt"),
             },
         ),
         (
             Method::GET,
             "/example-bucket?list-type=2",
             S3Operation::ListObjectsV2 {
-                bucket: "example-bucket".to_owned(),
+                bucket: BucketName::new("example-bucket"),
                 prefix: None,
                 continuation_token: None,
                 max_keys: 1000,
@@ -91,8 +92,8 @@ fn supported_routes_resolve_to_explicit_operations() {
             Method::GET,
             "/example-bucket?list-type=2&prefix=images%2F&continuation-token=page%2F2&max-keys=25",
             S3Operation::ListObjectsV2 {
-                bucket: "example-bucket".to_owned(),
-                prefix: Some("images/".to_owned()),
+                bucket: BucketName::new("example-bucket"),
+                prefix: Some(ObjectKey::new("images/")),
                 continuation_token: Some("page/2".to_owned()),
                 max_keys: 25,
             },
@@ -101,7 +102,7 @@ fn supported_routes_resolve_to_explicit_operations() {
             Method::GET,
             "/example-bucket?list-type=2&max-keys=0",
             S3Operation::ListObjectsV2 {
-                bucket: "example-bucket".to_owned(),
+                bucket: BucketName::new("example-bucket"),
                 prefix: None,
                 continuation_token: None,
                 max_keys: 0,
@@ -139,8 +140,8 @@ fn object_keys_preserve_paths_spaces_encoded_slashes_and_literal_plus() {
         assert_eq!(
             route.operation,
             S3Operation::GetObject {
-                bucket: "example-bucket".to_owned(),
-                key: expected_key.to_owned(),
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new(expected_key),
             }
         );
     }
@@ -181,6 +182,90 @@ fn unsupported_and_malformed_bucket_routes_are_clear_rejections() {
 }
 
 #[test]
+fn invalid_bucket_names_are_rejected_before_route_resolution() {
+    for uri in [
+        "/ab",
+        "/Uppercase",
+        "/bad_bucket",
+        "/bucket..name",
+        "/bucket.-name",
+        "/bucket-.name",
+        "/192.168.0.1",
+        "/bucket%2Fname",
+        "/xn--bucket",
+        "/sthree-bucket",
+        "/amzn-s3-demo-bucket",
+        "/bucket-s3alias",
+        "/bucket--ol-s3",
+        "/bucket.mrap",
+        "/bucket--x-s3",
+        "/bucket--table-s3",
+    ] {
+        let rejection = resolve_operation(&Method::PUT, &Uri::from_static(uri))
+            .expect_err("invalid bucket name is rejected");
+
+        assert_eq!(rejection.code, S3ErrorCode::InvalidBucketName);
+    }
+}
+
+#[test]
+fn object_key_routes_accept_utf8_byte_limit_and_reject_longer_keys() {
+    let valid_key = "nested/".to_owned() + &"a".repeat(1024 - "nested/".len());
+    let valid_uri = format!("/example-bucket/{valid_key}");
+    let route = resolve_operation(&Method::PUT, &valid_uri.parse::<Uri>().expect("valid URI"))
+        .expect("key at byte limit resolves");
+
+    assert_eq!(
+        route.operation,
+        S3Operation::PutObject {
+            bucket: BucketName::new("example-bucket"),
+            key: ObjectKey::new(valid_key),
+        }
+    );
+
+    let too_long_uri = format!("/example-bucket/{}", "a".repeat(1025));
+    let rejection = resolve_operation(
+        &Method::PUT,
+        &too_long_uri.parse::<Uri>().expect("valid URI"),
+    )
+    .expect_err("oversized key is rejected");
+
+    assert_eq!(rejection.code, S3ErrorCode::InvalidArgument);
+}
+
+#[test]
+fn object_key_routes_reject_xml_invalid_control_characters() {
+    for uri in [
+        "/example-bucket/prefix/%00object.txt",
+        "/example-bucket/prefix/%1Fobject.txt",
+    ] {
+        let rejection = resolve_operation(&Method::PUT, &uri.parse::<Uri>().expect("valid URI"))
+            .expect_err("XML-invalid object key is rejected");
+
+        assert_eq!(rejection.code, S3ErrorCode::InvalidArgument);
+    }
+}
+
+#[test]
+fn object_key_routes_accept_carriage_return() {
+    let route = resolve_operation(
+        &Method::PUT,
+        &"/example-bucket/prefix/%0Dobject.txt"
+            .parse::<Uri>()
+            .expect("valid URI"),
+    )
+    .expect("CR object key resolves");
+
+    assert_eq!(
+        route.operation,
+        S3Operation::PutObject {
+            bucket: BucketName::new("example-bucket"),
+            key: ObjectKey::new("prefix/\robject.txt"),
+        }
+    );
+}
+
+#[test]
 fn duplicate_and_unknown_query_params_are_invalid_argument() {
     for uri in [
         "/bucket?list-type=2&list-type=2",
@@ -199,6 +284,7 @@ fn duplicate_and_unknown_query_params_are_invalid_argument() {
 fn known_s3_subresources_are_not_implemented() {
     for subresource in [
         "acl",
+        "delete",
         "tagging",
         "uploads",
         "uploadId",
@@ -222,6 +308,126 @@ fn known_s3_subresources_are_not_implemented() {
             .expect_err("subresource is unsupported");
 
         assert_eq!(rejection.code, S3ErrorCode::NotImplemented);
+    }
+}
+
+#[test]
+fn list_objects_v2_prefix_rejects_xml_invalid_control_characters() {
+    for uri in [
+        "/example-bucket?list-type=2&prefix=logs%00",
+        "/example-bucket?list-type=2&prefix=logs%1F",
+    ] {
+        let rejection = resolve_operation(&Method::GET, &Uri::from_static(uri))
+            .expect_err("XML-invalid prefix is rejected");
+
+        assert_eq!(rejection.code, S3ErrorCode::InvalidArgument);
+    }
+}
+
+#[test]
+fn list_objects_v2_prefix_accepts_carriage_return() {
+    let route = resolve_operation(
+        &Method::GET,
+        &Uri::from_static("/example-bucket?list-type=2&prefix=logs%0D"),
+    )
+    .expect("CR prefix resolves");
+
+    assert_eq!(
+        route.operation,
+        S3Operation::ListObjectsV2 {
+            bucket: BucketName::new("example-bucket"),
+            prefix: Some(ObjectKey::new("logs\r")),
+            continuation_token: None,
+            max_keys: 1000,
+        }
+    );
+}
+
+#[tokio::test]
+async fn invalid_bucket_names_return_invalid_bucket_name_without_storage_call() {
+    for (method, uri) in [
+        (Method::PUT, "/BadBucket"),
+        (Method::HEAD, "/bad_bucket"),
+        (Method::GET, "/bucket..name?list-type=2"),
+        (Method::DELETE, "/bucket-.name"),
+        (Method::PUT, "/ab/object.txt"),
+        (Method::GET, "/192.168.0.1/object.txt"),
+        (Method::HEAD, "/bucket%2Fname/object.txt"),
+        (Method::DELETE, "/bucket.-name/object.txt"),
+        (Method::PUT, "/xn--bucket/object.txt"),
+        (Method::GET, "/sthree-bucket/object.txt"),
+        (Method::HEAD, "/amzn-s3-demo-bucket/object.txt"),
+        (Method::DELETE, "/bucket--table-s3/object.txt"),
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request(method.clone(), uri, Body::empty()))
+            .await
+            .expect("route response");
+
+        if method == Method::HEAD {
+            assert_head_error(response, StatusCode::BAD_REQUEST).await;
+        } else {
+            assert_s3_error_xml(
+                response,
+                StatusCode::BAD_REQUEST,
+                "InvalidBucketName",
+                path_only(uri),
+            )
+            .await;
+        }
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn oversized_object_key_routes_return_invalid_argument_without_storage_call() {
+    for method in [Method::PUT, Method::GET, Method::HEAD, Method::DELETE] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+        let uri = format!("/bucket/{}", "a".repeat(1025));
+
+        let response = app
+            .oneshot(request(method.clone(), &uri, Body::from("body")))
+            .await
+            .expect("route response");
+
+        if method == Method::HEAD {
+            assert_head_error(response, StatusCode::BAD_REQUEST).await;
+        } else {
+            assert_invalid_argument_xml(response, &uri).await;
+        }
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn xml_invalid_object_key_routes_return_invalid_argument_without_storage_call() {
+    for method in [Method::PUT, Method::GET, Method::HEAD, Method::DELETE] {
+        for uri in [
+            "/bucket/prefix/%00object.txt",
+            "/bucket/prefix/%1Fobject.txt",
+        ] {
+            let storage = RecordingStorage::default();
+            let calls = Arc::clone(&storage.calls);
+            let app = router(ServerState::from_storage(storage));
+
+            let response = app
+                .oneshot(request(method.clone(), uri, Body::from("body")))
+                .await
+                .expect("route response");
+
+            if method == Method::HEAD {
+                assert_head_error(response, StatusCode::BAD_REQUEST).await;
+            } else {
+                assert_invalid_argument_xml(response, uri).await;
+            }
+            assert_no_storage_calls(&calls);
+        }
     }
 }
 
@@ -256,6 +462,7 @@ async fn method_not_allowed_route_errors_return_s3_xml_without_storage_call() {
 async fn unsupported_subresources_return_501_without_storage_call() {
     for (method, uri) in [
         (Method::GET, "/bucket?acl"),
+        (Method::POST, "/bucket?delete"),
         (Method::PUT, "/bucket/key?tagging"),
     ] {
         let storage = RecordingStorage::default();
@@ -267,7 +474,13 @@ async fn unsupported_subresources_return_501_without_storage_call() {
             .await
             .expect("route response");
 
-        assert_s3_error_xml(response, StatusCode::NOT_IMPLEMENTED, "NotImplemented", uri).await;
+        assert_s3_error_xml(
+            response,
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            path_only(uri),
+        )
+        .await;
         assert_no_storage_calls(&calls);
     }
 }
@@ -305,7 +518,13 @@ async fn bucket_list_query_without_list_type_remains_not_implemented() {
             .await
             .expect("route response");
 
-        assert_s3_error_xml(response, StatusCode::NOT_IMPLEMENTED, "NotImplemented", uri).await;
+        assert_s3_error_xml(
+            response,
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            path_only(uri),
+        )
+        .await;
         assert_no_storage_calls(&calls);
     }
 }
@@ -322,7 +541,13 @@ async fn malformed_query_names_are_invalid_argument() {
             .await
             .expect("route response");
 
-        assert_s3_error_xml(response, StatusCode::BAD_REQUEST, "InvalidArgument", uri).await;
+        assert_s3_error_xml(
+            response,
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            path_only(uri),
+        )
+        .await;
         assert_no_storage_calls(&calls);
     }
 }
@@ -355,7 +580,10 @@ async fn list_objects_v2_continuation_token_calls_storage() {
 #[tokio::test]
 async fn list_objects_v2_max_keys_two_returns_paged_xml() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::with_clock(
+        temp_dir.path().to_path_buf(),
+        FixedClock(fixed_last_modified()),
+    )));
 
     assert_eq!(
         app.clone()
@@ -393,7 +621,17 @@ async fn list_objects_v2_max_keys_two_returns_paged_xml() {
     let first_body = String::from_utf8(body_bytes(first).await.to_vec()).expect("utf-8 XML body");
     assert_eq!(
         first_body,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>bucket</Name><Prefix></Prefix><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated><Contents><Key>a.txt</Key><Size>1</Size></Contents><Contents><Key>c.txt</Key><Size>2</Size></Contents><NextContinuationToken>s3lab-v1:7a2e747874</NextContinuationToken></ListBucketResult>"
+        expected_list_objects_v2_xml(ListObjectsV2XmlExpectation {
+            key_count: 2,
+            max_keys: 2,
+            is_truncated: true,
+            contents: &[
+                list_object_xml("a.txt", "0cc175b9c0f1b6a831c399e269772661", 1),
+                list_object_xml("c.txt", "e0323a9039add2978bf5b49550572c7c", 2),
+            ],
+            next_continuation_token: Some("s3lab-v1:7a2e747874"),
+            ..ListObjectsV2XmlExpectation::default()
+        })
     );
 
     let second = app
@@ -408,7 +646,144 @@ async fn list_objects_v2_max_keys_two_returns_paged_xml() {
     let second_body = String::from_utf8(body_bytes(second).await.to_vec()).expect("utf-8 XML body");
     assert_eq!(
         second_body,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>bucket</Name><Prefix></Prefix><KeyCount>1</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>z.txt</Key><Size>1</Size></Contents></ListBucketResult>"
+        expected_list_objects_v2_xml(ListObjectsV2XmlExpectation {
+            key_count: 1,
+            max_keys: 2,
+            continuation_token: Some("s3lab-v1:7a2e747874"),
+            contents: &[list_object_xml(
+                "z.txt",
+                "fbade9e36a3f36d3d676c1b808451dd7",
+                1,
+            )],
+            ..ListObjectsV2XmlExpectation::default()
+        })
+    );
+}
+
+#[tokio::test]
+async fn list_objects_v2_max_keys_zero_returns_truncated_xml_when_objects_match() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::from_storage(FilesystemStorage::with_clock(
+        temp_dir.path().to_path_buf(),
+        FixedClock(fixed_last_modified()),
+    )));
+
+    assert_eq!(
+        app.clone()
+            .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+            .await
+            .expect("create bucket")
+            .status(),
+        StatusCode::OK
+    );
+    for key in ["b.txt", "a.txt"] {
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::PUT,
+                    &format!("/bucket/{key}"),
+                    Body::from(key),
+                ))
+                .await
+                .expect("put object")
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=2&max-keys=0",
+            Body::empty(),
+        ))
+        .await
+        .expect("list max-keys zero");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert_eq!(
+        body,
+        expected_list_objects_v2_xml(ListObjectsV2XmlExpectation {
+            max_keys: 0,
+            is_truncated: true,
+            next_continuation_token: Some("s3lab-v1:612e747874"),
+            ..ListObjectsV2XmlExpectation::default()
+        })
+    );
+}
+
+#[tokio::test]
+async fn list_objects_v2_max_keys_zero_reused_token_advances() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::from_storage(FilesystemStorage::with_clock(
+        temp_dir.path().to_path_buf(),
+        FixedClock(fixed_last_modified()),
+    )));
+
+    assert_eq!(
+        app.clone()
+            .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+            .await
+            .expect("create bucket")
+            .status(),
+        StatusCode::OK
+    );
+    for key in ["c.txt", "a.txt", "b.txt"] {
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::PUT,
+                    &format!("/bucket/{key}"),
+                    Body::from(key),
+                ))
+                .await
+                .expect("put object")
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    let first = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=2&max-keys=0",
+            Body::empty(),
+        ))
+        .await
+        .expect("list first zero max keys page");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = String::from_utf8(body_bytes(first).await.to_vec()).expect("utf-8 XML body");
+    assert_eq!(
+        first_body,
+        expected_list_objects_v2_xml(ListObjectsV2XmlExpectation {
+            max_keys: 0,
+            is_truncated: true,
+            next_continuation_token: Some("s3lab-v1:612e747874"),
+            ..ListObjectsV2XmlExpectation::default()
+        })
+    );
+
+    let second = app
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=2&max-keys=0&continuation-token=s3lab-v1%3A612e747874",
+            Body::empty(),
+        ))
+        .await
+        .expect("list second zero max keys page");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = String::from_utf8(body_bytes(second).await.to_vec()).expect("utf-8 XML body");
+    assert_eq!(
+        second_body,
+        expected_list_objects_v2_xml(ListObjectsV2XmlExpectation {
+            max_keys: 0,
+            continuation_token: Some("s3lab-v1:612e747874"),
+            is_truncated: true,
+            next_continuation_token: Some("s3lab-v1:622e747874"),
+            ..ListObjectsV2XmlExpectation::default()
+        })
     );
 }
 
@@ -433,32 +808,61 @@ async fn malformed_list_objects_v2_max_keys_values_are_invalid_argument() {
             .await
             .expect("route response");
 
-        assert_invalid_argument_xml(response, uri).await;
+        assert_invalid_argument_xml(response, path_only(uri)).await;
         assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
     }
 }
 
 #[tokio::test]
-async fn list_objects_v2_delimiter_is_invalid_argument() {
-    let storage = RecordingStorage::default();
-    let calls = Arc::clone(&storage.calls);
-    let app = router(ServerState::from_storage(storage));
+async fn list_objects_v2_xml_invalid_prefix_returns_invalid_argument_without_storage_call() {
+    for uri in [
+        "/bucket?list-type=2&prefix=logs%00",
+        "/bucket?list-type=2&prefix=logs%1F",
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
 
-    let response = app
-        .oneshot(request(
-            Method::GET,
-            "/bucket?list-type=2&delimiter=%2F",
-            Body::empty(),
-        ))
-        .await
-        .expect("route response");
+        let response = app
+            .oneshot(request(Method::GET, uri, Body::empty()))
+            .await
+            .expect("route response");
 
-    assert_invalid_argument_xml(response, "/bucket?list-type=2&delimiter=%2F").await;
-    assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
+        assert_invalid_argument_xml(response, "/bucket").await;
+        assert_no_storage_calls(&calls);
+    }
 }
 
 #[tokio::test]
-async fn route_invalid_argument_error_xml_escapes_query_resource_exactly() {
+async fn list_objects_v2_unsupported_params_are_not_implemented_without_storage_call() {
+    for uri in [
+        "/bucket?list-type=2&delimiter=%2F",
+        "/bucket?list-type=2&encoding-type=url",
+        "/bucket?list-type=2&start-after=a.txt",
+        "/bucket?list-type=2&fetch-owner=true",
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request(Method::GET, uri, Body::empty()))
+            .await
+            .expect("route response");
+
+        assert_s3_error_xml(
+            response,
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "/bucket",
+        )
+        .await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn route_invalid_argument_error_xml_reports_path_only_resource() {
     let storage = RecordingStorage::default();
     let calls = Arc::clone(&storage.calls);
     let app = router(ServerState::from_storage(storage));
@@ -490,15 +894,45 @@ async fn route_invalid_argument_error_xml_escapes_query_resource_exactly() {
     let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
     assert_eq!(
         body,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidArgument</Code><Message>Invalid argument.</Message><Resource>/bucket?list-type=1&amp;marker=a%26b%3Ctag%3E</Resource><RequestId>s3lab-test-request-id</RequestId></Error>"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidArgument</Code><Message>Invalid argument.</Message><Resource>/bucket</Resource><RequestId>s3lab-test-request-id</RequestId></Error>"
     );
+    assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
+}
+
+#[tokio::test]
+async fn route_error_xml_does_not_echo_presigned_url_query_credentials() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(ServerState::from_storage(storage));
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/bucket?X-Amz-Credential=AKIA%2F20260510%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=abcdef123456&X-Amz-Security-Token=session-token",
+            Body::empty(),
+        ))
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>InvalidArgument</Code>"));
+    assert!(body.contains("<Resource>/bucket</Resource>"));
+    assert!(!body.contains("X-Amz-Credential"));
+    assert!(!body.contains("AKIA"));
+    assert!(!body.contains("X-Amz-Signature"));
+    assert!(!body.contains("abcdef123456"));
+    assert!(!body.contains("X-Amz-Security-Token"));
+    assert!(!body.contains("session-token"));
     assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
 }
 
 #[tokio::test]
 async fn head_success_and_error_responses_have_empty_bodies() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -603,9 +1037,79 @@ async fn head_object_includes_available_metadata_headers() {
 }
 
 #[tokio::test]
+async fn get_object_returns_internal_error_for_invalid_response_metadata_headers() {
+    for metadata in [
+        {
+            let mut metadata =
+                metadata_with_content_type("bucket", "object.txt", 5, Some("text/plain\nbad"));
+            metadata.etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_owned();
+            metadata
+        },
+        {
+            let mut metadata = metadata_with_content_type("bucket", "object.txt", 5, None);
+            metadata.etag = "\"bad\netag\"".to_owned();
+            metadata
+        },
+        {
+            let mut metadata = metadata_with_content_type("bucket", "object.txt", 5, None);
+            metadata
+                .user_metadata
+                .insert("bad key".to_owned(), "value".to_owned());
+            metadata
+        },
+        {
+            let mut metadata = metadata_with_content_type("bucket", "object.txt", 5, None);
+            metadata
+                .user_metadata
+                .insert("valid-key".to_owned(), "bad\nvalue".to_owned());
+            metadata
+        },
+    ] {
+        let storage = RecordingStorage {
+            metadata,
+            ..RecordingStorage::default()
+        };
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+            .await
+            .expect("get response");
+
+        assert_s3_error_xml(
+            response,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "/bucket/object.txt",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn head_object_returns_internal_error_for_invalid_response_metadata_headers() {
+    let mut metadata = metadata_with_content_type("bucket", "object.txt", 5, None);
+    metadata.etag = "\"bad\netag\"".to_owned();
+    let storage = RecordingStorage {
+        metadata,
+        ..RecordingStorage::default()
+    };
+    let app = router(ServerState::from_storage(storage));
+
+    let response = app
+        .oneshot(request(Method::HEAD, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("head response");
+
+    assert_head_error(response, StatusCode::INTERNAL_SERVER_ERROR).await;
+}
+
+#[tokio::test]
 async fn storage_errors_return_s3_xml_with_status_and_request_id() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let response = app
         .oneshot(request(
@@ -637,9 +1141,78 @@ async fn storage_errors_return_s3_xml_with_status_and_request_id() {
 }
 
 #[tokio::test]
+async fn successful_s3_responses_include_request_id() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
+
+    let create_bucket = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create_bucket.status(), StatusCode::OK);
+    assert_success_request_id(&create_bucket);
+
+    let head_bucket = app
+        .clone()
+        .oneshot(request(Method::HEAD, "/bucket", Body::empty()))
+        .await
+        .expect("head bucket");
+    assert_eq!(head_bucket.status(), StatusCode::OK);
+    assert_success_request_id(&head_bucket);
+
+    let list_buckets = app
+        .clone()
+        .oneshot(request(Method::GET, "/", Body::empty()))
+        .await
+        .expect("list buckets");
+    assert_eq!(list_buckets.status(), StatusCode::OK);
+    assert_success_request_id(&list_buckets);
+
+    let put_object = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/object.txt",
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object");
+    assert_eq!(put_object.status(), StatusCode::OK);
+    assert_success_request_id(&put_object);
+
+    let list_objects = app
+        .clone()
+        .oneshot(request(Method::GET, "/bucket?list-type=2", Body::empty()))
+        .await
+        .expect("list objects");
+    assert_eq!(list_objects.status(), StatusCode::OK);
+    assert_success_request_id(&list_objects);
+
+    let delete_object = app
+        .clone()
+        .oneshot(request(Method::DELETE, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("delete object");
+    assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+    assert_success_request_id(&delete_object);
+
+    let delete_bucket = app
+        .oneshot(request(Method::DELETE, "/bucket", Body::empty()))
+        .await
+        .expect("delete bucket");
+    assert_eq!(delete_bucket.status(), StatusCode::NO_CONTENT);
+    assert_success_request_id(&delete_bucket);
+}
+
+#[tokio::test]
 async fn bucket_lifecycle_for_empty_bucket_returns_s3_statuses_and_empty_bodies() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -686,7 +1259,9 @@ async fn bucket_lifecycle_for_empty_bucket_returns_s3_statuses_and_empty_bodies(
 #[tokio::test]
 async fn duplicate_bucket_create_returns_409_bucket_already_owned_by_you() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -708,7 +1283,9 @@ async fn duplicate_bucket_create_returns_409_bucket_already_owned_by_you() {
 #[tokio::test]
 async fn missing_bucket_head_and_delete_return_expected_errors() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let head = app
         .clone()
@@ -731,7 +1308,9 @@ async fn missing_bucket_head_and_delete_return_expected_errors() {
 #[tokio::test]
 async fn delete_non_empty_bucket_returns_409_bucket_not_empty() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -772,7 +1351,9 @@ async fn delete_non_empty_bucket_returns_409_bucket_not_empty() {
 #[tokio::test]
 async fn filesystem_backed_router_supports_basic_bucket_and_object_flow() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -839,7 +1420,9 @@ async fn filesystem_backed_router_supports_basic_bucket_and_object_flow() {
 #[tokio::test]
 async fn object_put_get_and_head_preserve_metadata_headers() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -863,7 +1446,7 @@ async fn object_put_get_and_head_preserve_metadata_headers() {
         .await
         .expect("put object");
     assert_eq!(put.status(), StatusCode::OK);
-    assert_put_object_metadata_headers(&put, Some("text/plain"));
+    assert_put_object_success_headers(&put);
     assert_eq!(
         put.headers().get(ETAG).and_then(|v| v.to_str().ok()),
         Some("\"5d41402abc4b2a76b9719d911017c592\"")
@@ -889,9 +1472,209 @@ async fn object_put_get_and_head_preserve_metadata_headers() {
 }
 
 #[tokio::test]
+async fn object_put_without_content_type_defaults_get_and_head_to_binary_octet_stream() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.bin",
+            &[("x-amz-meta-Z-Key", "last"), ("x-amz-meta-a-key", "first")],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object");
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let get = app
+        .clone()
+        .oneshot(request(Method::GET, "/bucket/object.bin", Body::empty()))
+        .await
+        .expect("get object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_object_metadata_headers(&get, "5", Some("binary/octet-stream"));
+    assert_eq!(body_bytes(get).await, Bytes::from_static(b"hello"));
+
+    let head = app
+        .oneshot(request(Method::HEAD, "/bucket/object.bin", Body::empty()))
+        .await
+        .expect("head object");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_object_metadata_headers(&head, "5", Some("binary/octet-stream"));
+    assert!(body_bytes(head).await.is_empty());
+}
+
+#[tokio::test]
+async fn put_object_rejects_known_unsupported_s3_headers_without_storage_call() {
+    for (header, value) in [
+        ("x-amz-acl", "public-read"),
+        ("x-amz-tagging", "project=s3lab"),
+        ("x-amz-storage-class", "STANDARD_IA"),
+        ("x-amz-server-side-encryption", "AES256"),
+        ("x-amz-server-side-encryption-aws-kms-key-id", "key-id"),
+        ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ("x-amz-checksum-algorithm", "SHA256"),
+        ("x-amz-checksum-sha256", "checksum"),
+        ("x-amz-copy-source", "/source-bucket/source-key"),
+        ("x-amz-sdk-checksum-algorithm", "CRC32"),
+        (
+            "x-amz-grant-read",
+            "uri=http://acs.amazonaws.com/groups/global/AllUsers",
+        ),
+        ("x-amz-object-lock-mode", "GOVERNANCE"),
+        ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
+        ("cache-control", "max-age=60"),
+        ("content-disposition", "attachment"),
+        ("content-encoding", "gzip"),
+        ("content-language", "en-US"),
+        ("expires", "Sun, 10 May 2026 12:00:00 GMT"),
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request_with_headers(
+                Method::PUT,
+                "/bucket/object.txt",
+                &[(header, value)],
+                Body::from("hello"),
+            ))
+            .await
+            .expect("put object");
+
+        assert_s3_error_xml(
+            response,
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "/bucket/object.txt",
+        )
+        .await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn range_get_and_head_object_are_not_implemented_without_storage_call() {
+    for method in [Method::GET, Method::HEAD] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request_with_headers(
+                method.clone(),
+                "/bucket/object.txt",
+                &[("range", "bytes=0-1")],
+                Body::empty(),
+            ))
+            .await
+            .expect("range object request");
+
+        if method == Method::HEAD {
+            assert_head_error(response, StatusCode::NOT_IMPLEMENTED).await;
+        } else {
+            assert_s3_error_xml(
+                response,
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                "/bucket/object.txt",
+            )
+            .await;
+        }
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn put_object_rejects_body_over_phase1_limit_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(ServerState::from_storage(storage));
+    let oversized_body = vec![b'x'; PHASE1_MAX_PUT_OBJECT_BODY_BYTES + 1];
+
+    let response = app
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/object.txt",
+            Body::from(oversized_body),
+        ))
+        .await
+        .expect("put oversized object");
+
+    assert_s3_error_xml(
+        response,
+        StatusCode::BAD_REQUEST,
+        "EntityTooLarge",
+        "/bucket/object.txt",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn filesystem_object_put_get_and_head_use_fixed_last_modified_header() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::from_storage(FilesystemStorage::with_clock(
+        temp_dir.path().to_path_buf(),
+        FixedClock(fixed_last_modified()),
+    )));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/object.txt",
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_no_last_modified(&put);
+    assert!(body_bytes(put).await.is_empty());
+
+    let get = app
+        .clone()
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_last_modified(&get, "Sun, 10 May 2026 12:34:56 GMT");
+    assert_eq!(body_bytes(get).await, Bytes::from_static(b"hello"));
+
+    let head = app
+        .oneshot(request(Method::HEAD, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("head object");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_last_modified(&head, "Sun, 10 May 2026 12:34:56 GMT");
+    assert!(body_bytes(head).await.is_empty());
+}
+
+#[tokio::test]
 async fn object_lifecycle_put_overwrite_get_head_delete_contract() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -1004,7 +1787,9 @@ async fn object_lifecycle_put_overwrite_get_head_delete_contract() {
 #[tokio::test]
 async fn put_object_rejects_empty_user_metadata_suffix() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -1027,9 +1812,36 @@ async fn put_object_rejects_empty_user_metadata_suffix() {
 }
 
 #[tokio::test]
+async fn put_object_rejects_invalid_user_metadata_headers_without_storage_call() {
+    for headers in [
+        vec![("x-amz-meta-", "value")],
+        vec![("x-amz-meta-Z-Key", "last"), ("x-amz-meta-z-key", "again")],
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request_with_headers(
+                Method::PUT,
+                "/bucket/object.txt",
+                &headers,
+                Body::from("hello"),
+            ))
+            .await
+            .expect("put object");
+
+        assert_invalid_argument_xml(response, "/bucket/object.txt").await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
 async fn put_object_rejects_non_utf8_user_metadata_value() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -1054,9 +1866,32 @@ async fn put_object_rejects_non_utf8_user_metadata_value() {
 }
 
 #[tokio::test]
+async fn put_object_rejects_non_utf8_content_type_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(ServerState::from_storage(storage));
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/bucket/object.txt")
+        .header(
+            CONTENT_TYPE,
+            HeaderValue::from_bytes(&[0xff]).expect("valid opaque header value"),
+        )
+        .body(Body::from("hello"))
+        .expect("valid request");
+
+    let response = app.oneshot(request).await.expect("put object");
+
+    assert_invalid_argument_xml(response, "/bucket/object.txt").await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
 async fn put_object_rejects_duplicate_normalized_user_metadata_keys() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -1081,7 +1916,9 @@ async fn put_object_rejects_duplicate_normalized_user_metadata_keys() {
 #[tokio::test]
 async fn object_lifecycle_missing_bucket_and_key_errors_are_s3_errors() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let missing_bucket_put = app
         .clone()
@@ -1165,7 +2002,9 @@ async fn object_lifecycle_missing_bucket_and_key_errors_are_s3_errors() {
 #[tokio::test]
 async fn delete_bucket_and_object_successes_return_204_no_content() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -1204,7 +2043,9 @@ async fn delete_bucket_and_object_successes_return_204_no_content() {
 #[tokio::test]
 async fn delete_object_is_idempotent_for_existing_bucket_only() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::filesystem(temp_dir.path()));
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
 
     let create = app
         .clone()
@@ -1332,11 +2173,74 @@ fn assert_no_storage_calls(calls: &Arc<Mutex<Vec<&'static str>>>) {
     assert_eq!(calls.lock().expect("calls lock").as_slice(), &[] as &[&str]);
 }
 
+fn assert_success_request_id(response: &axum::http::Response<Body>) {
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+}
+
 fn xml_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn path_only(uri: &str) -> &str {
+    uri.split_once('?').map_or(uri, |(path, _)| path)
+}
+
+#[derive(Default)]
+struct ListObjectsV2XmlExpectation<'a> {
+    key_count: usize,
+    max_keys: usize,
+    continuation_token: Option<&'a str>,
+    is_truncated: bool,
+    contents: &'a [String],
+    next_continuation_token: Option<&'a str>,
+}
+
+fn expected_list_objects_v2_xml(expectation: ListObjectsV2XmlExpectation<'_>) -> String {
+    let mut xml = format!(
+        "{}<ListBucketResult><Name>bucket</Name><Prefix></Prefix><KeyCount>{}</KeyCount><MaxKeys>{}</MaxKeys>",
+        xml_declaration(),
+        expectation.key_count,
+        expectation.max_keys
+    );
+
+    if let Some(continuation_token) = expectation.continuation_token {
+        xml.push_str(&format!(
+            "<ContinuationToken>{continuation_token}</ContinuationToken>"
+        ));
+    }
+    xml.push_str(&format!(
+        "<IsTruncated>{}</IsTruncated>",
+        expectation.is_truncated
+    ));
+    for content in expectation.contents {
+        xml.push_str(content);
+    }
+    if let Some(next_continuation_token) = expectation.next_continuation_token {
+        xml.push_str(&format!(
+            "<NextContinuationToken>{next_continuation_token}</NextContinuationToken>"
+        ));
+    }
+    xml.push_str("</ListBucketResult>");
+    xml
+}
+
+fn list_object_xml(key: &str, etag: &str, size: u64) -> String {
+    format!(
+        "<Contents><Key>{key}</Key><LastModified>2026-05-10T12:34:56.000Z</LastModified><ETag>&quot;{etag}&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
+    )
+}
+
+fn xml_declaration() -> &'static str {
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
 }
 
 fn assert_object_metadata_headers(
@@ -1386,10 +2290,27 @@ fn assert_object_metadata_headers(
     );
 }
 
-fn assert_put_object_metadata_headers(
-    response: &axum::http::Response<Body>,
-    content_type: Option<&str>,
-) {
+fn assert_last_modified(response: &axum::http::Response<Body>, expected: &str) {
+    assert_eq!(
+        response
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok()),
+        Some(expected)
+    );
+}
+
+fn assert_no_last_modified(response: &axum::http::Response<Body>) {
+    assert_eq!(
+        response
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok()),
+        None
+    );
+}
+
+fn assert_put_object_success_headers(response: &axum::http::Response<Body>) {
     assert!(matches!(
         response
             .headers()
@@ -1402,13 +2323,15 @@ fn assert_put_object_metadata_headers(
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok()),
-        content_type
+        None
     );
-    assert!(response
-        .headers()
-        .get(LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok())
-        .is_some());
+    assert_eq!(
+        response
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok()),
+        None
+    );
     assert_eq!(
         response
             .headers()
@@ -1421,15 +2344,32 @@ fn assert_put_object_metadata_headers(
             .headers()
             .get("x-amz-meta-z-key")
             .and_then(|v| v.to_str().ok()),
-        Some("last")
+        None
     );
     assert_eq!(
         response
             .headers()
             .get("x-amz-meta-a-key")
             .and_then(|v| v.to_str().ok()),
-        Some("first")
+        None
     );
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct FixedClock(OffsetDateTime);
+
+impl StorageClock for FixedClock {
+    fn now_utc(&self) -> OffsetDateTime {
+        self.0
+    }
+}
+
+fn fixed_last_modified() -> OffsetDateTime {
+    PrimitiveDateTime::new(
+        Date::from_calendar_date(2026, Month::May, 10).expect("valid test date"),
+        Time::from_hms(12, 34, 56).expect("valid test time"),
+    )
+    .assume_utc()
 }
 
 #[derive(Clone)]

@@ -8,6 +8,7 @@ description = "Offline S3 compatibility and protocol debugging lab."
 [dependencies]
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
 md-5 = "0.11"
 percent-encoding = "2"
 quick-xml = "0.39"
@@ -21,7 +22,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 tempfile = "3"

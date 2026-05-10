@@ -2,7 +2,7 @@
 
 use super::StorageError;
 use crate::s3::bucket::BucketName;
-use crate::s3::object::ObjectKey;
+use crate::s3::object::{is_valid_s3_object_key, ObjectKey};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -32,10 +32,6 @@ impl EncodedObjectKey {
     }
 }
 
-pub fn raw_keys_are_not_filesystem_paths() -> bool {
-    true
-}
-
 pub fn encode_bucket_name(bucket: &BucketName) -> EncodedBucketName {
     EncodedBucketName {
         path_component: format!("bucket-{}", sha256_lower_hex(bucket.as_str())),
@@ -43,7 +39,7 @@ pub fn encode_bucket_name(bucket: &BucketName) -> EncodedBucketName {
 }
 
 pub fn encode_object_key(key: &ObjectKey) -> Result<EncodedObjectKey, StorageError> {
-    if key.as_str().is_empty() {
+    if !is_valid_s3_object_key(key.as_str()) {
         return Err(StorageError::InvalidObjectKey {
             key: key.as_str().to_owned(),
         });
@@ -66,14 +62,9 @@ fn sha256_lower_hex(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_bucket_name, encode_object_key, raw_keys_are_not_filesystem_paths};
+    use super::{encode_bucket_name, encode_object_key, StorageError};
     use crate::s3::bucket::BucketName;
-    use crate::s3::object::ObjectKey;
-
-    #[test]
-    fn storage_key_policy_rejects_raw_path_mapping() {
-        assert!(raw_keys_are_not_filesystem_paths());
-    }
+    use crate::s3::object::{ObjectKey, MAX_OBJECT_KEY_UTF8_BYTES};
 
     #[test]
     fn bucket_encoding_is_deterministic_and_distinguishes_names() {
@@ -136,5 +127,47 @@ mod tests {
         let error = encode_object_key(&ObjectKey::new("")).expect_err("empty key is invalid");
 
         assert!(error.to_string().contains("invalid object key"));
+    }
+
+    #[test]
+    fn xml_invalid_object_key_is_rejected_before_path_encoding() {
+        for key in ["prefix/\0object.txt", "prefix/\u{1F}object.txt"] {
+            let error =
+                encode_object_key(&ObjectKey::new(key)).expect_err("XML-invalid key is invalid");
+
+            assert!(matches!(error, StorageError::InvalidObjectKey { .. }));
+        }
+    }
+
+    #[test]
+    fn object_key_encoding_accepts_carriage_return() {
+        let encoded =
+            encode_object_key(&ObjectKey::new("prefix/\robject.txt")).expect("CR key is valid");
+
+        assert!(encoded.as_path_component().starts_with("key-"));
+    }
+
+    #[test]
+    fn object_key_encoding_accepts_path_like_keys_at_utf8_byte_limit() {
+        let key = ObjectKey::new(format!(
+            "prefix/{}",
+            "a".repeat(MAX_OBJECT_KEY_UTF8_BYTES - "prefix/".len())
+        ));
+
+        let encoded = encode_object_key(&key).expect("key at byte limit is valid");
+
+        assert!(encoded.as_path_component().starts_with("key-"));
+    }
+
+    #[test]
+    fn object_key_encoding_rejects_keys_over_utf8_byte_limit() {
+        let ascii_key = ObjectKey::new("a".repeat(MAX_OBJECT_KEY_UTF8_BYTES + 1));
+        let utf8_key = ObjectKey::new("é".repeat((MAX_OBJECT_KEY_UTF8_BYTES / 2) + 1));
+
+        for key in [ascii_key, utf8_key] {
+            let error = encode_object_key(&key).expect_err("oversized key is invalid");
+
+            assert!(matches!(error, StorageError::InvalidObjectKey { .. }));
+        }
     }
 }

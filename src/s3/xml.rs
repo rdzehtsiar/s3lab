@@ -1,11 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::s3::error::S3Error;
-use crate::storage::{BucketSummary, ObjectListing};
+use crate::s3::time::s3_xml_timestamp;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
+use time::OffsetDateTime;
 
 pub const XML_CONTENT_TYPE: &str = "application/xml";
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ListBucketsXml {
+    pub buckets: Vec<ListBucketXml>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ListBucketXml {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ListObjectsV2Xml {
+    pub bucket: String,
+    pub objects: Vec<ListObjectXml>,
+    pub max_keys: usize,
+    pub is_truncated: bool,
+    pub next_continuation_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ListObjectXml {
+    pub key: String,
+    pub etag: String,
+    pub content_length: u64,
+    pub last_modified: OffsetDateTime,
+}
 
 pub fn error_response_xml(error: &S3Error) -> String {
     let mut writer = Writer::new(Vec::new());
@@ -27,7 +55,7 @@ pub fn error_response_xml(error: &S3Error) -> String {
     String::from_utf8(writer.into_inner()).expect("quick-xml writes valid UTF-8")
 }
 
-pub fn list_buckets_response_xml(buckets: &[BucketSummary]) -> String {
+pub fn list_buckets_response_xml(listing: &ListBucketsXml) -> String {
     let mut writer = Writer::new(Vec::new());
 
     write_xml_declaration(&mut writer);
@@ -38,7 +66,7 @@ pub fn list_buckets_response_xml(buckets: &[BucketSummary]) -> String {
         .write_event(Event::Start(BytesStart::new("Buckets")))
         .expect("writing XML start element to memory cannot fail");
 
-    for bucket in buckets {
+    for bucket in &listing.buckets {
         writer
             .write_event(Event::Start(BytesStart::new("Bucket")))
             .expect("writing XML start element to memory cannot fail");
@@ -58,7 +86,11 @@ pub fn list_buckets_response_xml(buckets: &[BucketSummary]) -> String {
     String::from_utf8(writer.into_inner()).expect("quick-xml writes valid UTF-8")
 }
 
-pub fn list_objects_v2_response_xml(listing: &ObjectListing, prefix: Option<&str>) -> String {
+pub fn list_objects_v2_response_xml(
+    listing: &ListObjectsV2Xml,
+    prefix: Option<&str>,
+    continuation_token: Option<&str>,
+) -> String {
     let mut writer = Writer::new(Vec::new());
 
     write_xml_declaration(&mut writer);
@@ -69,6 +101,9 @@ pub fn list_objects_v2_response_xml(listing: &ObjectListing, prefix: Option<&str
     write_text_element(&mut writer, "Prefix", prefix.unwrap_or(""));
     write_text_element(&mut writer, "KeyCount", &listing.objects.len().to_string());
     write_text_element(&mut writer, "MaxKeys", &listing.max_keys.to_string());
+    if let Some(token) = continuation_token {
+        write_text_element(&mut writer, "ContinuationToken", token);
+    }
     write_text_element(
         &mut writer,
         "IsTruncated",
@@ -84,7 +119,14 @@ pub fn list_objects_v2_response_xml(listing: &ObjectListing, prefix: Option<&str
             .write_event(Event::Start(BytesStart::new("Contents")))
             .expect("writing XML start element to memory cannot fail");
         write_text_element(&mut writer, "Key", object.key.as_str());
+        write_text_element(
+            &mut writer,
+            "LastModified",
+            &s3_xml_timestamp(object.last_modified),
+        );
+        write_text_element(&mut writer, "ETag", &object.etag);
         write_text_element(&mut writer, "Size", &object.content_length.to_string());
+        write_text_element(&mut writer, "StorageClass", "STANDARD");
         writer
             .write_event(Event::End(BytesEnd::new("Contents")))
             .expect("writing XML end element to memory cannot fail");
@@ -114,9 +156,24 @@ fn write_text_element(writer: &mut Writer<Vec<u8>>, name: &str, value: &str) {
         .write_event(Event::Start(BytesStart::new(name)))
         .expect("writing XML start element to memory cannot fail");
     writer
-        .write_event(Event::Text(BytesText::new(value)))
+        .write_event(Event::Text(BytesText::from_escaped(escape_text(value))))
         .expect("writing XML text to memory cannot fail");
     writer
         .write_event(Event::End(BytesEnd::new(name)))
         .expect("writing XML end element to memory cannot fail");
+}
+
+fn escape_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\r' => escaped.push_str("&#13;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }

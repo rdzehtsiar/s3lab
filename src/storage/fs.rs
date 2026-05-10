@@ -3,10 +3,10 @@
 use super::key::{encode_bucket_name, encode_object_key, EncodedObjectKey};
 use super::{
     BucketSummary, ListObjectsOptions, ObjectListing, PutObjectRequest, Storage, StorageError,
-    StoredObject, StoredObjectMetadata, STORAGE_ROOT_DIR,
+    StoredObject, StoredObjectMetadata, DEFAULT_OBJECT_CONTENT_TYPE, STORAGE_ROOT_DIR,
 };
-use crate::s3::bucket::BucketName;
-use crate::s3::object::ObjectKey;
+use crate::s3::bucket::{is_valid_s3_bucket_name, BucketName};
+use crate::s3::object::{is_valid_s3_object_key_prefix, ObjectKey};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -26,7 +28,10 @@ const OBJECT_CONTENT_FILE: &str = "content.bin";
 const OBJECT_METADATA_FILE: &str = "metadata.json";
 const OBJECT_METADATA_SCHEMA_VERSION: u32 = 1;
 const CONTINUATION_TOKEN_PREFIX: &str = "s3lab-v1:";
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const SIBLING_PATH_RETRY_LIMIT: u64 = 64;
 // Process-local serialization keeps filesystem transitions invisible to other
 // public storage operations while the storage layout is intentionally simple.
 static STORAGE_LOCK: Mutex<()> = Mutex::new(());
@@ -51,7 +56,7 @@ impl StorageClock for SystemClock {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct FilesystemStorage<C = SystemClock> {
-    pub root: PathBuf,
+    root: PathBuf,
     clock: C,
 }
 
@@ -68,10 +73,20 @@ impl<C> FilesystemStorage<C> {
             clock,
         }
     }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 }
 
 impl<C: StorageClock> Storage for FilesystemStorage<C> {
     fn create_bucket(&self, bucket: &BucketName) -> Result<(), StorageError> {
+        if !bucket.is_valid_s3_name() {
+            return Err(StorageError::InvalidBucketName {
+                bucket: bucket.as_str().to_owned(),
+            });
+        }
+
         let _guard = lock_storage(&self.root, "create_bucket")?;
         let bucket_root = self.bucket_root();
         create_dir_all(&bucket_root)?;
@@ -113,24 +128,25 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
                 continue;
             }
 
-            if !entry
-                .file_type()
-                .map_err(|source| StorageError::Io {
-                    path: entry.path(),
-                    source,
-                })?
-                .is_dir()
-            {
+            let entry_path = entry.path();
+            let Some(entry_metadata) = storage_path_metadata(&entry_path)? else {
+                continue;
+            };
+            if !entry_metadata.is_dir() {
                 continue;
             }
 
-            let metadata_path = entry.path().join(BUCKET_METADATA_FILE);
+            let metadata_path = entry_path.join(BUCKET_METADATA_FILE);
             if !path_exists(&metadata_path)? {
                 return Err(corrupt_state(metadata_path, "missing bucket metadata"));
             }
 
             let record: BucketRecord = read_json(&metadata_path)?;
-            validate_listed_bucket_record(&entry.path(), &metadata_path, &record)?;
+            validate_listed_bucket_record(&entry_path, &metadata_path, &record)?;
+            require_storage_directory(
+                &entry_path.join(OBJECTS_DIR),
+                "missing bucket objects directory",
+            )?;
             buckets.push(BucketSummary {
                 name: BucketName::new(record.bucket),
             });
@@ -157,7 +173,9 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         self.ensure_bucket(bucket)?;
 
         let objects_dir = self.bucket_dir(bucket).join(OBJECTS_DIR);
-        if path_exists(&objects_dir)? && directory_has_entries(&objects_dir)? {
+        if path_exists(&objects_dir)?
+            && self.bucket_has_visible_committed_objects(bucket, &objects_dir)?
+        {
             return Err(StorageError::BucketNotEmpty {
                 bucket: bucket.clone(),
             });
@@ -179,7 +197,11 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
             key: request.key.clone(),
             etag: etag_for_bytes(&request.bytes),
             content_length: request.bytes.len() as u64,
-            content_type: request.content_type,
+            content_type: Some(
+                request
+                    .content_type
+                    .unwrap_or_else(|| DEFAULT_OBJECT_CONTENT_TYPE.to_owned()),
+            ),
             last_modified: now,
             user_metadata: request.user_metadata,
         };
@@ -245,6 +267,13 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
     ) -> Result<ObjectListing, StorageError> {
         let _guard = lock_storage(&self.root, "list_objects")?;
         self.ensure_bucket(bucket)?;
+        if options
+            .prefix
+            .as_ref()
+            .is_some_and(|prefix| !is_valid_s3_object_key_prefix(prefix.as_str()))
+        {
+            return Err(invalid_list_objects_prefix());
+        }
         let resume_key = options
             .continuation_token
             .as_deref()
@@ -263,63 +292,36 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         }
 
         let mut objects = Vec::new();
-        for shard_entry in sorted_directory_entries(&objects_dir)? {
-            if is_hidden_storage_entry(&shard_entry) {
-                continue;
-            }
-
-            if !shard_entry
-                .file_type()
-                .map_err(|source| StorageError::Io {
-                    path: shard_entry.path(),
-                    source,
-                })?
-                .is_dir()
+        self.visit_visible_committed_objects(bucket, &objects_dir, |metadata| {
+            if options
+                .prefix
+                .as_ref()
+                .is_some_and(|prefix| !metadata.key.as_str().starts_with(prefix.as_str()))
             {
-                continue;
+                return Ok(VisibleCommittedObjectVisit::Continue);
             }
 
-            for object_entry in sorted_directory_entries(&shard_entry.path())? {
-                if is_hidden_storage_entry(&object_entry) {
-                    continue;
-                }
-
-                if !object_entry
-                    .file_type()
-                    .map_err(|source| StorageError::Io {
-                        path: object_entry.path(),
-                        source,
-                    })?
-                    .is_dir()
-                {
-                    continue;
-                }
-
-                let metadata_path = object_entry.path().join(OBJECT_METADATA_FILE);
-                let metadata = self.read_listed_object_metadata(bucket, &metadata_path)?;
-                if options
-                    .prefix
-                    .as_ref()
-                    .is_some_and(|prefix| !metadata.key.as_str().starts_with(prefix.as_str()))
-                {
-                    continue;
-                }
-
-                objects.push(metadata);
-            }
-        }
+            objects.push(metadata);
+            Ok(VisibleCommittedObjectVisit::Continue)
+        })?;
 
         objects.sort_by(|left, right| left.key.cmp(&right.key));
         let start_index = resume_key.as_ref().map_or(0, |resume_key| {
             objects.partition_point(|object| object.key < *resume_key)
         });
         if options.max_keys == 0 {
+            let start_index = resume_key.as_ref().map_or(0, |resume_key| {
+                objects.partition_point(|object| object.key <= *resume_key)
+            });
+            let next_continuation_token = objects
+                .get(start_index)
+                .map(|object| encode_continuation_token(&object.key));
             return Ok(ObjectListing {
                 bucket: bucket.clone(),
                 objects: Vec::new(),
                 max_keys: options.max_keys,
-                is_truncated: false,
-                next_continuation_token: None,
+                is_truncated: next_continuation_token.is_some(),
+                next_continuation_token,
             });
         }
 
@@ -389,6 +391,10 @@ impl<C> FilesystemStorage<C> {
 
         let record = self.read_bucket_record(bucket)?;
         validate_bucket_record(bucket, &self.bucket_metadata_path(bucket), &record)?;
+        require_storage_directory(
+            &self.bucket_dir(bucket).join(OBJECTS_DIR),
+            "missing bucket objects directory",
+        )?;
 
         Ok(())
     }
@@ -419,22 +425,18 @@ impl<C> FilesystemStorage<C> {
         encoded_key: &EncodedObjectKey,
     ) -> Result<StoredObject, StorageError> {
         let object_dir = self.object_dir(bucket, encoded_key);
-        if !path_exists(&object_dir)? {
-            return Err(StorageError::NoSuchKey {
-                bucket: bucket.clone(),
-                key: key.clone(),
-            });
+        match object_path_state(&object_dir)? {
+            ObjectPathState::Committed => {}
+            ObjectPathState::Missing => {
+                return Err(StorageError::NoSuchKey {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                });
+            }
         }
 
         let metadata_path = object_dir.join(OBJECT_METADATA_FILE);
-        if !path_exists(&metadata_path)? {
-            return Err(corrupt_state(metadata_path, "missing object metadata"));
-        }
-
         let content_path = object_dir.join(OBJECT_CONTENT_FILE);
-        if !path_exists(&content_path)? {
-            return Err(corrupt_state(content_path, "missing object content"));
-        }
 
         let metadata = object_metadata_from_path(&metadata_path)?;
         if metadata.bucket != *bucket || metadata.key != *key {
@@ -492,6 +494,78 @@ impl<C> FilesystemStorage<C> {
 
         Ok(metadata)
     }
+
+    fn bucket_has_visible_committed_objects(
+        &self,
+        bucket: &BucketName,
+        objects_dir: &Path,
+    ) -> Result<bool, StorageError> {
+        let mut found_object = false;
+        self.visit_visible_committed_objects(bucket, objects_dir, |_| {
+            found_object = true;
+            Ok(VisibleCommittedObjectVisit::Stop)
+        })?;
+
+        Ok(found_object)
+    }
+
+    fn visit_visible_committed_objects<F>(
+        &self,
+        bucket: &BucketName,
+        objects_dir: &Path,
+        mut visit: F,
+    ) -> Result<(), StorageError>
+    where
+        F: FnMut(StoredObjectMetadata) -> Result<VisibleCommittedObjectVisit, StorageError>,
+    {
+        for shard_entry in sorted_directory_entries(objects_dir)? {
+            if is_hidden_storage_entry(&shard_entry) {
+                continue;
+            }
+
+            let shard_path = shard_entry.path();
+            let Some(shard_metadata) = storage_path_metadata(&shard_path)? else {
+                continue;
+            };
+            if !shard_metadata.is_dir() {
+                return Err(corrupt_state(
+                    shard_path,
+                    "visible object shard path exists but is not a directory",
+                ));
+            }
+
+            for object_entry in sorted_directory_entries(&shard_path)? {
+                if is_hidden_storage_entry(&object_entry) {
+                    continue;
+                }
+
+                let object_path = object_entry.path();
+                let Some(object_metadata) = storage_path_metadata(&object_path)? else {
+                    continue;
+                };
+                if !object_metadata.is_dir() {
+                    return Err(corrupt_state(
+                        object_path,
+                        "visible object path exists but is not a directory",
+                    ));
+                }
+
+                let metadata = self
+                    .read_listed_object_metadata(bucket, &object_path.join(OBJECT_METADATA_FILE))?;
+                if visit(metadata)? == VisibleCommittedObjectVisit::Stop {
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum VisibleCommittedObjectVisit {
+    Continue,
+    Stop,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -634,7 +708,14 @@ fn invalid_continuation_token() -> StorageError {
     }
 }
 
+fn invalid_list_objects_prefix() -> StorageError {
+    StorageError::InvalidArgument {
+        message: "invalid ListObjectsV2 prefix".to_owned(),
+    }
+}
+
 fn sorted_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, StorageError> {
+    require_storage_directory(path, "missing storage directory")?;
     let mut entries = fs::read_dir(path)
         .map_err(|source| StorageError::Io {
             path: path.to_path_buf(),
@@ -667,6 +748,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, StorageErro
 }
 
 fn read_bytes(path: &Path) -> Result<Vec<u8>, StorageError> {
+    require_storage_file(path, "missing storage file")?;
     fs::read(path).map_err(|source| StorageError::Io {
         path: path.to_path_buf(),
         source,
@@ -674,6 +756,7 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, StorageError> {
 }
 
 fn read_object_content_bytes(path: &Path) -> Result<Vec<u8>, StorageError> {
+    require_storage_file(path, "missing object content")?;
     fs::read(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             corrupt_state(path.to_path_buf(), "missing object content")
@@ -727,8 +810,7 @@ fn write_new_bucket_state_atomically(
     record: &BucketRecord,
     bucket: &BucketName,
 ) -> Result<(), StorageError> {
-    let temporary_bucket_dir = temporary_sibling_path(bucket_dir);
-    create_dir(&temporary_bucket_dir)?;
+    let temporary_bucket_dir = create_temporary_sibling_dir(bucket_dir)?;
 
     if let Err(error) = write_new_bucket_state(&temporary_bucket_dir, record) {
         remove_path_best_effort(&temporary_bucket_dir);
@@ -777,8 +859,7 @@ fn write_new_object_dir_atomically(
     };
 
     create_dir_all(shard_dir)?;
-    let temporary_object_dir = temporary_sibling_path(object_dir);
-    create_dir(&temporary_object_dir)?;
+    let temporary_object_dir = create_temporary_sibling_dir(object_dir)?;
 
     if let Err(error) = write_new_object_state(&temporary_object_dir, content, metadata) {
         remove_path_best_effort(&temporary_object_dir);
@@ -863,11 +944,10 @@ enum ObjectPathState {
 }
 
 fn object_path_state(object_dir: &Path) -> Result<ObjectPathState, StorageError> {
-    if !path_exists(object_dir)? {
+    let Some(object_dir_metadata) = storage_path_metadata(object_dir)? else {
         return Ok(ObjectPathState::Missing);
-    }
-
-    if !object_dir.is_dir() {
+    };
+    if !object_dir_metadata.is_dir() {
         return Err(corrupt_state(
             object_dir.to_path_buf(),
             "object path exists but is not a directory",
@@ -876,17 +956,17 @@ fn object_path_state(object_dir: &Path) -> Result<ObjectPathState, StorageError>
 
     let content_path = object_dir.join(OBJECT_CONTENT_FILE);
     let metadata_path = object_dir.join(OBJECT_METADATA_FILE);
-    let content_exists = path_exists(&content_path)?;
-    let metadata_exists = path_exists(&metadata_path)?;
-    if content_exists && metadata_exists {
-        if !content_path.is_file() {
+    let content_metadata = storage_path_metadata(&content_path)?;
+    let object_metadata = storage_path_metadata(&metadata_path)?;
+    if let (Some(content_metadata), Some(object_metadata)) = (content_metadata, object_metadata) {
+        if !content_metadata.is_file() {
             return Err(corrupt_state(
                 content_path,
                 "object content path exists but is not a file",
             ));
         }
 
-        if !metadata_path.is_file() {
+        if !object_metadata.is_file() {
             return Err(corrupt_state(
                 metadata_path,
                 "object metadata path exists but is not a file",
@@ -903,12 +983,53 @@ fn object_path_state(object_dir: &Path) -> Result<ObjectPathState, StorageError>
 }
 
 fn lock_storage(root: &Path, operation: &str) -> Result<MutexGuard<'static, ()>, StorageError> {
+    validate_storage_root(root)?;
     STORAGE_LOCK.lock().map_err(|_| {
         corrupt_state(
             root.to_path_buf(),
             format!("{operation} storage lock poisoned"),
         )
     })
+}
+
+fn validate_storage_root(root: &Path) -> Result<(), StorageError> {
+    reject_existing_reparse_point_ancestors(root)?;
+
+    let Some(metadata) = storage_path_metadata(root)? else {
+        return Ok(());
+    };
+
+    if !metadata.is_dir() {
+        return Err(corrupt_state(
+            root.to_path_buf(),
+            "storage root exists but is not a directory",
+        ));
+    }
+
+    Ok(())
+}
+
+fn reject_existing_reparse_point_ancestors(path: &Path) -> Result<(), StorageError> {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+
+        let metadata = match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(StorageError::Io {
+                    path: ancestor.to_path_buf(),
+                    source,
+                });
+            }
+        };
+
+        reject_reparse_point(ancestor, &metadata)?;
+    }
+
+    Ok(())
 }
 
 fn json_bytes<T: Serialize>(path: &Path, value: &T) -> Result<Vec<u8>, StorageError> {
@@ -960,15 +1081,7 @@ fn write_temporary_sibling(path: &Path, bytes: &[u8]) -> Result<PathBuf, Storage
         create_dir_all(parent)?;
     }
 
-    let temporary_path = temporary_sibling_path(path);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary_path)
-        .map_err(|source| StorageError::Io {
-            path: temporary_path.clone(),
-            source,
-        })?;
+    let (temporary_path, mut file) = create_new_temporary_file(path, SIBLING_PATH_RETRY_LIMIT)?;
     file.write_all(bytes).map_err(|source| StorageError::Io {
         path: temporary_path.clone(),
         source,
@@ -1029,9 +1142,7 @@ fn move_existing_path_to_backup(path: &Path) -> Result<Option<PathBuf>, StorageE
         return Ok(None);
     }
 
-    let backup_path = backup_sibling_path(path);
-    rename_path(path, &backup_path)?;
-    Ok(Some(backup_path))
+    move_existing_path_to_unused_backup(path, SIBLING_PATH_RETRY_LIMIT)
 }
 
 fn restore_path_backup(path: &Path, backup_path: Option<PathBuf>) {
@@ -1048,6 +1159,8 @@ fn discard_path_backup(backup_path: Option<PathBuf>) {
 }
 
 fn rename_path(from: &Path, to: &Path) -> Result<(), StorageError> {
+    let _ = storage_path_metadata(from)?;
+    let _ = storage_path_metadata(to)?;
     fs::rename(from, to).map_err(|source| StorageError::Io {
         path: to.to_path_buf(),
         source,
@@ -1067,11 +1180,21 @@ fn sync_parent_dir_best_effort(path: &Path) {
 }
 
 fn remove_path_best_effort(path: &Path) {
-    if path.is_dir() {
-        let _ = fs::remove_dir_all(path);
-    } else {
-        let _ = fs::remove_file(path);
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+
+    if is_reparse_point(&metadata) {
+        let _ = fs::remove_file(path).or_else(|_| fs::remove_dir(path));
+        return;
     }
+
+    if metadata.is_dir() {
+        let _ = fs::remove_dir_all(path);
+        return;
+    }
+
+    let _ = fs::remove_file(path);
 }
 
 fn remove_new_object_dirs_best_effort(object_dir: &Path) {
@@ -1085,19 +1208,87 @@ fn remove_empty_dir_best_effort(path: &Path) {
     let _ = fs::remove_dir(path);
 }
 
-fn temporary_sibling_path(path: &Path) -> PathBuf {
-    sibling_path(path, "tmp")
+fn create_temporary_sibling_dir(path: &Path) -> Result<PathBuf, StorageError> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+
+    for attempt in 0..SIBLING_PATH_RETRY_LIMIT {
+        let candidate = sibling_path(path, "tmp", attempt);
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(StorageError::Io {
+                    path: candidate,
+                    source,
+                });
+            }
+        }
+    }
+
+    Err(sibling_collision_error(path, "temporary"))
 }
 
-fn backup_sibling_path(path: &Path) -> PathBuf {
-    sibling_path(path, "bak")
+fn create_new_temporary_file(path: &Path, attempts: u64) -> Result<(PathBuf, File), StorageError> {
+    for attempt in 0..attempts {
+        let candidate = sibling_path(path, "tmp", attempt);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(StorageError::Io {
+                    path: candidate,
+                    source,
+                });
+            }
+        }
+    }
+
+    Err(sibling_collision_error(path, "temporary"))
 }
 
-fn sibling_path(path: &Path, purpose: &str) -> PathBuf {
+fn move_existing_path_to_unused_backup(
+    path: &Path,
+    attempts: u64,
+) -> Result<Option<PathBuf>, StorageError> {
+    for attempt in 0..attempts {
+        let candidate = sibling_path(path, "bak", attempt);
+        if path_exists(&candidate)? {
+            continue;
+        }
+
+        match fs::rename(path, &candidate) {
+            Ok(()) => {
+                sync_parent_dir_best_effort(&candidate);
+                return Ok(Some(candidate));
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(StorageError::Io {
+                    path: candidate,
+                    source,
+                });
+            }
+        }
+    }
+
+    Err(sibling_collision_error(path, "backup"))
+}
+
+fn sibling_path(path: &Path, purpose: &str, attempt: u64) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("storage-file");
+    if attempt == 0 {
+        return path.with_file_name(format!(".{file_name}.{purpose}-{}", std::process::id(),));
+    }
+
     let counter = TEMPORARY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     path.with_file_name(format!(
         ".{file_name}.{purpose}-{}-{counter}",
@@ -1105,11 +1296,28 @@ fn sibling_path(path: &Path, purpose: &str) -> PathBuf {
     ))
 }
 
+fn sibling_collision_error(path: &Path, purpose: &str) -> StorageError {
+    StorageError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("could not create unused {purpose} sibling path"),
+        ),
+    }
+}
+
 fn validate_bucket_record(
     bucket: &BucketName,
     metadata_path: &Path,
     record: &BucketRecord,
 ) -> Result<(), StorageError> {
+    if !is_valid_s3_bucket_name(&record.bucket) {
+        return Err(corrupt_state(
+            metadata_path.to_path_buf(),
+            "bucket metadata contains an invalid S3 bucket name",
+        ));
+    }
+
     if record.bucket != bucket.as_str() {
         return Err(corrupt_state(
             metadata_path.to_path_buf(),
@@ -1125,6 +1333,13 @@ fn validate_listed_bucket_record(
     metadata_path: &Path,
     record: &BucketRecord,
 ) -> Result<(), StorageError> {
+    if !is_valid_s3_bucket_name(&record.bucket) {
+        return Err(corrupt_state(
+            metadata_path.to_path_buf(),
+            "bucket metadata contains an invalid S3 bucket name",
+        ));
+    }
+
     let bucket = BucketName::new(record.bucket.clone());
     let encoded_bucket = encode_bucket_name(&bucket);
     if bucket_dir.file_name() != Some(OsStr::new(encoded_bucket.as_path_component())) {
@@ -1137,25 +1352,85 @@ fn validate_listed_bucket_record(
     Ok(())
 }
 
-fn path_exists(path: &Path) -> Result<bool, StorageError> {
-    path.try_exists().map_err(|source| StorageError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+fn storage_path_metadata(path: &Path) -> Result<Option<fs::Metadata>, StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            reject_reparse_point(path, &metadata)?;
+            Ok(Some(metadata))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(StorageError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
-fn create_dir(path: &Path) -> Result<(), StorageError> {
-    fs::create_dir(path).map_err(|source| StorageError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+fn require_storage_directory(path: &Path, missing_message: &str) -> Result<(), StorageError> {
+    let Some(metadata) = storage_path_metadata(path)? else {
+        return Err(corrupt_state(path.to_path_buf(), missing_message));
+    };
+
+    if !metadata.is_dir() {
+        return Err(corrupt_state(
+            path.to_path_buf(),
+            "storage path exists but is not a directory",
+        ));
+    }
+
+    Ok(())
+}
+
+fn require_storage_file(path: &Path, missing_message: &str) -> Result<(), StorageError> {
+    let Some(metadata) = storage_path_metadata(path)? else {
+        return Err(corrupt_state(path.to_path_buf(), missing_message));
+    };
+
+    if !metadata.is_file() {
+        return Err(corrupt_state(
+            path.to_path_buf(),
+            "storage path exists but is not a file",
+        ));
+    }
+
+    Ok(())
+}
+
+fn reject_reparse_point(path: &Path, metadata: &fs::Metadata) -> Result<(), StorageError> {
+    if is_reparse_point(metadata) {
+        return Err(corrupt_state(
+            path.to_path_buf(),
+            "storage path is a symlink or reparse point",
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink() || has_windows_reparse_point_attribute(metadata)
+}
+
+#[cfg(windows)]
+fn has_windows_reparse_point_attribute(metadata: &fs::Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn has_windows_reparse_point_attribute(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn path_exists(path: &Path) -> Result<bool, StorageError> {
+    Ok(storage_path_metadata(path)?.is_some())
 }
 
 fn create_dir_all(path: &Path) -> Result<(), StorageError> {
     fs::create_dir_all(path).map_err(|source| StorageError::Io {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    require_storage_directory(path, "missing storage directory")
 }
 
 fn remove_dir(path: &Path) -> Result<(), StorageError> {
@@ -1166,6 +1441,7 @@ fn remove_dir(path: &Path) -> Result<(), StorageError> {
 }
 
 fn remove_dir_all(path: &Path) -> Result<(), StorageError> {
+    require_storage_directory(path, "missing storage directory")?;
     fs::remove_dir_all(path).map_err(|source| StorageError::Io {
         path: path.to_path_buf(),
         source,
@@ -1182,23 +1458,28 @@ fn corrupt_state(path: impl Into<PathBuf>, message: impl Into<String>) -> Storag
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_object_files, fail_next_new_object_state_write_for_test,
-        replace_file_with_temporary, restore_path_backup, write_new_bucket_state, BucketRecord,
-        FilesystemStorage, StorageClock, StorageError, OBJECTS_DIR,
+        commit_object_files, create_temporary_sibling_dir,
+        fail_next_new_object_state_write_for_test, move_existing_path_to_backup,
+        replace_file_with_temporary, restore_path_backup, sibling_path, storage_path_metadata,
+        write_new_bucket_state, write_temporary_sibling, BucketRecord, FilesystemStorage,
+        StorageClock, StorageError, OBJECTS_DIR,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::object::ObjectKey;
     use crate::storage::key::encode_object_key;
     use crate::storage::{PutObjectRequest, Storage};
     use std::collections::BTreeMap;
+    use std::fmt::{Display, Formatter};
     use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
     use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
     #[test]
     fn new_stores_root_without_normalizing() {
         let storage = FilesystemStorage::new("./s3lab-data");
 
-        assert_eq!(storage.root, std::path::PathBuf::from("./s3lab-data"));
+        assert_eq!(storage.root(), std::path::Path::new("./s3lab-data"));
     }
 
     #[test]
@@ -1297,6 +1578,66 @@ mod tests {
     }
 
     #[test]
+    fn write_temporary_sibling_retries_stale_pid_collision() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let target_path = temp_dir.path().join("metadata.json");
+        let stale_temporary_path = sibling_path(&target_path, "tmp", 0);
+        fs::write(&stale_temporary_path, b"stale").expect("write stale temporary sibling");
+
+        let temporary_path =
+            write_temporary_sibling(&target_path, b"new").expect("write temporary sibling");
+
+        assert_ne!(temporary_path, stale_temporary_path);
+        assert_eq!(
+            fs::read(&temporary_path).expect("read retried temporary"),
+            b"new"
+        );
+        assert_eq!(
+            fs::read(&stale_temporary_path).expect("stale temporary remains untouched"),
+            b"stale"
+        );
+    }
+
+    #[test]
+    fn create_temporary_sibling_dir_retries_stale_pid_collision() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let target_path = temp_dir.path().join("object-dir");
+        let stale_temporary_path = sibling_path(&target_path, "tmp", 0);
+        fs::create_dir(&stale_temporary_path).expect("create stale temporary directory");
+
+        let temporary_path =
+            create_temporary_sibling_dir(&target_path).expect("create temporary sibling dir");
+
+        assert_ne!(temporary_path, stale_temporary_path);
+        assert!(temporary_path.is_dir());
+        assert!(stale_temporary_path.is_dir());
+    }
+
+    #[test]
+    fn move_existing_path_to_backup_retries_stale_pid_collision() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let target_path = temp_dir.path().join("content.bin");
+        let stale_backup_path = sibling_path(&target_path, "bak", 0);
+        fs::write(&target_path, b"current").expect("write current target");
+        fs::write(&stale_backup_path, b"stale").expect("write stale backup sibling");
+
+        let backup_path = move_existing_path_to_backup(&target_path)
+            .expect("move target to backup")
+            .expect("target existed");
+
+        assert_ne!(backup_path, stale_backup_path);
+        assert!(!target_path.exists());
+        assert_eq!(
+            fs::read(&backup_path).expect("read retried backup"),
+            b"current"
+        );
+        assert_eq!(
+            fs::read(&stale_backup_path).expect("stale backup remains untouched"),
+            b"stale"
+        );
+    }
+
+    #[test]
     fn restore_path_backup_without_backup_leaves_existing_path_untouched() {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let path = temp_dir.path().join("content.bin");
@@ -1305,6 +1646,35 @@ mod tests {
         restore_path_backup(&path, None);
 
         assert_eq!(fs::read(path).expect("read current path"), b"current");
+    }
+
+    #[test]
+    fn storage_path_metadata_accepts_regular_storage_files() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("content.bin");
+        fs::write(&path, b"content").expect("write regular file");
+
+        let metadata = storage_path_metadata(&path)
+            .expect("regular file metadata succeeds")
+            .expect("regular file exists");
+
+        assert!(metadata.is_file());
+    }
+
+    #[test]
+    fn storage_path_metadata_rejects_symlinks_when_platform_allows_them() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let target = temp_dir.path().join("target.bin");
+        let link = temp_dir.path().join("content.bin");
+        fs::write(&target, b"target").expect("write symlink target");
+        if let Err(skip) = create_file_symlink_or_skip(&target, &link) {
+            println!("{skip}");
+            return;
+        }
+
+        let error = storage_path_metadata(&link).expect_err("symlink metadata is corrupt state");
+
+        assert!(matches!(error, StorageError::CorruptState { .. }));
     }
 
     #[test]
@@ -1369,5 +1739,41 @@ mod tests {
             Time::MIDNIGHT,
         )
         .assume_utc()
+    }
+
+    fn create_file_symlink_or_skip(target: &Path, link: &Path) -> Result<(), SymlinkTestSkipped> {
+        try_create_file_symlink(target, link).map_err(|source| SymlinkTestSkipped {
+            target: target.to_path_buf(),
+            link: link.to_path_buf(),
+            source,
+        })
+    }
+
+    struct SymlinkTestSkipped {
+        target: PathBuf,
+        link: PathBuf,
+        source: io::Error,
+    }
+
+    impl Display for SymlinkTestSkipped {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "skipped storage metadata symlink safety test: symlink creation unavailable from {} to {}: {}",
+                self.link.display(),
+                self.target.display(),
+                self.source
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    fn try_create_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn try_create_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
     }
 }
