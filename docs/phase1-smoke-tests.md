@@ -1,6 +1,6 @@
 # Phase 1 Smoke Tests
 
-This page documents narrow AWS CLI, Python boto3, and Go SDK smoke recipes for S3Lab Phase 1. It is intended to produce local evidence that the current Phase 1 endpoint can accept a basic bucket and object lifecycle against `localhost`.
+This page documents narrow AWS CLI, Python boto3, AWS SDK for JavaScript v3, and Go SDK smoke recipes for S3Lab Phase 1. It is intended to produce local evidence that the current Phase 1 endpoint can accept a basic bucket and object lifecycle against `localhost`.
 
 This is not a general compatibility claim. Phase 1 smoke evidence only covers the operations exercised below.
 
@@ -10,9 +10,10 @@ This is not a general compatibility claim. Phase 1 smoke evidence only covers th
 - The smoke test uses a temporary local data directory.
 - The AWS CLI is installed and available as `aws` for the AWS CLI recipe.
 - Python and boto3 are installed for the boto3 recipe.
+- Node.js and npm are installed for the AWS SDK for JavaScript v3 recipe.
 - Go is installed for the Go SDK recipe.
 - Clients use dummy credentials. No cloud account is required.
-- Requests stay offline and target only the local S3Lab endpoint through `--endpoint-url`, boto3 `endpoint_url`, or the Go SDK local endpoint configuration.
+- Requests stay offline and target only the local S3Lab endpoint through `--endpoint-url`, boto3 `endpoint_url`, AWS SDK for JavaScript v3 `endpoint`, or the Go SDK local endpoint configuration.
 - Phase 1 accepts signed client requests but does not validate SigV4 signatures yet.
 - Phase 1 supports path-style localhost routing, for example `http://127.0.0.1:9000/s3lab-smoke-bucket/object.txt`.
 - Virtual-host style routing, presigned URLs, and multipart uploads are deferred.
@@ -110,6 +111,72 @@ The output should include:
 
 ```text
 ['hello.txt']
+hello from s3lab phase 1
+```
+
+## AWS SDK for JavaScript v3 Smoke Recipe
+
+Create a temporary Node.js project in a second terminal:
+
+```powershell
+$SmokeDir = Join-Path $env:TEMP "s3lab-js-smoke-$([guid]::NewGuid())"
+New-Item -ItemType Directory -Path $SmokeDir | Out-Null
+Set-Location $SmokeDir
+npm init -y
+npm install @aws-sdk/client-s3
+```
+
+Create `smoke.mjs` in that directory:
+
+```javascript
+import {
+  CreateBucketCommand,
+  DeleteBucketCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
+
+const endpoint = "http://127.0.0.1:9000";
+const bucket = "s3lab-smoke-js-bucket";
+const key = "hello.txt";
+const body = "hello from s3lab phase 1";
+
+const client = new S3Client({
+  endpoint,
+  forcePathStyle: true,
+  region: "us-east-1",
+  credentials: {
+    accessKeyId: "s3lab",
+    secretAccessKey: "s3lab-secret",
+  },
+});
+
+await client.send(new CreateBucketCommand({ Bucket: bucket }));
+await client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }));
+
+const listed = await client.send(new ListObjectsV2Command({ Bucket: bucket }));
+console.log((listed.Contents ?? []).map((object) => object.Key));
+
+const downloaded = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+console.log(await downloaded.Body.transformToString());
+
+await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+await client.send(new DeleteBucketCommand({ Bucket: bucket }));
+```
+
+Run it:
+
+```powershell
+node smoke.mjs
+```
+
+The output should include:
+
+```text
+[ 'hello.txt' ]
 hello from s3lab phase 1
 ```
 
