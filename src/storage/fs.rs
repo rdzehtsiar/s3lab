@@ -3,7 +3,7 @@
 use super::key::{encode_bucket_name, encode_object_key, EncodedObjectKey};
 use super::{
     BucketSummary, ListObjectsOptions, ObjectListing, PutObjectRequest, Storage, StorageError,
-    StoredObjectMetadata, STORAGE_ROOT_DIR,
+    StoredObject, StoredObjectMetadata, STORAGE_ROOT_DIR,
 };
 use crate::s3::bucket::BucketName;
 use crate::s3::object::ObjectKey;
@@ -214,6 +214,17 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         self.read_object_metadata(bucket, key, &encoded_key)
     }
 
+    fn get_object(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<StoredObject, StorageError> {
+        let _guard = lock_storage(&self.root, "get_object")?;
+        self.ensure_bucket(bucket)?;
+        let encoded_key = encode_object_key(key)?;
+        self.read_object(bucket, key, &encoded_key)
+    }
+
     fn get_object_bytes(
         &self,
         bucket: &BucketName,
@@ -222,14 +233,8 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         let _guard = lock_storage(&self.root, "get_object_bytes")?;
         self.ensure_bucket(bucket)?;
         let encoded_key = encode_object_key(key)?;
-        let metadata = self.read_object_metadata(bucket, key, &encoded_key)?;
-
-        let content_path = self
-            .object_dir(bucket, &encoded_key)
-            .join(OBJECT_CONTENT_FILE);
-        let bytes = read_object_content_bytes(&content_path)?;
-        validate_object_content_bytes(&content_path, &metadata, &bytes)?;
-        Ok(bytes)
+        self.read_object(bucket, key, &encoded_key)
+            .map(|object| object.bytes)
     }
 
     fn list_objects(
@@ -380,6 +385,16 @@ impl<C> FilesystemStorage<C> {
         key: &ObjectKey,
         encoded_key: &EncodedObjectKey,
     ) -> Result<StoredObjectMetadata, StorageError> {
+        self.read_object(bucket, key, encoded_key)
+            .map(|object| object.metadata)
+    }
+
+    fn read_object(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        encoded_key: &EncodedObjectKey,
+    ) -> Result<StoredObject, StorageError> {
         let object_dir = self.object_dir(bucket, encoded_key);
         if !path_exists(&object_dir)? {
             return Err(StorageError::NoSuchKey {
@@ -405,9 +420,10 @@ impl<C> FilesystemStorage<C> {
                 "object metadata does not match requested bucket/key",
             ));
         }
-        validate_object_content(&content_path, &metadata)?;
+        let bytes = read_object_content_bytes(&content_path)?;
+        validate_object_content_bytes(&content_path, &metadata, &bytes)?;
 
-        Ok(metadata)
+        Ok(StoredObject { metadata, bytes })
     }
 
     fn read_listed_object_metadata(

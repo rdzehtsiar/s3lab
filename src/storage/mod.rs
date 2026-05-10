@@ -23,6 +23,12 @@ pub trait Storage {
 
     fn put_object(&self, request: PutObjectRequest) -> Result<StoredObjectMetadata, StorageError>;
 
+    fn get_object(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<StoredObject, StorageError>;
+
     fn get_object_metadata(
         &self,
         bucket: &BucketName,
@@ -56,6 +62,12 @@ pub struct PutObjectRequest {
     pub bytes: Vec<u8>,
     pub content_type: Option<String>,
     pub user_metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StoredObject {
+    pub metadata: StoredObjectMetadata,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

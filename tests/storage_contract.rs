@@ -360,6 +360,15 @@ fn put_object_persists_bytes_and_metadata() {
             .expect("get bytes"),
         b"hello"
     );
+    assert_eq!(
+        storage
+            .get_object(&bucket, &ObjectKey::new("prefix/example.txt"))
+            .expect("get object"),
+        s3lab::storage::StoredObject {
+            metadata: stored,
+            bytes: b"hello".to_vec(),
+        }
+    );
 }
 
 #[test]
@@ -929,6 +938,9 @@ fn missing_key_returns_no_such_key() {
     let metadata_error = storage
         .get_object_metadata(&bucket, &key)
         .expect_err("missing metadata fails");
+    let object_error = storage
+        .get_object(&bucket, &key)
+        .expect_err("missing object fails");
     let bytes_error = storage
         .get_object_bytes(&bucket, &key)
         .expect_err("missing bytes fails");
@@ -937,6 +949,7 @@ fn missing_key_returns_no_such_key() {
         .expect_err("missing delete fails");
 
     assert!(matches!(metadata_error, StorageError::NoSuchKey { .. }));
+    assert!(matches!(object_error, StorageError::NoSuchKey { .. }));
     assert!(matches!(bytes_error, StorageError::NoSuchKey { .. }));
     assert!(matches!(delete_error, StorageError::NoSuchKey { .. }));
 }

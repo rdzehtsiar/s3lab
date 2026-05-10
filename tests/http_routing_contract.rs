@@ -2,7 +2,7 @@
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
-use axum::http::{Method, Request, StatusCode, Uri};
+use axum::http::{HeaderValue, Method, Request, StatusCode, Uri};
 use s3lab::s3::bucket::BucketName;
 use s3lab::s3::error::S3ErrorCode;
 use s3lab::s3::object::ObjectKey;
@@ -12,7 +12,7 @@ use s3lab::server::routes::resolve_operation;
 use s3lab::server::state::ServerState;
 use s3lab::storage::{
     BucketSummary, ListObjectsOptions, ObjectListing, PutObjectRequest, Storage, StorageError,
-    StoredObjectMetadata,
+    StoredObject, StoredObjectMetadata,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -297,8 +297,13 @@ async fn head_success_and_error_responses_have_empty_bodies() {
 
 #[tokio::test]
 async fn head_object_includes_available_metadata_headers() {
+    let mut metadata = metadata_with_content_type("bucket", "object.txt", 5, Some("text/plain"));
+    metadata.user_metadata = BTreeMap::from([
+        ("a-key".to_owned(), "first".to_owned()),
+        ("z-key".to_owned(), "last".to_owned()),
+    ]);
     let storage = RecordingStorage {
-        metadata: metadata_with_content_type("bucket", "object.txt", 5, Some("text/plain")),
+        metadata,
         ..RecordingStorage::default()
     };
     let app = router(ServerState::from_storage(storage));
@@ -330,6 +335,24 @@ async fn head_object_includes_available_metadata_headers() {
             .get(LAST_MODIFIED)
             .and_then(|v| v.to_str().ok()),
         Some("Thu, 01 Jan 1970 00:00:00 GMT")
+    );
+    assert_eq!(
+        head.headers()
+            .get("x-amz-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    assert_eq!(
+        head.headers()
+            .get("x-amz-meta-z-key")
+            .and_then(|v| v.to_str().ok()),
+        Some("last")
+    );
+    assert_eq!(
+        head.headers()
+            .get("x-amz-meta-a-key")
+            .and_then(|v| v.to_str().ok()),
+        Some("first")
     );
     assert!(body_bytes(head).await.is_empty());
 }
@@ -567,6 +590,58 @@ async fn filesystem_backed_router_supports_basic_bucket_and_object_flow() {
 }
 
 #[tokio::test]
+async fn object_put_get_and_head_preserve_metadata_headers() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("content-type", "text/plain"),
+                ("x-amz-meta-Z-Key", "last"),
+                ("x-amz-meta-a-key", "first"),
+            ],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_put_object_metadata_headers(&put, Some("text/plain"));
+    assert_eq!(
+        put.headers().get(ETAG).and_then(|v| v.to_str().ok()),
+        Some("\"5d41402abc4b2a76b9719d911017c592\"")
+    );
+    assert!(body_bytes(put).await.is_empty());
+
+    let get = app
+        .clone()
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_object_metadata_headers(&get, "5", Some("text/plain"));
+    assert_eq!(body_bytes(get).await, Bytes::from_static(b"hello"));
+
+    let head = app
+        .oneshot(request(Method::HEAD, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("head object");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_object_metadata_headers(&head, "5", Some("text/plain"));
+    assert!(body_bytes(head).await.is_empty());
+}
+
+#[tokio::test]
 async fn object_lifecycle_put_overwrite_get_head_delete_contract() {
     let temp_dir = TempDir::new().expect("temp dir");
     let app = router(ServerState::filesystem(temp_dir.path()));
@@ -677,6 +752,83 @@ async fn object_lifecycle_put_overwrite_get_head_delete_contract() {
         .expect("delete already missing object");
     assert_eq!(repeated_delete.status(), StatusCode::NO_CONTENT);
     assert!(body_bytes(repeated_delete).await.is_empty());
+}
+
+#[tokio::test]
+async fn put_object_rejects_empty_user_metadata_suffix() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[("x-amz-meta-", "value")],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object");
+
+    assert_invalid_argument_xml(response, "/bucket/object.txt").await;
+}
+
+#[tokio::test]
+async fn put_object_rejects_non_utf8_user_metadata_value() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/bucket/object.txt")
+        .header(
+            "x-amz-meta-bad",
+            HeaderValue::from_bytes(&[0xff]).expect("valid opaque header value"),
+        )
+        .body(Body::from("hello"))
+        .expect("valid request");
+
+    let response = app.oneshot(request).await.expect("put object");
+
+    assert_invalid_argument_xml(response, "/bucket/object.txt").await;
+}
+
+#[tokio::test]
+async fn put_object_rejects_duplicate_normalized_user_metadata_keys() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::filesystem(temp_dir.path()));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[("x-amz-meta-Z-Key", "last"), ("x-amz-meta-z-key", "again")],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object");
+
+    assert_invalid_argument_xml(response, "/bucket/object.txt").await;
 }
 
 #[tokio::test]
@@ -848,16 +1000,140 @@ fn request(method: Method, uri: &str, body: Body) -> Request<Body> {
         .expect("valid request")
 }
 
+fn request_with_headers(
+    method: Method,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Body,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(
+            *name,
+            HeaderValue::from_str(value).expect("valid test header"),
+        );
+    }
+    builder.body(body).expect("valid request")
+}
+
 async fn body_bytes(response: axum::http::Response<Body>) -> Bytes {
     to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read response body")
 }
 
+async fn assert_invalid_argument_xml(response: axum::http::Response<Body>, resource: &str) {
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>InvalidArgument</Code>"));
+    assert!(body.contains(&format!("<Resource>{resource}</Resource>")));
+}
+
+fn assert_object_metadata_headers(
+    response: &axum::http::Response<Body>,
+    content_length: &str,
+    content_type: Option<&str>,
+) {
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(content_length)
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        content_type
+    );
+    assert!(response
+        .headers()
+        .get(LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .is_some());
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-meta-z-key")
+            .and_then(|v| v.to_str().ok()),
+        Some("last")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-meta-a-key")
+            .and_then(|v| v.to_str().ok()),
+        Some("first")
+    );
+}
+
+fn assert_put_object_metadata_headers(
+    response: &axum::http::Response<Body>,
+    content_type: Option<&str>,
+) {
+    assert!(matches!(
+        response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        None | Some("0")
+    ));
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        content_type
+    );
+    assert!(response
+        .headers()
+        .get(LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .is_some());
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-meta-z-key")
+            .and_then(|v| v.to_str().ok()),
+        Some("last")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-meta-a-key")
+            .and_then(|v| v.to_str().ok()),
+        Some("first")
+    );
+}
+
 #[derive(Clone)]
 struct RecordingStorage {
     calls: Arc<Mutex<Vec<&'static str>>>,
     metadata: StoredObjectMetadata,
+    last_put_user_metadata: Arc<Mutex<Option<BTreeMap<String, String>>>>,
 }
 
 impl RecordingStorage {
@@ -887,9 +1163,25 @@ impl Storage for RecordingStorage {
         Ok(())
     }
 
-    fn put_object(&self, _request: PutObjectRequest) -> Result<StoredObjectMetadata, StorageError> {
+    fn put_object(&self, request: PutObjectRequest) -> Result<StoredObjectMetadata, StorageError> {
         self.record("put_object");
+        *self
+            .last_put_user_metadata
+            .lock()
+            .expect("last put metadata lock") = Some(request.user_metadata);
         Ok(self.metadata.clone())
+    }
+
+    fn get_object(
+        &self,
+        _bucket: &BucketName,
+        _key: &ObjectKey,
+    ) -> Result<StoredObject, StorageError> {
+        self.record("get_object");
+        Ok(StoredObject {
+            metadata: self.metadata.clone(),
+            bytes: Vec::new(),
+        })
     }
 
     fn get_object_metadata(
@@ -955,6 +1247,7 @@ impl Default for RecordingStorage {
         Self {
             calls: Arc::default(),
             metadata: metadata("bucket", "key", 0),
+            last_put_user_metadata: Arc::default(),
         }
     }
 }

@@ -8,16 +8,20 @@ use crate::s3::xml::{
     error_response_xml, list_buckets_response_xml, list_objects_v2_response_xml, XML_CONTENT_TYPE,
 };
 use crate::server::state::ServerState;
-use crate::storage::{ListObjectsOptions, PutObjectRequest, StorageError, StoredObjectMetadata};
+use crate::storage::{
+    ListObjectsOptions, PutObjectRequest, StorageError, StoredObject, StoredObjectMetadata,
+};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
+use axum::http::HeaderName;
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri};
 use percent_encoding::percent_decode_str;
 use std::collections::{BTreeMap, BTreeSet};
 use time::{Month, OffsetDateTime, UtcOffset, Weekday};
 
 const REQUEST_ID_HEADER: &str = "x-amz-request-id";
+const USER_METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
 const LIST_TYPE: &str = "list-type";
 const PREFIX: &str = "prefix";
 const CONTINUATION_TOKEN: &str = "continuation-token";
@@ -213,6 +217,12 @@ fn execute_operation(
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
+            let user_metadata = match extract_user_metadata(&headers) {
+                Ok(user_metadata) => user_metadata,
+                Err(error) => {
+                    return storage_error_response(error, format!("/{bucket}/{key}"), is_head)
+                }
+            };
             state
                 .storage()
                 .put_object(PutObjectRequest {
@@ -220,18 +230,20 @@ fn execute_operation(
                     key: ObjectKey::new(key.clone()),
                     bytes: body.to_vec(),
                     content_type,
-                    user_metadata: BTreeMap::new(),
+                    user_metadata,
                 })
-                .map(|_| empty_response())
+                .map(|metadata| {
+                    object_metadata_response(metadata, Body::empty(), ContentLength::Body)
+                })
                 .map_err(|error| (error, format!("/{bucket}/{key}")))
         }
         S3Operation::GetObject { bucket, key } => state
             .storage()
-            .get_object_bytes(
+            .get_object(
                 &BucketName::new(bucket.clone()),
                 &ObjectKey::new(key.clone()),
             )
-            .map(bytes_response)
+            .map(object_response)
             .map_err(|error| (error, format!("/{bucket}/{key}"))),
         S3Operation::HeadObject { bucket, key } => state
             .storage()
@@ -239,7 +251,9 @@ fn execute_operation(
                 &BucketName::new(bucket.clone()),
                 &ObjectKey::new(key.clone()),
             )
-            .map(head_object_response)
+            .map(|metadata| {
+                object_metadata_response(metadata, Body::empty(), ContentLength::Object)
+            })
             .map_err(|error| (error, format!("/{bucket}/{key}"))),
         S3Operation::DeleteObject { bucket, key } => match state.storage().delete_object(
             &BucketName::new(bucket.clone()),
@@ -480,10 +494,6 @@ fn no_content_response() -> Response<Body> {
     response
 }
 
-fn bytes_response(bytes: Vec<u8>) -> Response<Body> {
-    Response::new(Body::from(bytes))
-}
-
 fn xml_response(xml: String) -> Response<Body> {
     let mut response = Response::new(Body::from(xml));
     response
@@ -492,13 +502,32 @@ fn xml_response(xml: String) -> Response<Body> {
     response
 }
 
-fn head_object_response(metadata: StoredObjectMetadata) -> Response<Body> {
-    let mut response = Response::new(Body::empty());
-    response.headers_mut().insert(
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&metadata.content_length.to_string())
-            .expect("content length is valid"),
-    );
+fn object_response(object: StoredObject) -> Response<Body> {
+    object_metadata_response(
+        object.metadata,
+        Body::from(object.bytes),
+        ContentLength::Object,
+    )
+}
+
+enum ContentLength {
+    Body,
+    Object,
+}
+
+fn object_metadata_response(
+    metadata: StoredObjectMetadata,
+    body: Body,
+    content_length: ContentLength,
+) -> Response<Body> {
+    let mut response = Response::new(body);
+    if matches!(content_length, ContentLength::Object) {
+        response.headers_mut().insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&metadata.content_length.to_string())
+                .expect("content length is valid"),
+        );
+    }
     if let Some(content_type) = metadata.content_type {
         if let Ok(value) = HeaderValue::from_str(&content_type) {
             response.headers_mut().insert(CONTENT_TYPE, value);
@@ -511,7 +540,51 @@ fn head_object_response(metadata: StoredObjectMetadata) -> Response<Body> {
         LAST_MODIFIED,
         HeaderValue::from_str(&http_date(metadata.last_modified)).expect("HTTP date is valid"),
     );
+    response.headers_mut().insert(
+        REQUEST_ID_HEADER,
+        HeaderValue::from_str(TEST_REQUEST_ID).expect("static request id is valid"),
+    );
+    for (key, value) in metadata.user_metadata {
+        let header_name = format!("{USER_METADATA_HEADER_PREFIX}{key}");
+        if let (Ok(header_name), Ok(header_value)) = (
+            HeaderName::from_bytes(header_name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().insert(header_name, header_value);
+        }
+    }
     response
+}
+
+fn extract_user_metadata(headers: &HeaderMap) -> Result<BTreeMap<String, String>, StorageError> {
+    let mut user_metadata = BTreeMap::new();
+    for (name, value) in headers {
+        let Some(suffix) = name.as_str().strip_prefix(USER_METADATA_HEADER_PREFIX) else {
+            continue;
+        };
+        if suffix.is_empty() {
+            return Err(invalid_user_metadata("empty user metadata header name"));
+        }
+
+        let key = suffix.to_ascii_lowercase();
+        let value = value
+            .to_str()
+            .map_err(|_| invalid_user_metadata("user metadata values must be valid UTF-8"))?
+            .to_owned();
+        if user_metadata.insert(key, value).is_some() {
+            return Err(invalid_user_metadata(
+                "duplicate user metadata header name after lowercase normalization",
+            ));
+        }
+    }
+
+    Ok(user_metadata)
+}
+
+fn invalid_user_metadata(message: impl Into<String>) -> StorageError {
+    StorageError::InvalidArgument {
+        message: message.into(),
+    }
 }
 
 fn http_date(timestamp: OffsetDateTime) -> String {
