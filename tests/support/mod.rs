@@ -8,9 +8,11 @@ use hyper::http::{HeaderValue, Method, Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use s3lab::s3::error::STATIC_REQUEST_ID;
 use s3lab::server::serve_listener_until;
 use s3lab::server::state::ServerState;
 use s3lab::storage::fs::FilesystemStorage;
+use s3lab::storage::Storage;
 use std::path::PathBuf;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -43,7 +45,7 @@ impl TestServer {
 
     async fn start_inner(data_dir: PathBuf, temp_dir: Option<TempDir>) -> Self {
         Self::start_with_state(
-            ServerState::from_storage(FilesystemStorage::new(data_dir.clone())),
+            test_server_state(FilesystemStorage::new(data_dir.clone())),
             temp_dir,
             Some(data_dir),
         )
@@ -143,4 +145,8 @@ pub async fn response_bytes(response: Response<Incoming>) -> TestResult<Bytes> {
 pub async fn response_text(response: Response<Incoming>) -> TestResult<String> {
     let bytes = response_bytes(response).await?;
     Ok(String::from_utf8(bytes.to_vec())?)
+}
+
+pub fn test_server_state(storage: impl Storage + Send + Sync + 'static) -> ServerState {
+    ServerState::with_fixed_request_id(storage, STATIC_REQUEST_ID)
 }

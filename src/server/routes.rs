@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::s3::bucket::{is_valid_s3_bucket_name, BucketName};
-use crate::s3::error::{S3Error, S3ErrorCode, S3RequestId, STATIC_REQUEST_ID};
+use crate::s3::error::{S3Error, S3ErrorCode, S3RequestId};
 use crate::s3::object::{is_valid_s3_object_key, is_valid_s3_object_key_prefix, ObjectKey};
 use crate::s3::operation::S3Operation;
 use crate::s3::time::http_date;
@@ -89,11 +89,21 @@ pub async fn handle_request(
     body: Body,
 ) -> Response<Body> {
     let is_head = method == Method::HEAD;
+    let request_id = state.next_request_id();
+
     match resolve_operation(&method, &uri) {
         Ok(route_match) => {
-            execute_operation(state, headers, body, route_match.operation, is_head).await
+            execute_operation(
+                state,
+                headers,
+                body,
+                route_match.operation,
+                is_head,
+                request_id,
+            )
+            .await
         }
-        Err(rejection) => route_error_response(rejection, is_head),
+        Err(rejection) => route_error_response(rejection, is_head, &request_id),
     }
 }
 
@@ -238,20 +248,26 @@ async fn execute_operation(
     body: Body,
     operation: S3Operation,
     is_head: bool,
+    request_id: S3RequestId,
 ) -> Response<Body> {
     let result = match operation {
         S3Operation::ListBuckets => state
             .storage()
             .list_buckets()
-            .map(|buckets| xml_response(list_buckets_response_xml(&list_buckets_xml(buckets))))
+            .map(|buckets| {
+                xml_response(
+                    list_buckets_response_xml(&list_buckets_xml(buckets)),
+                    &request_id,
+                )
+            })
             .map_err(|error| (error, "/".to_owned())),
         S3Operation::CreateBucket { bucket } => state
             .storage()
             .create_bucket(&bucket)
-            .map(|()| empty_response())
+            .map(|()| empty_response(&request_id))
             .map_err(|error| (error, bucket_resource(&bucket))),
         S3Operation::HeadBucket { bucket } => match state.storage().bucket_exists(&bucket) {
-            Ok(true) => Ok(empty_response()),
+            Ok(true) => Ok(empty_response(&request_id)),
             Ok(false) => Err((
                 StorageError::NoSuchBucket {
                     bucket: bucket.clone(),
@@ -263,25 +279,26 @@ async fn execute_operation(
         S3Operation::DeleteBucket { bucket } => state
             .storage()
             .delete_bucket(&bucket)
-            .map(|()| no_content_response())
+            .map(|()| no_content_response(&request_id))
             .map_err(|error| (error, bucket_resource(&bucket))),
         S3Operation::PutObject { bucket, key } => {
             if let Some(code) = unsupported_put_object_header(&headers) {
                 return route_error_response(
                     RouteRejection::new(code, object_resource(&bucket, &key)),
                     is_head,
+                    &request_id,
                 );
             }
             let resource = object_resource(&bucket, &key);
             let content_type = match extract_content_type(&headers, &resource) {
                 Ok(content_type) => content_type,
-                Err(rejection) => return route_error_response(rejection, is_head),
+                Err(rejection) => return route_error_response(rejection, is_head, &request_id),
             };
             let user_metadata = match extract_user_metadata(&headers, &resource) {
                 Ok(user_metadata) => user_metadata,
-                Err(rejection) => return route_error_response(rejection, is_head),
+                Err(rejection) => return route_error_response(rejection, is_head, &request_id),
             };
-            let bytes = match read_put_object_body(body, &resource, is_head).await {
+            let bytes = match read_put_object_body(body, &resource, is_head, &request_id).await {
                 Ok(bytes) => bytes,
                 Err(response) => return response,
             };
@@ -294,7 +311,7 @@ async fn execute_operation(
                     content_type,
                     user_metadata,
                 })
-                .map(put_object_response)
+                .map(|metadata| put_object_response(metadata, &request_id))
                 .map_err(|error| (error, resource))
         }
         S3Operation::GetObject { bucket, key } => {
@@ -305,12 +322,13 @@ async fn execute_operation(
                         object_resource(&bucket, &key),
                     ),
                     is_head,
+                    &request_id,
                 );
             }
             state
                 .storage()
                 .get_object(&bucket, &key)
-                .and_then(object_response)
+                .and_then(|object| object_response(object, &request_id))
                 .map_err(|error| (error, object_resource(&bucket, &key)))
         }
         S3Operation::HeadObject { bucket, key } => {
@@ -321,17 +339,20 @@ async fn execute_operation(
                         object_resource(&bucket, &key),
                     ),
                     is_head,
+                    &request_id,
                 );
             }
             state
                 .storage()
                 .get_object_metadata(&bucket, &key)
-                .and_then(|metadata| object_metadata_response(metadata, Body::empty()))
+                .and_then(|metadata| object_metadata_response(metadata, Body::empty(), &request_id))
                 .map_err(|error| (error, object_resource(&bucket, &key)))
         }
         S3Operation::DeleteObject { bucket, key } => {
             match state.storage().delete_object(&bucket, &key) {
-                Ok(()) | Err(StorageError::NoSuchKey { .. }) => Ok(no_content_response()),
+                Ok(()) | Err(StorageError::NoSuchKey { .. }) => {
+                    Ok(no_content_response(&request_id))
+                }
                 Err(error) => Err((error, object_resource(&bucket, &key))),
             }
         }
@@ -354,12 +375,15 @@ async fn execute_operation(
                 .list_objects(&bucket, options)
                 .map(|listing| {
                     let listing = list_objects_v2_xml(listing);
-                    xml_response(list_objects_v2_response_xml(
-                        &listing,
-                        prefix.as_ref().map(ObjectKey::as_str),
-                        delimiter.as_deref(),
-                        request_continuation_token.as_deref(),
-                    ))
+                    xml_response(
+                        list_objects_v2_response_xml(
+                            &listing,
+                            prefix.as_ref().map(ObjectKey::as_str),
+                            delimiter.as_deref(),
+                            request_continuation_token.as_deref(),
+                        ),
+                        &request_id,
+                    )
                 })
                 .map_err(|error| (error, bucket_resource(&bucket)))
         }
@@ -373,7 +397,7 @@ async fn execute_operation(
                 response
             }
         }
-        Err((error, resource)) => storage_error_response(error, resource, is_head),
+        Err((error, resource)) => storage_error_response(error, resource, is_head, &request_id),
     }
 }
 
@@ -381,6 +405,7 @@ async fn read_put_object_body(
     body: Body,
     resource: &str,
     is_head: bool,
+    request_id: &S3RequestId,
 ) -> Result<Bytes, Response<Body>> {
     match to_bytes(body, PHASE1_MAX_PUT_OBJECT_BODY_BYTES).await {
         Ok(bytes) => Ok(bytes),
@@ -391,7 +416,7 @@ async fn read_put_object_body(
                     "Object body exceeds S3Lab Phase 1 PUT object limit of {PHASE1_MAX_PUT_OBJECT_BODY_BYTES} bytes."
                 ),
                 resource,
-                S3RequestId::new(STATIC_REQUEST_ID),
+                request_id.clone(),
             ),
             is_head,
         )),
@@ -399,7 +424,7 @@ async fn read_put_object_body(
             S3Error::new(
                 S3ErrorCode::InternalError,
                 resource,
-                S3RequestId::new(STATIC_REQUEST_ID),
+                request_id.clone(),
             ),
             is_head,
         )),
@@ -574,13 +599,13 @@ fn has_valid_percent_encoding(raw: &str) -> bool {
     true
 }
 
-fn route_error_response(rejection: RouteRejection, is_head: bool) -> Response<Body> {
+fn route_error_response(
+    rejection: RouteRejection,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Response<Body> {
     s3_error_response(
-        S3Error::new(
-            rejection.code,
-            rejection.resource,
-            S3RequestId::new(STATIC_REQUEST_ID),
-        ),
+        S3Error::new(rejection.code, rejection.resource, request_id.clone()),
         is_head,
     )
 }
@@ -589,9 +614,10 @@ fn storage_error_response(
     error: StorageError,
     resource: impl Into<String>,
     is_head: bool,
+    request_id: &S3RequestId,
 ) -> Response<Body> {
     s3_error_response(
-        s3_error_from_storage_error(error, resource, S3RequestId::new(STATIC_REQUEST_ID)),
+        s3_error_from_storage_error(error, resource, request_id.clone()),
         is_head,
     )
 }
@@ -634,7 +660,7 @@ fn s3_error_response(error: S3Error, is_head: bool) -> Response<Body> {
         *response.status_mut() = status;
         response.headers_mut().insert(
             REQUEST_ID_HEADER,
-            HeaderValue::from_str(error.request_id.as_str()).expect("static request id is valid"),
+            HeaderValue::from_str(error.request_id.as_str()).expect("request id is valid"),
         );
         return response;
     }
@@ -646,27 +672,27 @@ fn s3_error_response(error: S3Error, is_head: bool) -> Response<Body> {
         .insert(CONTENT_TYPE, HeaderValue::from_static(XML_CONTENT_TYPE));
     response.headers_mut().insert(
         REQUEST_ID_HEADER,
-        HeaderValue::from_str(error.request_id.as_str()).expect("static request id is valid"),
+        HeaderValue::from_str(error.request_id.as_str()).expect("request id is valid"),
     );
     response
 }
 
-fn empty_response() -> Response<Body> {
-    with_request_id(Response::new(Body::empty()))
+fn empty_response(request_id: &S3RequestId) -> Response<Body> {
+    with_request_id(Response::new(Body::empty()), request_id)
 }
 
-fn no_content_response() -> Response<Body> {
+fn no_content_response(request_id: &S3RequestId) -> Response<Body> {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::NO_CONTENT;
-    with_request_id(response)
+    with_request_id(response, request_id)
 }
 
-fn xml_response(xml: String) -> Response<Body> {
+fn xml_response(xml: String, request_id: &S3RequestId) -> Response<Body> {
     let mut response = Response::new(Body::from(xml));
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static(XML_CONTENT_TYPE));
-    with_request_id(response)
+    with_request_id(response, request_id)
 }
 
 fn list_buckets_xml(buckets: Vec<BucketSummary>) -> ListBucketsXml {
@@ -706,11 +732,14 @@ fn list_objects_v2_xml(listing: ObjectListing) -> ListObjectsV2Xml {
     }
 }
 
-fn object_response(object: StoredObject) -> Result<Response<Body>, StorageError> {
-    object_metadata_response(object.metadata, Body::from(object.bytes))
+fn object_response(
+    object: StoredObject,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, StorageError> {
+    object_metadata_response(object.metadata, Body::from(object.bytes), request_id)
 }
 
-fn put_object_response(metadata: StoredObjectMetadata) -> Response<Body> {
+fn put_object_response(metadata: StoredObjectMetadata, request_id: &S3RequestId) -> Response<Body> {
     let mut response = Response::new(Body::empty());
     response.headers_mut().insert(
         ETAG,
@@ -719,7 +748,7 @@ fn put_object_response(metadata: StoredObjectMetadata) -> Response<Body> {
     );
     response.headers_mut().insert(
         REQUEST_ID_HEADER,
-        HeaderValue::from_str(STATIC_REQUEST_ID).expect("static request id is valid"),
+        HeaderValue::from_str(request_id.as_str()).expect("request id is valid"),
     );
     response
 }
@@ -727,6 +756,7 @@ fn put_object_response(metadata: StoredObjectMetadata) -> Response<Body> {
 fn object_metadata_response(
     metadata: StoredObjectMetadata,
     body: Body,
+    request_id: &S3RequestId,
 ) -> Result<Response<Body>, StorageError> {
     let mut response = Response::new(body);
     response.headers_mut().insert(
@@ -749,7 +779,7 @@ fn object_metadata_response(
     );
     response.headers_mut().insert(
         REQUEST_ID_HEADER,
-        HeaderValue::from_str(STATIC_REQUEST_ID).expect("static request id is valid"),
+        HeaderValue::from_str(request_id.as_str()).expect("request id is valid"),
     );
     for (key, value) in metadata.user_metadata {
         let header_name = format!("{USER_METADATA_HEADER_PREFIX}{key}");
@@ -765,10 +795,10 @@ fn object_metadata_response(
     Ok(response)
 }
 
-fn with_request_id(mut response: Response<Body>) -> Response<Body> {
+fn with_request_id(mut response: Response<Body>, request_id: &S3RequestId) -> Response<Body> {
     response.headers_mut().insert(
         REQUEST_ID_HEADER,
-        HeaderValue::from_str(STATIC_REQUEST_ID).expect("static request id is valid"),
+        HeaderValue::from_str(request_id.as_str()).expect("request id is valid"),
     );
     response
 }

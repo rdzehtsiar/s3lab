@@ -7,13 +7,14 @@ use hyper::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use hyper::http::{Method, Response, StatusCode};
 use s3lab::s3::bucket::BucketName;
 use s3lab::s3::object::ObjectKey;
-use s3lab::server::state::ServerState;
 use s3lab::storage::fs::{FilesystemStorage, StorageClock};
 use s3lab::storage::STORAGE_ROOT_DIR;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use support::{request, response_bytes, response_text, TestServer, TEST_SUPPORT_MARKER};
+use support::{
+    request, response_bytes, response_text, test_server_state, TestServer, TEST_SUPPORT_MARKER,
+};
 use tempfile::TempDir;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
@@ -314,7 +315,7 @@ async fn list_objects_v2_uses_fixed_clock_through_real_http_harness() {
     let temp_dir = TempDir::new().expect("create fixed-clock data dir");
     let data_dir = temp_dir.path().to_path_buf();
     let server = TestServer::start_with_state(
-        ServerState::from_storage(FilesystemStorage::with_clock(
+        test_server_state(FilesystemStorage::with_clock(
             data_dir.clone(),
             FixedClock(fixed_last_modified()),
         )),

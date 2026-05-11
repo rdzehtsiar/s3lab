@@ -6,122 +6,71 @@
 
 S3Lab is an offline S3 compatibility and protocol debugging lab for engineers who build, test, or troubleshoot S3-compatible workflows locally.
 
-The intended experience is simple: run the local endpoint, point an AWS SDK or CLI at localhost, then inspect and reproduce S3-shaped behavior without needing cloud access.
+The intended experience is simple: run a local endpoint, point an AWS SDK or CLI at localhost, and inspect S3-shaped behavior without requiring cloud access.
 
-## What We Are Building
+## Vision
 
-S3Lab is not meant to be production object storage and it is not positioned as another general-purpose S3 emulator. The goal is a local lab for understanding and reproducing S3-compatible behavior.
+S3Lab is meant to help engineers understand and reproduce S3-compatible behavior in a local, deterministic environment.
 
-The project is intended to provide:
+The product direction is:
 
-- a local S3-compatible endpoint for development and testing
-- an offline inspector for understanding requests and responses
-- compatibility evidence for common SDKs and tools
-- reproducible local state through snapshots
-- request replay for debugging regressions
-- controlled failure scenarios for CI and resilience testing
-- a self-contained offline user experience
+- local S3-compatible workflows for development and debugging
+- clear visibility into requests, responses, headers, signing behavior, and storage mutations
+- evidence-backed compatibility notes for common SDKs and tools
+- deterministic local state for repeatable tests and debugging sessions
+- offline-first operation with no required cloud account
+- clear documentation of what is supported, partial, or intentionally unsupported
 
-## Who It Is For
+S3Lab is not intended to be production object storage, a hosted SaaS service, or a broad replacement for cloud S3.
+
+## Current State
+
+S3Lab is at the very beginning of development.
+
+The repository contains an early Rust codebase and the first pieces of a local S3-shaped endpoint, but the project should still be treated as experimental and incomplete. APIs, commands, storage layout, responses, tests, and documentation may change quickly.
+
+Do not rely on S3Lab for production workloads. Do not assume general S3 compatibility unless a specific operation and client workflow is covered by tests or documented smoke evidence.
+
+## Intended Users
 
 S3Lab is for engineers who need to answer practical questions such as:
 
-- why an SDK request failed against an S3-compatible service
-- whether a client behaves consistently across local and CI environments
-- how signing, headers, redirects, multipart uploads, or presigned URLs are being interpreted
-- how a workflow reacts to timeouts, server errors, partial uploads, or other controlled failures
-- how to reproduce an S3-related bug without depending on external infrastructure
+- how an SDK or CLI request is shaped before it reaches an S3-compatible service
+- why a local S3 workflow behaves differently across machines or CI
+- how bucket and object operations are represented over HTTP
+- how signing, headers, paths, metadata, and list responses are interpreted
+- how to reproduce S3-related bugs without depending on external infrastructure
 
-## Project State
+## Principles
 
-Phase 1 includes a local S3-shaped HTTP server backed by filesystem persistence. It is intended for local development and compatibility smoke testing, not production object storage.
+- offline by default
+- no telemetry by default
+- no cloud account required for the primary local workflow
+- no Docker requirement for the primary experience
+- deterministic behavior where practical
+- compatibility claims backed by tests
+- unsupported behavior documented clearly
+- cross-platform development and CI friendliness
 
-Current Phase 1 behavior supports:
+## Development
 
-- create, head, list, and delete buckets
-- put, get, head, list, and delete objects
-- `ListObjectsV2` with `prefix`, `delimiter=/`, `max-keys`, and `continuation-token`
-- valid user metadata headers: `x-amz-meta-*` values are persisted, metadata keys are normalized to lowercase, and metadata is returned on `GET` and `HEAD`
-- path-style localhost routing, such as `http://127.0.0.1:9000/example-bucket/object.txt`
-- S3-shaped XML responses and XML error responses
-- local filesystem persistence in the configured data directory
+S3Lab is currently a Rust project.
 
-This is not a general S3 compatibility claim. Compatibility should be treated as something to prove with focused tests and documented evidence.
-
-## Phase 1 Limitations
-
-Phase 1 is a narrow local endpoint for implemented bucket and object operations. The following capabilities are deferred and are not implemented in Phase 1:
-
-- SigV4 signature validation
-- presigned URLs
-- virtual-host routing
-- multipart upload
-- snapshots
-- replay
-- failure injection
-- embedded or local UI
-
-Phase 1 rejects invalid user metadata, including an empty `x-amz-meta-` suffix, non-UTF8 metadata values, and duplicate metadata keys after lowercase normalization.
-
-Phase 1 uses conservative DNS-style bucket validation for local safety and practical SDK/CLI workflows, not complete AWS parity. Current tests cover rejection of names that are too short, contain uppercase letters, underscores, adjacent dots, dot-hyphen or hyphen-dot pairs, IP-address-like names, slashes, or the AWS reserved prefixes and suffixes currently modeled by the implementation.
-
-Compatibility evidence is limited to the operations implemented in Phase 1 and the documented smoke recipes. Do not treat Phase 1 behavior as broad AWS S3 compatibility.
-
-## Quick Start
-
-Run the Phase 1 server:
-
-```powershell
-cargo run -- serve
-```
-
-By default, S3Lab listens at `http://127.0.0.1:9000` and stores local data in `./s3lab-data`.
-
-Point AWS clients at the local endpoint and use dummy credentials. For example, with the AWS CLI:
-
-```powershell
-$env:AWS_ACCESS_KEY_ID = "s3lab"
-$env:AWS_SECRET_ACCESS_KEY = "s3lab-secret"
-$env:AWS_DEFAULT_REGION = "us-east-1"
-$env:AWS_EC2_METADATA_DISABLED = "true"
-
-aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket example-bucket
-```
-
-Use path-style localhost configuration for SDKs. Phase 1 accepts signed local requests with dummy credentials, so no cloud account is required.
-
-See [Phase 1 Smoke Tests](./docs/phase1-smoke-tests.md) for narrow AWS CLI, boto3, AWS SDK for JavaScript v3, and Go SDK recipes that exercise the implemented bucket and object lifecycle.
-
-## Local Verification
-
-Run the same local, credentials-free checks used by CI before opening a change:
+Common local checks:
 
 ```powershell
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-cargo llvm-cov --workspace --codecov --remap-path-prefix --output-path codecov.json
 ```
 
-## Project Principles
-
-- offline first
-- no cloud service required
-- no Docker requirement for the primary experience
-- no telemetry by default
-- deterministic behavior where possible
-- compatibility claims backed by tests
-- clear documentation of known limitations
+These checks are expected to stay offline and deterministic.
 
 ## Scope
 
-The first product target is local S3-compatible development and debugging. Other storage APIs, hosted SaaS features, distributed storage, full identity systems, and production object storage are out of scope for the initial project.
+Initial development is focused on a local S3-compatible debugging foundation: bucket and object workflows, S3-shaped HTTP behavior, local persistence, request inspection, and compatibility evidence.
 
-## Roadmap
-
-The current roadmap continues from the Phase 1 local endpoint toward request signing diagnostics, presigned URLs, snapshots, multipart uploads, an embedded local UI, compatibility testing, replay, failure injection, and eventually trusted packaged releases.
-
-Compatibility should be treated as something to prove, not something to claim in advance.
+Other storage APIs, hosted services, distributed storage, full IAM behavior, and production object-storage guarantees are outside the initial scope.
 
 ## License
 

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod support;
+
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use axum::http::{HeaderValue, Method, Request, StatusCode, Uri};
@@ -17,6 +19,7 @@ use s3lab::storage::{
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use support::test_server_state;
 use tempfile::TempDir;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use tower::ServiceExt;
@@ -376,7 +379,7 @@ async fn invalid_bucket_names_return_invalid_bucket_name_without_storage_call() 
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(method.clone(), uri, Body::empty()))
@@ -403,7 +406,7 @@ async fn oversized_object_key_routes_return_invalid_argument_without_storage_cal
     for method in [Method::PUT, Method::GET, Method::HEAD, Method::DELETE] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
         let uri = format!("/bucket/{}", "a".repeat(1025));
 
         let response = app
@@ -429,7 +432,7 @@ async fn xml_invalid_object_key_routes_return_invalid_argument_without_storage_c
         ] {
             let storage = RecordingStorage::default();
             let calls = Arc::clone(&storage.calls);
-            let app = router(ServerState::from_storage(storage));
+            let app = router(test_server_state(storage));
 
             let response = app
                 .oneshot(request(method.clone(), uri, Body::from("body")))
@@ -455,7 +458,7 @@ async fn method_not_allowed_route_errors_return_s3_xml_without_storage_call() {
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(method, uri, Body::empty()))
@@ -482,7 +485,7 @@ async fn unsupported_subresources_return_501_without_storage_call() {
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(method, uri, Body::empty()))
@@ -509,7 +512,7 @@ async fn head_route_errors_have_request_id_and_no_body() {
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(Method::HEAD, uri, Body::empty()))
@@ -526,7 +529,7 @@ async fn bucket_list_query_without_list_type_remains_not_implemented() {
     for uri in ["/bucket?prefix=a", "/bucket?max-keys=10"] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(Method::GET, uri, Body::empty()))
@@ -549,7 +552,7 @@ async fn malformed_query_names_are_invalid_argument() {
     for uri in ["/bucket?=value", "/bucket?bad%ZZ=value"] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(Method::GET, uri, Body::empty()))
@@ -571,7 +574,7 @@ async fn malformed_query_names_are_invalid_argument() {
 async fn list_objects_v2_continuation_token_calls_storage() {
     let storage = RecordingStorage::default();
     let calls = Arc::clone(&storage.calls);
-    let app = router(ServerState::from_storage(storage));
+    let app = router(test_server_state(storage));
 
     let response = app
         .oneshot(request(
@@ -596,7 +599,7 @@ async fn list_objects_v2_continuation_token_calls_storage() {
 async fn list_objects_v2_slash_delimiter_calls_storage() {
     let storage = RecordingStorage::default();
     let calls = Arc::clone(&storage.calls);
-    let app = router(ServerState::from_storage(storage));
+    let app = router(test_server_state(storage));
 
     let response = app
         .oneshot(request(
@@ -617,7 +620,7 @@ async fn list_objects_v2_slash_delimiter_calls_storage() {
 #[tokio::test]
 async fn list_objects_v2_max_keys_two_returns_paged_xml() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::with_clock(
+    let app = router(test_server_state(FilesystemStorage::with_clock(
         temp_dir.path().to_path_buf(),
         FixedClock(fixed_last_modified()),
     )));
@@ -700,7 +703,7 @@ async fn list_objects_v2_max_keys_two_returns_paged_xml() {
 #[tokio::test]
 async fn list_objects_v2_max_keys_zero_returns_truncated_xml_when_objects_match() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::with_clock(
+    let app = router(test_server_state(FilesystemStorage::with_clock(
         temp_dir.path().to_path_buf(),
         FixedClock(fixed_last_modified()),
     )));
@@ -753,7 +756,7 @@ async fn list_objects_v2_max_keys_zero_returns_truncated_xml_when_objects_match(
 #[tokio::test]
 async fn list_objects_v2_max_keys_zero_reused_token_advances() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::with_clock(
+    let app = router(test_server_state(FilesystemStorage::with_clock(
         temp_dir.path().to_path_buf(),
         FixedClock(fixed_last_modified()),
     )));
@@ -838,7 +841,7 @@ async fn malformed_list_objects_v2_max_keys_values_are_invalid_argument() {
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(Method::GET, uri, Body::empty()))
@@ -858,7 +861,7 @@ async fn list_objects_v2_non_slash_delimiter_is_invalid_argument_without_storage
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(Method::GET, uri, Body::empty()))
@@ -878,7 +881,7 @@ async fn list_objects_v2_xml_invalid_prefix_returns_invalid_argument_without_sto
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(Method::GET, uri, Body::empty()))
@@ -899,7 +902,7 @@ async fn list_objects_v2_unsupported_params_are_not_implemented_without_storage_
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(Method::GET, uri, Body::empty()))
@@ -921,7 +924,7 @@ async fn list_objects_v2_unsupported_params_are_not_implemented_without_storage_
 async fn route_invalid_argument_error_xml_reports_path_only_resource() {
     let storage = RecordingStorage::default();
     let calls = Arc::clone(&storage.calls);
-    let app = router(ServerState::from_storage(storage));
+    let app = router(test_server_state(storage));
 
     let response = app
         .oneshot(request(
@@ -956,10 +959,50 @@ async fn route_invalid_argument_error_xml_reports_path_only_resource() {
 }
 
 #[tokio::test]
+async fn runtime_error_request_ids_are_sequential_unique_and_match_xml() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(ServerState::from_storage(FilesystemStorage::new(
+        temp_dir.path(),
+    )));
+
+    let first = app
+        .clone()
+        .oneshot(request(Method::GET, "/bad_bucket", Body::empty()))
+        .await
+        .expect("first route response");
+    assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+    let first_request_id = first
+        .headers()
+        .get("x-amz-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("first request id")
+        .to_owned();
+    assert_eq!(first_request_id, "s3lab-0000000000000001");
+    let first_body = String::from_utf8(body_bytes(first).await.to_vec()).expect("utf-8 XML body");
+    assert!(first_body.contains(&format!("<RequestId>{first_request_id}</RequestId>")));
+
+    let second = app
+        .oneshot(request(Method::GET, "/also_bad_bucket", Body::empty()))
+        .await
+        .expect("second route response");
+    assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+    let second_request_id = second
+        .headers()
+        .get("x-amz-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("second request id")
+        .to_owned();
+    assert_eq!(second_request_id, "s3lab-0000000000000002");
+    assert_ne!(first_request_id, second_request_id);
+    let second_body = String::from_utf8(body_bytes(second).await.to_vec()).expect("utf-8 XML body");
+    assert!(second_body.contains(&format!("<RequestId>{second_request_id}</RequestId>")));
+}
+
+#[tokio::test]
 async fn route_error_xml_does_not_echo_presigned_url_query_credentials() {
     let storage = RecordingStorage::default();
     let calls = Arc::clone(&storage.calls);
-    let app = router(ServerState::from_storage(storage));
+    let app = router(test_server_state(storage));
 
     let response = app
         .oneshot(request(
@@ -986,9 +1029,7 @@ async fn route_error_xml_does_not_echo_presigned_url_query_credentials() {
 #[tokio::test]
 async fn head_success_and_error_responses_have_empty_bodies() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1041,7 +1082,7 @@ async fn head_object_includes_available_metadata_headers() {
         metadata,
         ..RecordingStorage::default()
     };
-    let app = router(ServerState::from_storage(storage));
+    let app = router(test_server_state(storage));
 
     let head = app
         .oneshot(request(Method::HEAD, "/bucket/object.txt", Body::empty()))
@@ -1125,7 +1166,7 @@ async fn get_object_returns_internal_error_for_invalid_response_metadata_headers
             metadata,
             ..RecordingStorage::default()
         };
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
@@ -1150,7 +1191,7 @@ async fn head_object_returns_internal_error_for_invalid_response_metadata_header
         metadata,
         ..RecordingStorage::default()
     };
-    let app = router(ServerState::from_storage(storage));
+    let app = router(test_server_state(storage));
 
     let response = app
         .oneshot(request(Method::HEAD, "/bucket/object.txt", Body::empty()))
@@ -1163,9 +1204,7 @@ async fn head_object_returns_internal_error_for_invalid_response_metadata_header
 #[tokio::test]
 async fn storage_errors_return_s3_xml_with_status_and_request_id() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let response = app
         .oneshot(request(
@@ -1199,9 +1238,7 @@ async fn storage_errors_return_s3_xml_with_status_and_request_id() {
 #[tokio::test]
 async fn successful_s3_responses_include_request_id() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create_bucket = app
         .clone()
@@ -1266,9 +1303,7 @@ async fn successful_s3_responses_include_request_id() {
 #[tokio::test]
 async fn bucket_lifecycle_for_empty_bucket_returns_s3_statuses_and_empty_bodies() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1315,9 +1350,7 @@ async fn bucket_lifecycle_for_empty_bucket_returns_s3_statuses_and_empty_bodies(
 #[tokio::test]
 async fn duplicate_bucket_create_returns_409_bucket_already_owned_by_you() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1339,9 +1372,7 @@ async fn duplicate_bucket_create_returns_409_bucket_already_owned_by_you() {
 #[tokio::test]
 async fn missing_bucket_head_and_delete_return_expected_errors() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let head = app
         .clone()
@@ -1364,9 +1395,7 @@ async fn missing_bucket_head_and_delete_return_expected_errors() {
 #[tokio::test]
 async fn delete_non_empty_bucket_returns_409_bucket_not_empty() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1407,9 +1436,7 @@ async fn delete_non_empty_bucket_returns_409_bucket_not_empty() {
 #[tokio::test]
 async fn filesystem_backed_router_supports_basic_bucket_and_object_flow() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1476,9 +1503,7 @@ async fn filesystem_backed_router_supports_basic_bucket_and_object_flow() {
 #[tokio::test]
 async fn object_put_get_and_head_preserve_metadata_headers() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1530,9 +1555,7 @@ async fn object_put_get_and_head_preserve_metadata_headers() {
 #[tokio::test]
 async fn object_put_without_content_type_defaults_get_and_head_to_binary_octet_stream() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1598,7 +1621,7 @@ async fn put_object_rejects_known_unsupported_s3_headers_without_storage_call() 
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request_with_headers(
@@ -1626,7 +1649,7 @@ async fn range_get_and_head_object_are_not_implemented_without_storage_call() {
     for method in [Method::GET, Method::HEAD] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request_with_headers(
@@ -1657,7 +1680,7 @@ async fn range_get_and_head_object_are_not_implemented_without_storage_call() {
 async fn put_object_rejects_body_over_phase1_limit_without_storage_call() {
     let storage = RecordingStorage::default();
     let calls = Arc::clone(&storage.calls);
-    let app = router(ServerState::from_storage(storage));
+    let app = router(test_server_state(storage));
     let oversized_body = vec![b'x'; PHASE1_MAX_PUT_OBJECT_BODY_BYTES + 1];
 
     let response = app
@@ -1682,7 +1705,7 @@ async fn put_object_rejects_body_over_phase1_limit_without_storage_call() {
 #[tokio::test]
 async fn filesystem_object_put_get_and_head_use_fixed_last_modified_header() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::with_clock(
+    let app = router(test_server_state(FilesystemStorage::with_clock(
         temp_dir.path().to_path_buf(),
         FixedClock(fixed_last_modified()),
     )));
@@ -1728,9 +1751,7 @@ async fn filesystem_object_put_get_and_head_use_fixed_last_modified_header() {
 #[tokio::test]
 async fn object_lifecycle_put_overwrite_get_head_delete_contract() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1843,9 +1864,7 @@ async fn object_lifecycle_put_overwrite_get_head_delete_contract() {
 #[tokio::test]
 async fn put_object_rejects_empty_user_metadata_suffix() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1875,7 +1894,7 @@ async fn put_object_rejects_invalid_user_metadata_headers_without_storage_call()
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
-        let app = router(ServerState::from_storage(storage));
+        let app = router(test_server_state(storage));
 
         let response = app
             .oneshot(request_with_headers(
@@ -1895,9 +1914,7 @@ async fn put_object_rejects_invalid_user_metadata_headers_without_storage_call()
 #[tokio::test]
 async fn put_object_rejects_non_utf8_user_metadata_value() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1925,7 +1942,7 @@ async fn put_object_rejects_non_utf8_user_metadata_value() {
 async fn put_object_rejects_non_utf8_content_type_without_storage_call() {
     let storage = RecordingStorage::default();
     let calls = Arc::clone(&storage.calls);
-    let app = router(ServerState::from_storage(storage));
+    let app = router(test_server_state(storage));
     let request = Request::builder()
         .method(Method::PUT)
         .uri("/bucket/object.txt")
@@ -1945,9 +1962,7 @@ async fn put_object_rejects_non_utf8_content_type_without_storage_call() {
 #[tokio::test]
 async fn put_object_rejects_duplicate_normalized_user_metadata_keys() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -1972,9 +1987,7 @@ async fn put_object_rejects_duplicate_normalized_user_metadata_keys() {
 #[tokio::test]
 async fn object_lifecycle_missing_bucket_and_key_errors_are_s3_errors() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let missing_bucket_put = app
         .clone()
@@ -2058,9 +2071,7 @@ async fn object_lifecycle_missing_bucket_and_key_errors_are_s3_errors() {
 #[tokio::test]
 async fn delete_bucket_and_object_successes_return_204_no_content() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
@@ -2099,9 +2110,7 @@ async fn delete_bucket_and_object_successes_return_204_no_content() {
 #[tokio::test]
 async fn delete_object_is_idempotent_for_existing_bucket_only() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let app = router(ServerState::from_storage(FilesystemStorage::new(
-        temp_dir.path(),
-    )));
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
 
     let create = app
         .clone()
