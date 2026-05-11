@@ -106,7 +106,7 @@ pub fn ensure_data_dir(path: &Path) -> Result<(), ConfigError> {
         });
     }
 
-    std::fs::create_dir_all(path).map_err(|source| ConfigError::CreateDataDir {
+    fs::create_dir_all(path).map_err(|source| ConfigError::CreateDataDir {
         path: path.to_path_buf(),
         source,
     })?;

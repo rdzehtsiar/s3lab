@@ -1561,7 +1561,7 @@ mod tests {
     fn new_stores_root_without_normalizing() {
         let storage = FilesystemStorage::new("./s3lab-data");
 
-        assert_eq!(storage.root(), std::path::Path::new("./s3lab-data"));
+        assert_eq!(storage.root(), Path::new("./s3lab-data"));
     }
 
     #[test]
