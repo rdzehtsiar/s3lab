@@ -326,12 +326,14 @@ async fn execute_storage_operation(
             encoding,
         } => list_objects_v2_route_response(
             &state,
-            bucket,
-            prefix,
-            delimiter,
-            continuation_token,
-            max_keys,
-            encoding,
+            ListObjectsV2RouteRequest {
+                bucket,
+                prefix,
+                delimiter,
+                continuation_token,
+                max_keys,
+                encoding,
+            },
             request_id,
         ),
     }
@@ -448,13 +450,13 @@ async fn put_object_route_response(
         request_id,
     ) {
         Ok(body) => body,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     for checksum in &body.checksums {
         if let Err(response) =
             validate_put_object_checksum(checksum, &body.bytes, &resource, request_id)
         {
-            return Ok(response);
+            return Ok(*response);
         }
     }
 
@@ -525,14 +527,17 @@ fn delete_object_response(
 
 fn list_objects_v2_route_response(
     state: &ServerState,
-    bucket: BucketName,
-    prefix: Option<ObjectKey>,
-    delimiter: Option<String>,
-    continuation_token: Option<String>,
-    max_keys: usize,
-    encoding: Option<ListObjectsEncoding>,
+    request: ListObjectsV2RouteRequest,
     request_id: &S3RequestId,
 ) -> Result<Response<Body>, (StorageError, String)> {
+    let ListObjectsV2RouteRequest {
+        bucket,
+        prefix,
+        delimiter,
+        continuation_token,
+        max_keys,
+        encoding,
+    } = request;
     let request_continuation_token = continuation_token.clone();
     let options = ListObjectsOptions {
         prefix: prefix.clone(),
@@ -1213,7 +1218,7 @@ fn decode_put_object_body(
     headers: &HeaderMap,
     resource: &str,
     request_id: &S3RequestId,
-) -> Result<PutObjectBody, Response<Body>> {
+) -> RouteResponseResult<PutObjectBody> {
     match body_encoding {
         PutObjectBodyEncoding::Plain => Ok(PutObjectBody {
             bytes: bytes.to_vec(),
@@ -1238,7 +1243,7 @@ fn validate_decoded_content_length(
     decoded_len: usize,
     resource: &str,
     request_id: &S3RequestId,
-) -> Result<(), Response<Body>> {
+) -> RouteResponseResult<()> {
     let Some(value) = headers.get(X_AMZ_DECODED_CONTENT_LENGTH) else {
         return Ok(());
     };
@@ -1250,11 +1255,11 @@ fn validate_decoded_content_length(
     if expected == Some(decoded_len) {
         Ok(())
     } else {
-        Err(invalid_argument_response(
+        Err(Box::new(invalid_argument_response(
             "x-amz-decoded-content-length does not match the decoded object body length.",
             resource,
             request_id,
-        ))
+        )))
     }
 }
 
@@ -1262,20 +1267,22 @@ fn decode_aws_chunked_body(
     bytes: &[u8],
     resource: &str,
     request_id: &S3RequestId,
-) -> Result<AwsChunkedBody, Response<Body>> {
+) -> RouteResponseResult<AwsChunkedBody> {
     let mut position = 0;
     let mut decoded = Vec::new();
 
     loop {
         let chunk_header = read_crlf_line(bytes, &mut position)
-            .ok_or_else(|| malformed_aws_chunked_response(resource, request_id))?;
+            .ok_or_else(|| Box::new(malformed_aws_chunked_response(resource, request_id)))?;
         let chunk_size = parse_aws_chunk_size(chunk_header)
-            .ok_or_else(|| malformed_aws_chunked_response(resource, request_id))?;
+            .ok_or_else(|| Box::new(malformed_aws_chunked_response(resource, request_id)))?;
         if chunk_size == 0 {
             let trailer_checksum =
                 read_aws_chunked_trailer(bytes, &mut position, resource, request_id)?;
             if position != bytes.len() {
-                return Err(malformed_aws_chunked_response(resource, request_id));
+                return Err(Box::new(malformed_aws_chunked_response(
+                    resource, request_id,
+                )));
             }
             return Ok(AwsChunkedBody {
                 bytes: decoded,
@@ -1285,12 +1292,14 @@ fn decode_aws_chunked_body(
 
         let chunk_end = position
             .checked_add(chunk_size)
-            .ok_or_else(|| malformed_aws_chunked_response(resource, request_id))?;
+            .ok_or_else(|| Box::new(malformed_aws_chunked_response(resource, request_id)))?;
         let chunk_crlf_end = chunk_end
             .checked_add(2)
-            .ok_or_else(|| malformed_aws_chunked_response(resource, request_id))?;
+            .ok_or_else(|| Box::new(malformed_aws_chunked_response(resource, request_id)))?;
         if chunk_crlf_end > bytes.len() || &bytes[chunk_end..chunk_crlf_end] != b"\r\n" {
-            return Err(malformed_aws_chunked_response(resource, request_id));
+            return Err(Box::new(malformed_aws_chunked_response(
+                resource, request_id,
+            )));
         }
         decoded.extend_from_slice(&bytes[position..chunk_end]);
         position = chunk_crlf_end;
@@ -1302,18 +1311,18 @@ fn read_aws_chunked_trailer(
     position: &mut usize,
     resource: &str,
     request_id: &S3RequestId,
-) -> Result<Option<PutObjectChecksum>, Response<Body>> {
+) -> RouteResponseResult<Option<PutObjectChecksum>> {
     let mut trailer_checksum = None;
     while let Some(line) = read_crlf_line(bytes, position) {
         if line.is_empty() {
             return Ok(trailer_checksum);
         }
         let Some((name, value)) = line.split_once(':') else {
-            return Err(invalid_argument_response(
+            return Err(Box::new(invalid_argument_response(
                 "aws-chunked trailer is malformed.",
                 resource,
                 request_id,
-            ));
+            )));
         };
         if name.trim().eq_ignore_ascii_case(X_AMZ_CHECKSUM_CRC32) {
             trailer_checksum = Some(PutObjectChecksum::Crc32(value.trim().to_owned()));
@@ -1322,11 +1331,11 @@ fn read_aws_chunked_trailer(
         }
     }
 
-    Err(invalid_argument_response(
+    Err(Box::new(invalid_argument_response(
         "aws-chunked trailer is malformed.",
         resource,
         request_id,
-    ))
+    )))
 }
 
 fn read_crlf_line<'a>(bytes: &'a [u8], position: &mut usize) -> Option<&'a str> {
@@ -1374,7 +1383,7 @@ fn validate_put_object_checksum(
     bytes: &[u8],
     resource: &str,
     request_id: &S3RequestId,
-) -> Result<(), Response<Body>> {
+) -> RouteResponseResult<()> {
     match checksum {
         PutObjectChecksum::None => Ok(()),
         PutObjectChecksum::Crc32(expected) => {
@@ -1382,7 +1391,7 @@ fn validate_put_object_checksum(
             if expected == &actual {
                 Ok(())
             } else {
-                Err(s3_error_response(
+                Err(Box::new(s3_error_response(
                     S3Error::with_message(
                         S3ErrorCode::BadDigest,
                         format!(
@@ -1392,7 +1401,7 @@ fn validate_put_object_checksum(
                         request_id.clone(),
                     ),
                     false,
-                ))
+                )))
             }
         }
         PutObjectChecksum::Crc64Nvme(expected) => {
@@ -1400,7 +1409,7 @@ fn validate_put_object_checksum(
             if expected == &actual {
                 Ok(())
             } else {
-                Err(s3_error_response(
+                Err(Box::new(s3_error_response(
                     S3Error::with_message(
                         S3ErrorCode::BadDigest,
                         format!(
@@ -1410,7 +1419,7 @@ fn validate_put_object_checksum(
                         request_id.clone(),
                     ),
                     false,
-                ))
+                )))
             }
         }
     }
@@ -1423,6 +1432,18 @@ fn put_object_checksums(
         .into_iter()
         .filter(|checksum| !matches!(checksum, PutObjectChecksum::None))
         .collect()
+}
+
+type RouteResponseResult<T> = Result<T, Box<Response<Body>>>;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ListObjectsV2RouteRequest {
+    bucket: BucketName,
+    prefix: Option<ObjectKey>,
+    delimiter: Option<String>,
+    continuation_token: Option<String>,
+    max_keys: usize,
+    encoding: Option<ListObjectsEncoding>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
