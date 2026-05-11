@@ -1613,6 +1613,284 @@ async fn object_put_get_and_head_preserve_metadata_headers() {
 }
 
 #[tokio::test]
+async fn put_object_accepts_aws_cli_crc32_checksum_headers() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                ("x-amz-checksum-crc32", "NhCmhg=="),
+            ],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object with AWS CLI checksum headers");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_put_object_success_headers(&put);
+    assert!(body_bytes(put).await.is_empty());
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get checksummed object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(body_bytes(get).await, Bytes::from_static(b"hello"));
+}
+
+#[tokio::test]
+async fn put_object_accepts_aws_cli_crc64nvme_checksum_headers() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("x-amz-sdk-checksum-algorithm", "CRC64NVME"),
+                ("x-amz-checksum-crc64nvme", "M3eFcAZSQlc="),
+            ],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object with AWS CLI CRC64NVME checksum headers");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_put_object_success_headers(&put);
+    assert!(body_bytes(put).await.is_empty());
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get checksummed object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(body_bytes(get).await, Bytes::from_static(b"hello"));
+}
+
+#[tokio::test]
+async fn put_object_accepts_aws_cli_aws_chunked_crc32_trailer() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", "5"),
+                ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                ("x-amz-trailer", "x-amz-checksum-crc32"),
+            ],
+            Body::from(
+                "5;chunk-signature=signature\r\nhello\r\n0;chunk-signature=signature\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n",
+            ),
+        ))
+        .await
+        .expect("put aws-chunked object with checksum trailer");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_put_object_success_headers(&put);
+    assert!(body_bytes(put).await.is_empty());
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get aws-chunked object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(body_bytes(get).await, Bytes::from_static(b"hello"));
+}
+
+#[tokio::test]
+async fn put_object_accepts_aws_cli_aws_chunked_crc64nvme_trailer() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", "5"),
+                ("x-amz-sdk-checksum-algorithm", "CRC64NVME"),
+                ("x-amz-trailer", "x-amz-checksum-crc64nvme"),
+            ],
+            Body::from(
+                "5;chunk-signature=signature\r\nhello\r\n0;chunk-signature=signature\r\nx-amz-checksum-crc64nvme:M3eFcAZSQlc=\r\n\r\n",
+            ),
+        ))
+        .await
+        .expect("put aws-chunked object with CRC64NVME checksum trailer");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_put_object_success_headers(&put);
+    assert!(body_bytes(put).await.is_empty());
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get aws-chunked object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(body_bytes(get).await, Bytes::from_static(b"hello"));
+}
+
+#[tokio::test]
+async fn put_object_rejects_mismatched_crc32_checksum_without_storing_object() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                ("x-amz-checksum-crc32", "AAAAAA=="),
+            ],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object with bad checksum");
+    assert_s3_error_xml(
+        put,
+        StatusCode::BAD_REQUEST,
+        "BadDigest",
+        "/bucket/object.txt",
+    )
+    .await;
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get rejected object");
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn put_object_rejects_mismatched_crc64nvme_checksum_without_storing_object() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("x-amz-sdk-checksum-algorithm", "CRC64NVME"),
+                ("x-amz-checksum-crc64nvme", "AAAAAAAAAAA="),
+            ],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("put object with bad CRC64NVME checksum");
+    assert_s3_error_xml(
+        put,
+        StatusCode::BAD_REQUEST,
+        "BadDigest",
+        "/bucket/object.txt",
+    )
+    .await;
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get rejected object");
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn put_object_rejects_mismatched_aws_chunked_crc32_trailer_without_storing_object() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", "5"),
+                ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                ("x-amz-trailer", "x-amz-checksum-crc32"),
+            ],
+            Body::from("5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n"),
+        ))
+        .await
+        .expect("put aws-chunked object with bad checksum trailer");
+    assert_s3_error_xml(
+        put,
+        StatusCode::BAD_REQUEST,
+        "BadDigest",
+        "/bucket/object.txt",
+    )
+    .await;
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get rejected aws-chunked object");
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn object_put_without_content_type_defaults_get_and_head_to_binary_octet_stream() {
     let temp_dir = TempDir::new().expect("temp dir");
     let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
@@ -1666,7 +1944,7 @@ async fn put_object_rejects_known_unsupported_s3_headers_without_storage_call() 
         ("x-amz-checksum-algorithm", "SHA256"),
         ("x-amz-checksum-sha256", "checksum"),
         ("x-amz-copy-source", "/source-bucket/source-key"),
-        ("x-amz-sdk-checksum-algorithm", "CRC32"),
+        ("x-amz-sdk-checksum-algorithm", "SHA256"),
         (
             "x-amz-grant-read",
             "uri=http://acs.amazonaws.com/groups/global/AllUsers",
@@ -1678,6 +1956,7 @@ async fn put_object_rejects_known_unsupported_s3_headers_without_storage_call() 
         ("content-encoding", "gzip"),
         ("content-language", "en-US"),
         ("expires", "Sun, 10 May 2026 12:00:00 GMT"),
+        ("x-amz-trailer", "x-amz-checksum-sha256"),
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);

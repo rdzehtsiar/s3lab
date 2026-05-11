@@ -4,6 +4,7 @@ pub const STATIC_REQUEST_ID: &str = "s3lab-test-request-id";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum S3ErrorCode {
+    BadDigest,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
     EntityTooLarge,
@@ -19,6 +20,7 @@ pub enum S3ErrorCode {
 impl S3ErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::BadDigest => "BadDigest",
             Self::BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou",
             Self::BucketNotEmpty => "BucketNotEmpty",
             Self::EntityTooLarge => "EntityTooLarge",
@@ -34,6 +36,7 @@ impl S3ErrorCode {
 
     pub fn default_message(&self) -> &'static str {
         match self {
+            Self::BadDigest => "The Content-MD5 you specified did not match what we received.",
             Self::NoSuchBucket => "The specified bucket does not exist.",
             Self::NoSuchKey => "The specified key does not exist.",
             Self::BucketAlreadyOwnedByYou => {
@@ -53,6 +56,7 @@ impl S3ErrorCode {
 
     pub fn http_status_code(&self) -> u16 {
         match self {
+            Self::BadDigest => 400,
             Self::NoSuchBucket | Self::NoSuchKey => 404,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => 409,
             Self::EntityTooLarge => 400,
@@ -141,6 +145,7 @@ mod tests {
         assert_eq!(
             [
                 S3ErrorCode::BucketAlreadyOwnedByYou,
+                S3ErrorCode::BadDigest,
                 S3ErrorCode::BucketNotEmpty,
                 S3ErrorCode::EntityTooLarge,
                 S3ErrorCode::InternalError,
@@ -151,7 +156,7 @@ mod tests {
                 S3ErrorCode::NoSuchKey,
             ]
             .len(),
-            9
+            10
         );
     }
 
@@ -165,6 +170,7 @@ mod tests {
         let cases = [
             (S3ErrorCode::NoSuchBucket, 404),
             (S3ErrorCode::NoSuchKey, 404),
+            (S3ErrorCode::BadDigest, 400),
             (S3ErrorCode::BucketAlreadyOwnedByYou, 409),
             (S3ErrorCode::BucketNotEmpty, 409),
             (S3ErrorCode::EntityTooLarge, 400),

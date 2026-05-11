@@ -16,7 +16,9 @@ use crate::storage::{
 };
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::State;
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE};
+use axum::http::header::{
+    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE,
+};
 use axum::http::HeaderName;
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri};
 use http_body_util::LengthLimitError;
@@ -38,6 +40,12 @@ const ENCODING_TYPE: &str = "encoding-type";
 const START_AFTER: &str = "start-after";
 const FETCH_OWNER: &str = "fetch-owner";
 const X_ID: &str = "x-id";
+const X_AMZ_CHECKSUM_ALGORITHM: &str = "x-amz-checksum-algorithm";
+const X_AMZ_CHECKSUM_CRC32: &str = "x-amz-checksum-crc32";
+const X_AMZ_CHECKSUM_CRC64NVME: &str = "x-amz-checksum-crc64nvme";
+const X_AMZ_DECODED_CONTENT_LENGTH: &str = "x-amz-decoded-content-length";
+const X_AMZ_SDK_CHECKSUM_ALGORITHM: &str = "x-amz-sdk-checksum-algorithm";
+const X_AMZ_TRAILER: &str = "x-amz-trailer";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RouteScope {
@@ -391,13 +399,28 @@ async fn put_object_route_response(
     request_id: &S3RequestId,
 ) -> Result<Response<Body>, (StorageError, String)> {
     let resource = object_resource(&bucket, &key);
-    if let Some(code) = unsupported_put_object_header(&headers) {
+    if let Some(header_name) = unsupported_put_object_header(&headers) {
+        log_put_object_rejection(
+            &headers,
+            &resource,
+            request_id,
+            "unsupported header",
+            &header_name,
+        );
         return Ok(route_error_response(
-            RouteRejection::new(code, resource),
+            RouteRejection::new(S3ErrorCode::NotImplemented, resource),
             is_head,
             request_id,
         ));
     }
+    let checksum = match extract_put_object_checksum(&headers, &resource) {
+        Ok(checksum) => checksum,
+        Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
+    };
+    let body_encoding = match extract_put_object_body_encoding(&headers, &resource) {
+        Ok(body_encoding) => body_encoding,
+        Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
+    };
 
     let content_type = match extract_content_type(&headers, &resource) {
         Ok(content_type) => content_type,
@@ -411,13 +434,29 @@ async fn put_object_route_response(
         Ok(bytes) => bytes,
         Err(response) => return Ok(response),
     };
+    let body = match decode_put_object_body(
+        body_encoding,
+        bytes.as_ref(),
+        checksum,
+        &headers,
+        &resource,
+        request_id,
+    ) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    if let Err(response) =
+        validate_put_object_checksum(&body.checksum, &body.bytes, &resource, request_id)
+    {
+        return Ok(response);
+    }
 
     state
         .storage()
         .put_object(PutObjectRequest {
             bucket: bucket.clone(),
             key: key.clone(),
-            bytes: bytes.to_vec(),
+            bytes: body.bytes,
             content_type,
             user_metadata,
         })
@@ -986,11 +1025,419 @@ fn extract_content_type(
         .transpose()
 }
 
+fn extract_put_object_checksum(
+    headers: &HeaderMap,
+    resource: &str,
+) -> Result<PutObjectChecksum, RouteRejection> {
+    reject_unsupported_checksum_algorithm(headers, X_AMZ_SDK_CHECKSUM_ALGORITHM, resource)?;
+    reject_unsupported_checksum_algorithm(headers, X_AMZ_CHECKSUM_ALGORITHM, resource)?;
+    reject_unsupported_checksum_trailer(headers, resource)?;
+
+    let crc32 = extract_checksum_header(headers, X_AMZ_CHECKSUM_CRC32, resource)?;
+    let crc64_nvme = extract_checksum_header(headers, X_AMZ_CHECKSUM_CRC64NVME, resource)?;
+
+    match (crc32, crc64_nvme) {
+        (Some(_), Some(_)) => Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        )),
+        (Some(value), None) => Ok(PutObjectChecksum::Crc32(value)),
+        (None, Some(value)) => Ok(PutObjectChecksum::Crc64Nvme(value)),
+        (None, None) => Ok(PutObjectChecksum::None),
+    }
+}
+
+fn extract_checksum_header(
+    headers: &HeaderMap,
+    header_name: &str,
+    resource: &str,
+) -> Result<Option<String>, RouteRejection> {
+    headers
+        .get(header_name)
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned()))
+        })
+        .transpose()
+}
+
+fn extract_put_object_body_encoding(
+    headers: &HeaderMap,
+    resource: &str,
+) -> Result<PutObjectBodyEncoding, RouteRejection> {
+    let Some(value) = headers.get(CONTENT_ENCODING) else {
+        return Ok(PutObjectBodyEncoding::Plain);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned()))?;
+
+    if value.eq_ignore_ascii_case("aws-chunked") {
+        Ok(PutObjectBodyEncoding::AwsChunked)
+    } else {
+        log_put_object_protocol_rejection(
+            resource,
+            "unsupported content encoding",
+            CONTENT_ENCODING.as_str(),
+            value,
+        );
+        Err(RouteRejection::new(
+            S3ErrorCode::NotImplemented,
+            resource.to_owned(),
+        ))
+    }
+}
+
+fn reject_unsupported_checksum_trailer(
+    headers: &HeaderMap,
+    resource: &str,
+) -> Result<(), RouteRejection> {
+    let Some(value) = headers.get(X_AMZ_TRAILER) else {
+        return Ok(());
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned()))?;
+
+    if value.eq_ignore_ascii_case(X_AMZ_CHECKSUM_CRC32)
+        || value.eq_ignore_ascii_case(X_AMZ_CHECKSUM_CRC64NVME)
+    {
+        Ok(())
+    } else {
+        log_put_object_protocol_rejection(
+            resource,
+            "unsupported checksum trailer",
+            X_AMZ_TRAILER,
+            value,
+        );
+        Err(RouteRejection::new(
+            S3ErrorCode::NotImplemented,
+            resource.to_owned(),
+        ))
+    }
+}
+
+fn reject_unsupported_checksum_algorithm(
+    headers: &HeaderMap,
+    header_name: &str,
+    resource: &str,
+) -> Result<(), RouteRejection> {
+    let Some(value) = headers.get(header_name) else {
+        return Ok(());
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned()))?;
+
+    if value.eq_ignore_ascii_case("CRC32") || value.eq_ignore_ascii_case("CRC64NVME") {
+        Ok(())
+    } else {
+        log_put_object_protocol_rejection(
+            resource,
+            "unsupported checksum algorithm",
+            header_name,
+            value,
+        );
+        Err(RouteRejection::new(
+            S3ErrorCode::NotImplemented,
+            resource.to_owned(),
+        ))
+    }
+}
+
+fn decode_put_object_body(
+    body_encoding: PutObjectBodyEncoding,
+    bytes: &[u8],
+    header_checksum: PutObjectChecksum,
+    headers: &HeaderMap,
+    resource: &str,
+    request_id: &S3RequestId,
+) -> Result<PutObjectBody, Response<Body>> {
+    match body_encoding {
+        PutObjectBodyEncoding::Plain => Ok(PutObjectBody {
+            bytes: bytes.to_vec(),
+            checksum: header_checksum,
+        }),
+        PutObjectBodyEncoding::AwsChunked => {
+            let decoded = decode_aws_chunked_body(bytes, resource, request_id)?;
+            validate_decoded_content_length(headers, decoded.bytes.len(), resource, request_id)?;
+            Ok(PutObjectBody {
+                bytes: decoded.bytes,
+                checksum: decoded.trailer_checksum.unwrap_or(header_checksum),
+            })
+        }
+    }
+}
+
+fn validate_decoded_content_length(
+    headers: &HeaderMap,
+    decoded_len: usize,
+    resource: &str,
+    request_id: &S3RequestId,
+) -> Result<(), Response<Body>> {
+    let Some(value) = headers.get(X_AMZ_DECODED_CONTENT_LENGTH) else {
+        return Ok(());
+    };
+    let expected = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+
+    if expected == Some(decoded_len) {
+        Ok(())
+    } else {
+        Err(invalid_argument_response(
+            "x-amz-decoded-content-length does not match the decoded object body length.",
+            resource,
+            request_id,
+        ))
+    }
+}
+
+fn decode_aws_chunked_body(
+    bytes: &[u8],
+    resource: &str,
+    request_id: &S3RequestId,
+) -> Result<AwsChunkedBody, Response<Body>> {
+    let mut position = 0;
+    let mut decoded = Vec::new();
+
+    loop {
+        let chunk_header = read_crlf_line(bytes, &mut position)
+            .ok_or_else(|| malformed_aws_chunked_response(resource, request_id))?;
+        let chunk_size = parse_aws_chunk_size(chunk_header)
+            .ok_or_else(|| malformed_aws_chunked_response(resource, request_id))?;
+        if chunk_size == 0 {
+            let trailer_checksum =
+                read_aws_chunked_trailer(bytes, &mut position, resource, request_id)?;
+            if position != bytes.len() {
+                return Err(malformed_aws_chunked_response(resource, request_id));
+            }
+            return Ok(AwsChunkedBody {
+                bytes: decoded,
+                trailer_checksum,
+            });
+        }
+
+        let chunk_end = position
+            .checked_add(chunk_size)
+            .ok_or_else(|| malformed_aws_chunked_response(resource, request_id))?;
+        if chunk_end + 2 > bytes.len() || &bytes[chunk_end..chunk_end + 2] != b"\r\n" {
+            return Err(malformed_aws_chunked_response(resource, request_id));
+        }
+        decoded.extend_from_slice(&bytes[position..chunk_end]);
+        position = chunk_end + 2;
+    }
+}
+
+fn read_aws_chunked_trailer(
+    bytes: &[u8],
+    position: &mut usize,
+    resource: &str,
+    request_id: &S3RequestId,
+) -> Result<Option<PutObjectChecksum>, Response<Body>> {
+    let mut trailer_checksum = None;
+    while let Some(line) = read_crlf_line(bytes, position) {
+        if line.is_empty() {
+            return Ok(trailer_checksum);
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(invalid_argument_response(
+                "aws-chunked trailer is malformed.",
+                resource,
+                request_id,
+            ));
+        };
+        if name.trim().eq_ignore_ascii_case(X_AMZ_CHECKSUM_CRC32) {
+            trailer_checksum = Some(PutObjectChecksum::Crc32(value.trim().to_owned()));
+        } else if name.trim().eq_ignore_ascii_case(X_AMZ_CHECKSUM_CRC64NVME) {
+            trailer_checksum = Some(PutObjectChecksum::Crc64Nvme(value.trim().to_owned()));
+        }
+    }
+
+    Err(invalid_argument_response(
+        "aws-chunked trailer is malformed.",
+        resource,
+        request_id,
+    ))
+}
+
+fn read_crlf_line<'a>(bytes: &'a [u8], position: &mut usize) -> Option<&'a str> {
+    let relative_end = bytes
+        .get(*position..)?
+        .windows(2)
+        .position(|window| window == b"\r\n")?;
+    let line_start = *position;
+    let line_end = line_start + relative_end;
+    *position = line_end + 2;
+    std::str::from_utf8(&bytes[line_start..line_end]).ok()
+}
+
+fn parse_aws_chunk_size(header: &str) -> Option<usize> {
+    let size = header.split_once(';').map_or(header, |(size, _)| size);
+    usize::from_str_radix(size, 16).ok()
+}
+
+fn malformed_aws_chunked_response(resource: &str, request_id: &S3RequestId) -> Response<Body> {
+    invalid_argument_response(
+        "aws-chunked request body is malformed.",
+        resource,
+        request_id,
+    )
+}
+
+fn invalid_argument_response(
+    message: impl Into<String>,
+    resource: &str,
+    request_id: &S3RequestId,
+) -> Response<Body> {
+    s3_error_response(
+        S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            message,
+            resource,
+            request_id.clone(),
+        ),
+        false,
+    )
+}
+
+fn validate_put_object_checksum(
+    checksum: &PutObjectChecksum,
+    bytes: &[u8],
+    resource: &str,
+    request_id: &S3RequestId,
+) -> Result<(), Response<Body>> {
+    match checksum {
+        PutObjectChecksum::None => Ok(()),
+        PutObjectChecksum::Crc32(expected) => {
+            let actual = crc32_base64(bytes);
+            if expected == &actual {
+                Ok(())
+            } else {
+                Err(s3_error_response(
+                    S3Error::with_message(
+                        S3ErrorCode::BadDigest,
+                        format!(
+                            "The x-amz-checksum-crc32 value did not match the object body. Expected {expected}, computed {actual}."
+                        ),
+                        resource,
+                        request_id.clone(),
+                    ),
+                    false,
+                ))
+            }
+        }
+        PutObjectChecksum::Crc64Nvme(expected) => {
+            let actual = crc64_nvme_base64(bytes);
+            if expected == &actual {
+                Ok(())
+            } else {
+                Err(s3_error_response(
+                    S3Error::with_message(
+                        S3ErrorCode::BadDigest,
+                        format!(
+                            "The x-amz-checksum-crc64nvme value did not match the object body. Expected {expected}, computed {actual}."
+                        ),
+                        resource,
+                        request_id.clone(),
+                    ),
+                    false,
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PutObjectBodyEncoding {
+    Plain,
+    AwsChunked,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PutObjectBody {
+    bytes: Vec<u8>,
+    checksum: PutObjectChecksum,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AwsChunkedBody {
+    bytes: Vec<u8>,
+    trailer_checksum: Option<PutObjectChecksum>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+enum PutObjectChecksum {
+    #[default]
+    None,
+    Crc32(String),
+    Crc64Nvme(String),
+}
+
+fn crc32_base64(bytes: &[u8]) -> String {
+    base64_bytes(&crc32(bytes).to_be_bytes())
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffff;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn crc64_nvme_base64(bytes: &[u8]) -> String {
+    base64_bytes(&crc64_nvme(bytes).to_be_bytes())
+}
+
+fn crc64_nvme(bytes: &[u8]) -> u64 {
+    let mut crc = 0xffff_ffff_ffff_ffff;
+    for byte in bytes {
+        crc ^= u64::from(*byte);
+        for _ in 0..8 {
+            let mask = 0u64.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0x9a6c_9329_ac4b_c9b5 & mask);
+        }
+    }
+    !crc
+}
+
+fn base64_bytes(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+
+        encoded.push(ALPHABET[(b0 >> 2) as usize] as char);
+        encoded.push(ALPHABET[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(ALPHABET[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(ALPHABET[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
 fn invalid_user_metadata(resource: &str) -> RouteRejection {
     RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned())
 }
 
-fn unsupported_put_object_header(headers: &HeaderMap) -> Option<S3ErrorCode> {
+fn unsupported_put_object_header(headers: &HeaderMap) -> Option<String> {
     headers.keys().find_map(|name| {
         let name = name.as_str();
         if UNSUPPORTED_PUT_OBJECT_HEADERS.contains(&name)
@@ -998,11 +1445,62 @@ fn unsupported_put_object_header(headers: &HeaderMap) -> Option<S3ErrorCode> {
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
         {
-            Some(S3ErrorCode::NotImplemented)
+            Some(name.to_owned())
         } else {
             None
         }
     })
+}
+
+fn log_put_object_rejection(
+    headers: &HeaderMap,
+    resource: &str,
+    request_id: &S3RequestId,
+    reason: &str,
+    detail: &str,
+) {
+    tracing::info!(
+        resource = %resource,
+        request_id = %request_id.as_str(),
+        reason = %reason,
+        detail = %detail,
+        header_names = %put_object_diagnostic_header_names(headers),
+        diagnostic_headers = %put_object_diagnostic_header_values(headers),
+        "put object rejected"
+    );
+}
+
+fn log_put_object_protocol_rejection(resource: &str, reason: &str, header_name: &str, value: &str) {
+    tracing::info!(
+        resource = %resource,
+        reason = %reason,
+        header_name = %header_name,
+        header_value = %value,
+        "put object rejected"
+    );
+}
+
+fn put_object_diagnostic_header_names(headers: &HeaderMap) -> String {
+    headers
+        .keys()
+        .map(|name| name.as_str().to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn put_object_diagnostic_header_values(headers: &HeaderMap) -> String {
+    SAFE_PUT_OBJECT_DIAGNOSTIC_VALUE_HEADERS
+        .iter()
+        .filter_map(|name| {
+            headers.get(*name).map(|value| {
+                let value = value.to_str().unwrap_or("<non-utf8>");
+                format!("{name}={value}")
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn head_from_response(response: Response<Body>) -> Response<Body> {
@@ -1092,21 +1590,16 @@ const UNSUPPORTED_LIST_OBJECTS_V2_PARAMS: &[&str] = &[ENCODING_TYPE, START_AFTER
 const UNSUPPORTED_PUT_OBJECT_HEADERS: &[&str] = &[
     "cache-control",
     "content-disposition",
-    "content-encoding",
     "content-language",
     "content-md5",
     "expires",
     "x-amz-acl",
-    "x-amz-checksum-algorithm",
-    "x-amz-checksum-crc32",
     "x-amz-checksum-crc32c",
-    "x-amz-checksum-crc64nvme",
     "x-amz-checksum-sha1",
     "x-amz-checksum-sha256",
     "x-amz-copy-source",
     "x-amz-expected-bucket-owner",
     "x-amz-request-payer",
-    "x-amz-sdk-checksum-algorithm",
     "x-amz-server-side-encryption",
     "x-amz-server-side-encryption-aws-kms-key-id",
     "x-amz-server-side-encryption-bucket-key-enabled",
@@ -1116,25 +1609,36 @@ const UNSUPPORTED_PUT_OBJECT_HEADERS: &[&str] = &[
     "x-amz-server-side-encryption-customer-key-md5",
     "x-amz-storage-class",
     "x-amz-tagging",
-    "x-amz-trailer",
     "x-amz-website-redirect-location",
     "x-amz-write-offset-bytes",
 ];
 
 const UNSUPPORTED_PUT_OBJECT_HEADER_PREFIXES: &[&str] = &["x-amz-grant-", "x-amz-object-lock-"];
 
+const SAFE_PUT_OBJECT_DIAGNOSTIC_VALUE_HEADERS: &[&str] = &[
+    "content-encoding",
+    "transfer-encoding",
+    X_AMZ_CHECKSUM_ALGORITHM,
+    X_AMZ_CHECKSUM_CRC32,
+    X_AMZ_CHECKSUM_CRC64NVME,
+    X_AMZ_DECODED_CONTENT_LENGTH,
+    X_AMZ_SDK_CHECKSUM_ALGORITHM,
+    X_AMZ_TRAILER,
+];
+
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_operation, s3_error_code_from_storage_error, s3_error_from_storage_error,
-        safe_log_path, RouteScope,
+        crc32_base64, crc64_nvme_base64, put_object_diagnostic_header_names,
+        put_object_diagnostic_header_values, resolve_operation, s3_error_code_from_storage_error,
+        s3_error_from_storage_error, safe_log_path, RouteScope,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::error::{S3ErrorCode, S3RequestId, STATIC_REQUEST_ID};
     use crate::s3::object::ObjectKey;
     use crate::s3::operation::S3Operation;
     use crate::storage::StorageError;
-    use axum::http::{Method, Uri};
+    use axum::http::{HeaderMap, HeaderValue, Method, Uri};
     use std::path::PathBuf;
 
     #[test]
@@ -1152,6 +1656,54 @@ mod tests {
         );
 
         assert_eq!(safe_log_path(&uri), "/example-bucket/object.txt");
+    }
+
+    #[test]
+    fn put_object_diagnostic_header_values_only_include_safe_protocol_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=secret, Signature=super-secret"),
+        );
+        headers.insert("content-encoding", HeaderValue::from_static("aws-chunked"));
+        headers.insert(
+            "x-amz-sdk-checksum-algorithm",
+            HeaderValue::from_static("CRC64NVME"),
+        );
+        headers.insert(
+            "x-amz-trailer",
+            HeaderValue::from_static("x-amz-checksum-crc64nvme"),
+        );
+        headers.insert(
+            "x-amz-checksum-crc64nvme",
+            HeaderValue::from_static("M3eFcAZSQlc="),
+        );
+
+        assert_eq!(
+            put_object_diagnostic_header_values(&headers),
+            "content-encoding=aws-chunked,x-amz-checksum-crc64nvme=M3eFcAZSQlc=,x-amz-sdk-checksum-algorithm=CRC64NVME,x-amz-trailer=x-amz-checksum-crc64nvme"
+        );
+        assert!(!put_object_diagnostic_header_values(&headers).contains("secret"));
+    }
+
+    #[test]
+    fn checksum_encodings_match_known_vectors() {
+        assert_eq!(crc32_base64(b"hello"), "NhCmhg==");
+        assert_eq!(crc64_nvme_base64(b"hello"), "M3eFcAZSQlc=");
+        assert_eq!(crc64_nvme_base64(b"123456789"), "rosUhgp5mIg=");
+    }
+
+    #[test]
+    fn put_object_diagnostic_header_names_are_sorted_and_value_free() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-case", HeaderValue::from_static("private-value"));
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        headers.insert("authorization", HeaderValue::from_static("secret"));
+
+        assert_eq!(
+            put_object_diagnostic_header_names(&headers),
+            "authorization,content-type,x-amz-meta-case"
+        );
     }
 
     #[test]
