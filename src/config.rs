@@ -403,6 +403,35 @@ mod tests {
     }
 
     #[test]
+    fn data_dir_reparse_point_error_display_is_actionable_and_has_no_source() {
+        let path = PathBuf::from("linked-data");
+        let error = ConfigError::DataDirIsReparsePoint { path: path.clone() };
+
+        assert!(error.to_string().contains("symlink or reparse point"));
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn create_data_dir_error_display_includes_source_and_exposes_it() {
+        let path = PathBuf::from("missing").join("s3lab-data");
+        let error = ConfigError::CreateDataDir {
+            path: path.clone(),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
+        };
+
+        assert!(error
+            .to_string()
+            .contains("failed to create or open data dir"));
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(error.to_string().contains("permission denied"));
+        assert_eq!(
+            error.source().expect("create error has source").to_string(),
+            "permission denied"
+        );
+    }
+
+    #[test]
     fn runtime_config_ensure_data_dir_delegates_to_configured_path() {
         let parent = tempfile::tempdir().expect("temp dir");
         let data_dir = parent.path().join("configured-data");

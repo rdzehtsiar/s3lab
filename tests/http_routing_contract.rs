@@ -298,6 +298,66 @@ fn duplicate_and_unknown_query_params_are_invalid_argument() {
 }
 
 #[test]
+fn x_id_query_param_is_ignored_when_resolving_routes() {
+    let cases = [
+        (
+            Method::GET,
+            "/bucket?list-type=2&x-id=ListObjectsV2",
+            S3Operation::ListObjectsV2 {
+                bucket: BucketName::new("bucket"),
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+            },
+        ),
+        (
+            Method::GET,
+            "/bucket/object.txt?x-id=GetObject",
+            S3Operation::GetObject {
+                bucket: BucketName::new("bucket"),
+                key: ObjectKey::new("object.txt"),
+            },
+        ),
+        (
+            Method::PUT,
+            "/bucket/object.txt?x-id=PutObject&x-id=Retry",
+            S3Operation::PutObject {
+                bucket: BucketName::new("bucket"),
+                key: ObjectKey::new("object.txt"),
+            },
+        ),
+    ];
+
+    for (method, uri, expected_operation) in cases {
+        let route = resolve_operation(&method, &uri.parse::<Uri>().expect("valid URI"))
+            .expect("x-id should not affect route resolution");
+
+        assert_eq!(route.operation, expected_operation);
+    }
+}
+
+#[test]
+fn empty_query_pairs_are_skipped_when_resolving_routes() {
+    let route = resolve_operation(
+        &Method::GET,
+        &Uri::from_static("/bucket?&&list-type=2&&prefix=logs%2F&&"),
+    )
+    .expect("empty query pairs should be skipped");
+
+    assert_eq!(
+        route.operation,
+        S3Operation::ListObjectsV2 {
+            bucket: BucketName::new("bucket"),
+            prefix: Some(ObjectKey::new("logs/")),
+            delimiter: None,
+            continuation_token: None,
+            max_keys: 1000,
+        }
+    );
+}
+
+#[test]
 fn known_s3_subresources_are_not_implemented() {
     for subresource in [
         "acl",

@@ -251,6 +251,20 @@ fn create_bucket_rejects_existing_bucket_directory_without_metadata() {
 }
 
 #[test]
+fn create_bucket_rejects_existing_bucket_directory_with_mismatched_metadata() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    fs::create_dir_all(bucket_dir(temp_dir.path(), &bucket)).expect("create bucket dir");
+    write_bucket_metadata(temp_dir.path(), &bucket, r#"{"bucket":"other-bucket"}"#);
+
+    let error = storage
+        .create_bucket(&bucket)
+        .expect_err("mismatched existing bucket metadata fails create");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+}
+
+#[test]
 fn list_buckets_reports_missing_bucket_metadata_as_corrupt_state() {
     let (temp_dir, storage) = storage();
     let bucket = BucketName::new("example-bucket");
@@ -712,6 +726,39 @@ fn list_objects_rejects_object_metadata_with_wrong_key_path_identity() {
         .expect_err("list rejects object metadata stored under the wrong key path");
 
     assert!(matches!(error, StorageError::CorruptState { .. }));
+}
+
+#[test]
+fn direct_object_reads_reject_metadata_with_wrong_requested_identity() {
+    for (field, value) in [
+        ("bucket", serde_json::json!("other-bucket")),
+        ("key", serde_json::json!("other-object.txt")),
+    ] {
+        let (temp_dir, storage) = storage();
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("object.txt");
+        storage.create_bucket(&bucket).expect("create bucket");
+        storage
+            .put_object(put_request(&bucket, key.as_str(), b"body"))
+            .expect("put object");
+        rewrite_object_metadata_field(temp_dir.path(), &bucket, &key, field, value);
+
+        let object_error = storage
+            .get_object(&bucket, &key)
+            .expect_err("direct object read rejects mismatched metadata identity");
+        let metadata_error = storage
+            .get_object_metadata(&bucket, &key)
+            .expect_err("direct metadata read rejects mismatched metadata identity");
+
+        assert!(
+            matches!(object_error, StorageError::CorruptState { .. }),
+            "{field} mismatch should corrupt direct object read"
+        );
+        assert!(
+            matches!(metadata_error, StorageError::CorruptState { .. }),
+            "{field} mismatch should corrupt direct metadata read"
+        );
+    }
 }
 
 #[test]
@@ -1786,6 +1833,24 @@ fn list_objects_max_keys_zero_is_not_truncated_without_matching_objects() {
     assert_eq!(listing.max_keys, 0);
     assert!(!listing.is_truncated);
     assert_eq!(listing.next_continuation_token, None);
+}
+
+#[test]
+fn list_objects_rejects_non_slash_delimiter() {
+    let (_temp_dir, storage) = storage_with_objects(["a-b.txt"]);
+    let bucket = BucketName::new("example-bucket");
+
+    let error = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                delimiter: Some("-".to_owned()),
+                ..ListObjectsOptions::default()
+            },
+        )
+        .expect_err("non-slash delimiter is unsupported");
+
+    assert!(matches!(error, StorageError::InvalidArgument { .. }));
 }
 
 #[test]
