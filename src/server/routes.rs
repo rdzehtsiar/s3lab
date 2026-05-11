@@ -266,144 +266,8 @@ async fn execute_operation(
     is_head: bool,
     request_id: S3RequestId,
 ) -> Response<Body> {
-    let result = match operation {
-        S3Operation::ListBuckets => state
-            .storage()
-            .list_buckets()
-            .map(|buckets| {
-                xml_response(
-                    list_buckets_response_xml(&list_buckets_xml(buckets)),
-                    &request_id,
-                )
-            })
-            .map_err(|error| (error, "/".to_owned())),
-        S3Operation::CreateBucket { bucket } => state
-            .storage()
-            .create_bucket(&bucket)
-            .map(|()| empty_response(&request_id))
-            .map_err(|error| (error, bucket_resource(&bucket))),
-        S3Operation::HeadBucket { bucket } => match state.storage().bucket_exists(&bucket) {
-            Ok(true) => Ok(empty_response(&request_id)),
-            Ok(false) => Err((
-                StorageError::NoSuchBucket {
-                    bucket: bucket.clone(),
-                },
-                bucket_resource(&bucket),
-            )),
-            Err(error) => Err((error, bucket_resource(&bucket))),
-        },
-        S3Operation::DeleteBucket { bucket } => state
-            .storage()
-            .delete_bucket(&bucket)
-            .map(|()| no_content_response(&request_id))
-            .map_err(|error| (error, bucket_resource(&bucket))),
-        S3Operation::PutObject { bucket, key } => {
-            if let Some(code) = unsupported_put_object_header(&headers) {
-                return route_error_response(
-                    RouteRejection::new(code, object_resource(&bucket, &key)),
-                    is_head,
-                    &request_id,
-                );
-            }
-            let resource = object_resource(&bucket, &key);
-            let content_type = match extract_content_type(&headers, &resource) {
-                Ok(content_type) => content_type,
-                Err(rejection) => return route_error_response(rejection, is_head, &request_id),
-            };
-            let user_metadata = match extract_user_metadata(&headers, &resource) {
-                Ok(user_metadata) => user_metadata,
-                Err(rejection) => return route_error_response(rejection, is_head, &request_id),
-            };
-            let bytes = match read_put_object_body(body, &resource, is_head, &request_id).await {
-                Ok(bytes) => bytes,
-                Err(response) => return response,
-            };
-            state
-                .storage()
-                .put_object(PutObjectRequest {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    bytes: bytes.to_vec(),
-                    content_type,
-                    user_metadata,
-                })
-                .map(|metadata| put_object_response(metadata, &request_id))
-                .map_err(|error| (error, resource))
-        }
-        S3Operation::GetObject { bucket, key } => {
-            if headers.contains_key(RANGE) {
-                return route_error_response(
-                    RouteRejection::new(
-                        S3ErrorCode::NotImplemented,
-                        object_resource(&bucket, &key),
-                    ),
-                    is_head,
-                    &request_id,
-                );
-            }
-            state
-                .storage()
-                .get_object(&bucket, &key)
-                .and_then(|object| object_response(object, &request_id))
-                .map_err(|error| (error, object_resource(&bucket, &key)))
-        }
-        S3Operation::HeadObject { bucket, key } => {
-            if headers.contains_key(RANGE) {
-                return route_error_response(
-                    RouteRejection::new(
-                        S3ErrorCode::NotImplemented,
-                        object_resource(&bucket, &key),
-                    ),
-                    is_head,
-                    &request_id,
-                );
-            }
-            state
-                .storage()
-                .get_object_metadata(&bucket, &key)
-                .and_then(|metadata| object_metadata_response(metadata, Body::empty(), &request_id))
-                .map_err(|error| (error, object_resource(&bucket, &key)))
-        }
-        S3Operation::DeleteObject { bucket, key } => {
-            match state.storage().delete_object(&bucket, &key) {
-                Ok(()) | Err(StorageError::NoSuchKey { .. }) => {
-                    Ok(no_content_response(&request_id))
-                }
-                Err(error) => Err((error, object_resource(&bucket, &key))),
-            }
-        }
-        S3Operation::ListObjectsV2 {
-            bucket,
-            prefix,
-            delimiter,
-            continuation_token,
-            max_keys,
-        } => {
-            let request_continuation_token = continuation_token.clone();
-            let options = ListObjectsOptions {
-                prefix: prefix.clone(),
-                delimiter: delimiter.clone(),
-                continuation_token,
-                max_keys,
-            };
-            state
-                .storage()
-                .list_objects(&bucket, options)
-                .map(|listing| {
-                    let listing = list_objects_v2_xml(listing);
-                    xml_response(
-                        list_objects_v2_response_xml(
-                            &listing,
-                            prefix.as_ref().map(ObjectKey::as_str),
-                            delimiter.as_deref(),
-                            request_continuation_token.as_deref(),
-                        ),
-                        &request_id,
-                    )
-                })
-                .map_err(|error| (error, bucket_resource(&bucket)))
-        }
-    };
+    let result =
+        execute_storage_operation(state, headers, body, operation, is_head, &request_id).await;
 
     match result {
         Ok(response) => {
@@ -415,6 +279,253 @@ async fn execute_operation(
         }
         Err((error, resource)) => storage_error_response(error, resource, is_head, &request_id),
     }
+}
+
+async fn execute_storage_operation(
+    state: ServerState,
+    headers: HeaderMap,
+    body: Body,
+    operation: S3Operation,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    match operation {
+        S3Operation::ListBuckets => list_buckets_response(&state, request_id),
+        S3Operation::CreateBucket { bucket } => create_bucket_response(&state, bucket, request_id),
+        S3Operation::HeadBucket { bucket } => head_bucket_response(&state, bucket, request_id),
+        S3Operation::DeleteBucket { bucket } => delete_bucket_response(&state, bucket, request_id),
+        S3Operation::PutObject { bucket, key } => {
+            put_object_route_response(state, headers, body, bucket, key, is_head, request_id).await
+        }
+        S3Operation::GetObject { bucket, key } => {
+            get_object_route_response(&state, &headers, bucket, key, is_head, request_id)
+        }
+        S3Operation::HeadObject { bucket, key } => {
+            head_object_route_response(&state, &headers, bucket, key, is_head, request_id)
+        }
+        S3Operation::DeleteObject { bucket, key } => {
+            delete_object_response(&state, bucket, key, request_id)
+        }
+        S3Operation::ListObjectsV2 {
+            bucket,
+            prefix,
+            delimiter,
+            continuation_token,
+            max_keys,
+        } => list_objects_v2_route_response(
+            &state,
+            bucket,
+            prefix,
+            delimiter,
+            continuation_token,
+            max_keys,
+            request_id,
+        ),
+    }
+}
+
+fn list_buckets_response(
+    state: &ServerState,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    state
+        .storage()
+        .list_buckets()
+        .map(|buckets| {
+            xml_response(
+                list_buckets_response_xml(&list_buckets_xml(buckets)),
+                request_id,
+            )
+        })
+        .map_err(|error| (error, "/".to_owned()))
+}
+
+fn create_bucket_response(
+    state: &ServerState,
+    bucket: BucketName,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    state
+        .storage()
+        .create_bucket(&bucket)
+        .map(|()| empty_response(request_id))
+        .map_err(|error| (error, bucket_resource(&bucket)))
+}
+
+fn head_bucket_response(
+    state: &ServerState,
+    bucket: BucketName,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    match state.storage().bucket_exists(&bucket) {
+        Ok(true) => Ok(empty_response(request_id)),
+        Ok(false) => Err((
+            StorageError::NoSuchBucket {
+                bucket: bucket.clone(),
+            },
+            bucket_resource(&bucket),
+        )),
+        Err(error) => Err((error, bucket_resource(&bucket))),
+    }
+}
+
+fn delete_bucket_response(
+    state: &ServerState,
+    bucket: BucketName,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    state
+        .storage()
+        .delete_bucket(&bucket)
+        .map(|()| no_content_response(request_id))
+        .map_err(|error| (error, bucket_resource(&bucket)))
+}
+
+async fn put_object_route_response(
+    state: ServerState,
+    headers: HeaderMap,
+    body: Body,
+    bucket: BucketName,
+    key: ObjectKey,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    let resource = object_resource(&bucket, &key);
+    if let Some(code) = unsupported_put_object_header(&headers) {
+        return Ok(route_error_response(
+            RouteRejection::new(code, resource),
+            is_head,
+            request_id,
+        ));
+    }
+
+    let content_type = match extract_content_type(&headers, &resource) {
+        Ok(content_type) => content_type,
+        Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
+    };
+    let user_metadata = match extract_user_metadata(&headers, &resource) {
+        Ok(user_metadata) => user_metadata,
+        Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
+    };
+    let bytes = match read_put_object_body(body, &resource, is_head, request_id).await {
+        Ok(bytes) => bytes,
+        Err(response) => return Ok(response),
+    };
+
+    state
+        .storage()
+        .put_object(PutObjectRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            bytes: bytes.to_vec(),
+            content_type,
+            user_metadata,
+        })
+        .map(|metadata| put_object_response(metadata, request_id))
+        .map_err(|error| (error, resource))
+}
+
+fn get_object_route_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    bucket: BucketName,
+    key: ObjectKey,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    if let Some(response) = unsupported_range_response(headers, &bucket, &key, is_head, request_id)
+    {
+        return Ok(response);
+    }
+
+    state
+        .storage()
+        .get_object(&bucket, &key)
+        .and_then(|object| object_response(object, request_id))
+        .map_err(|error| (error, object_resource(&bucket, &key)))
+}
+
+fn head_object_route_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    bucket: BucketName,
+    key: ObjectKey,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    if let Some(response) = unsupported_range_response(headers, &bucket, &key, is_head, request_id)
+    {
+        return Ok(response);
+    }
+
+    state
+        .storage()
+        .get_object_metadata(&bucket, &key)
+        .and_then(|metadata| object_metadata_response(metadata, Body::empty(), request_id))
+        .map_err(|error| (error, object_resource(&bucket, &key)))
+}
+
+fn delete_object_response(
+    state: &ServerState,
+    bucket: BucketName,
+    key: ObjectKey,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    match state.storage().delete_object(&bucket, &key) {
+        Ok(()) | Err(StorageError::NoSuchKey { .. }) => Ok(no_content_response(request_id)),
+        Err(error) => Err((error, object_resource(&bucket, &key))),
+    }
+}
+
+fn list_objects_v2_route_response(
+    state: &ServerState,
+    bucket: BucketName,
+    prefix: Option<ObjectKey>,
+    delimiter: Option<String>,
+    continuation_token: Option<String>,
+    max_keys: usize,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    let request_continuation_token = continuation_token.clone();
+    let options = ListObjectsOptions {
+        prefix: prefix.clone(),
+        delimiter: delimiter.clone(),
+        continuation_token,
+        max_keys,
+    };
+
+    state
+        .storage()
+        .list_objects(&bucket, options)
+        .map(|listing| {
+            let listing = list_objects_v2_xml(listing);
+            xml_response(
+                list_objects_v2_response_xml(
+                    &listing,
+                    prefix.as_ref().map(ObjectKey::as_str),
+                    delimiter.as_deref(),
+                    request_continuation_token.as_deref(),
+                ),
+                request_id,
+            )
+        })
+        .map_err(|error| (error, bucket_resource(&bucket)))
+}
+
+fn unsupported_range_response(
+    headers: &HeaderMap,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Option<Response<Body>> {
+    headers.contains_key(RANGE).then(|| {
+        route_error_response(
+            RouteRejection::new(S3ErrorCode::NotImplemented, object_resource(bucket, key)),
+            is_head,
+            request_id,
+        )
+    })
 }
 
 async fn read_put_object_body(
