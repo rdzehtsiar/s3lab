@@ -537,46 +537,50 @@ impl<C> FilesystemStorage<C> {
         F: FnMut(StoredObjectMetadata) -> Result<VisibleCommittedObjectVisit, StorageError>,
     {
         for shard_entry in sorted_directory_entries(objects_dir)? {
-            if is_hidden_storage_entry(&shard_entry) {
-                continue;
-            }
-
-            let shard_path = shard_entry.path();
-            let Some(shard_metadata) = storage_path_metadata(&shard_path)? else {
+            let Some(shard_path) = visible_storage_directory_path(
+                &shard_entry,
+                "visible object shard path exists but is not a directory",
+            )?
+            else {
                 continue;
             };
-            if !shard_metadata.is_dir() {
-                return Err(corrupt_state(
-                    shard_path,
-                    "visible object shard path exists but is not a directory",
-                ));
-            }
 
-            for object_entry in sorted_directory_entries(&shard_path)? {
-                if is_hidden_storage_entry(&object_entry) {
-                    continue;
-                }
-
-                let object_path = object_entry.path();
-                let Some(object_metadata) = storage_path_metadata(&object_path)? else {
-                    continue;
-                };
-                if !object_metadata.is_dir() {
-                    return Err(corrupt_state(
-                        object_path,
-                        "visible object path exists but is not a directory",
-                    ));
-                }
-
-                let metadata = self
-                    .read_listed_object_metadata(bucket, &object_path.join(OBJECT_METADATA_FILE))?;
-                if visit(metadata)? == VisibleCommittedObjectVisit::Stop {
-                    return Ok(());
-                }
+            if self.visit_visible_committed_object_shard(bucket, &shard_path, &mut visit)?
+                == VisibleCommittedObjectVisit::Stop
+            {
+                return Ok(());
             }
         }
 
         Ok(())
+    }
+
+    fn visit_visible_committed_object_shard<F>(
+        &self,
+        bucket: &BucketName,
+        shard_path: &Path,
+        visit: &mut F,
+    ) -> Result<VisibleCommittedObjectVisit, StorageError>
+    where
+        F: FnMut(StoredObjectMetadata) -> Result<VisibleCommittedObjectVisit, StorageError>,
+    {
+        for object_entry in sorted_directory_entries(shard_path)? {
+            let Some(object_path) = visible_storage_directory_path(
+                &object_entry,
+                "visible object path exists but is not a directory",
+            )?
+            else {
+                continue;
+            };
+
+            let metadata =
+                self.read_listed_object_metadata(bucket, &object_path.join(OBJECT_METADATA_FILE))?;
+            if visit(metadata)? == VisibleCommittedObjectVisit::Stop {
+                return Ok(VisibleCommittedObjectVisit::Stop);
+            }
+        }
+
+        Ok(VisibleCommittedObjectVisit::Continue)
     }
 }
 
@@ -817,6 +821,25 @@ fn is_hidden_storage_entry(entry: &fs::DirEntry) -> bool {
         .file_name()
         .to_str()
         .is_some_and(|file_name| file_name.starts_with('.'))
+}
+
+fn visible_storage_directory_path(
+    entry: &fs::DirEntry,
+    not_directory_message: &'static str,
+) -> Result<Option<PathBuf>, StorageError> {
+    if is_hidden_storage_entry(entry) {
+        return Ok(None);
+    }
+
+    let path = entry.path();
+    let Some(metadata) = storage_path_metadata(&path)? else {
+        return Ok(None);
+    };
+    if !metadata.is_dir() {
+        return Err(corrupt_state(path, not_directory_message));
+    }
+
+    Ok(Some(path))
 }
 
 fn directory_has_entries(path: &Path) -> Result<bool, StorageError> {
