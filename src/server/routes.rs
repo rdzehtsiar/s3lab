@@ -91,7 +91,7 @@ pub async fn handle_request(
     let is_head = method == Method::HEAD;
     let request_id = state.next_request_id();
 
-    match resolve_operation(&method, &uri) {
+    let response = match resolve_operation(&method, &uri) {
         Ok(route_match) => {
             execute_operation(
                 state,
@@ -99,12 +99,28 @@ pub async fn handle_request(
                 body,
                 route_match.operation,
                 is_head,
-                request_id,
+                request_id.clone(),
             )
             .await
         }
         Err(rejection) => route_error_response(rejection, is_head, &request_id),
-    }
+    };
+    log_request_outcome(&method, &uri, response.status(), &request_id);
+    response
+}
+
+fn log_request_outcome(method: &Method, uri: &Uri, status: StatusCode, request_id: &S3RequestId) {
+    tracing::info!(
+        method = %method,
+        path = %safe_log_path(uri),
+        status = status.as_u16(),
+        request_id = %request_id.as_str(),
+        "request completed"
+    );
+}
+
+fn safe_log_path(uri: &Uri) -> &str {
+    uri.path()
 }
 
 fn resolve_root_operation(
@@ -1000,7 +1016,7 @@ const UNSUPPORTED_PUT_OBJECT_HEADER_PREFIXES: &[&str] = &["x-amz-grant-", "x-amz
 mod tests {
     use super::{
         resolve_operation, s3_error_code_from_storage_error, s3_error_from_storage_error,
-        RouteScope,
+        safe_log_path, RouteScope,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::error::{S3ErrorCode, S3RequestId, STATIC_REQUEST_ID};
@@ -1016,6 +1032,15 @@ mod tests {
 
         assert_eq!(route.scope, RouteScope::PathStyle);
         assert_eq!(route.operation, S3Operation::ListBuckets);
+    }
+
+    #[test]
+    fn safe_log_path_omits_query_string_credentials() {
+        let uri = Uri::from_static(
+            "/example-bucket/object.txt?X-Amz-Credential=secret&X-Amz-Signature=signature",
+        );
+
+        assert_eq!(safe_log_path(&uri), "/example-bucket/object.txt");
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::fmt::{Display, Formatter};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug)]
 pub enum CliError {
@@ -176,6 +177,8 @@ where
     W: Write,
     F: std::future::Future<Output = Result<(), CliError>> + Send + 'static,
 {
+    init_tracing();
+
     config.validate()?;
     config.ensure_data_dir()?;
     let listener = crate::server::bind_listener(&config).await?;
@@ -184,6 +187,11 @@ where
     writeln!(writer, "S3 endpoint:  {endpoint}")?;
     writeln!(writer, "Data dir:     {}", config.data_dir.display())?;
     writer.flush()?;
+    tracing::info!(
+        endpoint = %endpoint,
+        data_dir = %config.data_dir.display(),
+        "local server listening"
+    );
 
     let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel();
     let shutdown = async move {
@@ -200,6 +208,15 @@ where
     }
 
     Ok(())
+}
+
+fn init_tracing() {
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("s3lab=info"));
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .try_init();
 }
 
 #[cfg(test)]
@@ -223,7 +240,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{run_with_writer, run_with_writer_until, Cli, CliError};
+    use super::{init_tracing, run_with_writer, run_with_writer_until, Cli, CliError};
     use clap::{CommandFactory, Parser};
     use std::error::Error;
     use std::io::Write;
@@ -243,6 +260,12 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn tracing_initialization_is_idempotent_for_tests() {
+        init_tracing();
+        init_tracing();
     }
 
     #[tokio::test]
