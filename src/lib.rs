@@ -5,3 +5,4 @@ pub mod config;
 pub mod s3;
 pub mod server;
 pub mod storage;
+pub mod trace;

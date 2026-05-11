@@ -2,6 +2,7 @@
 
 use crate::s3::error::S3RequestId;
 use crate::storage::Storage;
+use crate::trace::{NoopTraceSink, TraceEvent, TraceSink};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -9,6 +10,7 @@ use std::sync::Arc;
 pub struct ServerState {
     storage: Arc<dyn Storage + Send + Sync>,
     request_id_generator: Arc<dyn RequestIdGenerator>,
+    trace_sink: Arc<dyn TraceSink>,
 }
 
 pub trait RequestIdGenerator: Send + Sync {
@@ -30,13 +32,33 @@ impl ServerState {
         Self::with_request_id_generator(storage, SequentialRequestIdGenerator::default())
     }
 
+    pub fn with_trace_sink(
+        storage: impl Storage + Send + Sync + 'static,
+        trace_sink: impl TraceSink + 'static,
+    ) -> Self {
+        Self::with_request_id_generator_and_trace_sink(
+            storage,
+            SequentialRequestIdGenerator::default(),
+            trace_sink,
+        )
+    }
+
     pub fn with_request_id_generator(
         storage: impl Storage + Send + Sync + 'static,
         request_id_generator: impl RequestIdGenerator + 'static,
     ) -> Self {
+        Self::with_request_id_generator_and_trace_sink(storage, request_id_generator, NoopTraceSink)
+    }
+
+    pub fn with_request_id_generator_and_trace_sink(
+        storage: impl Storage + Send + Sync + 'static,
+        request_id_generator: impl RequestIdGenerator + 'static,
+        trace_sink: impl TraceSink + 'static,
+    ) -> Self {
         Self {
             storage: Arc::new(storage),
             request_id_generator: Arc::new(request_id_generator),
+            trace_sink: Arc::new(trace_sink),
         }
     }
 
@@ -53,6 +75,10 @@ impl ServerState {
 
     pub fn next_request_id(&self) -> S3RequestId {
         self.request_id_generator.next_request_id()
+    }
+
+    pub fn record_trace(&self, event: TraceEvent) {
+        self.trace_sink.record(event);
     }
 }
 
@@ -88,6 +114,9 @@ impl RequestIdGenerator for FixedRequestIdGenerator {
 mod tests {
     use super::{RequestIdGenerator, SequentialRequestIdGenerator, ServerState};
     use crate::storage::fs::FilesystemStorage;
+    use crate::trace::{
+        RecordingTraceSink, RequestReceivedTrace, RouteResolvedTrace, TraceEvent, TraceS3Operation,
+    };
 
     #[test]
     fn from_storage_wraps_filesystem_backed_state() {
@@ -113,6 +142,37 @@ mod tests {
             cloned.storage().list_buckets().expect("list from clone"),
             state.storage().list_buckets().expect("list from original")
         );
+    }
+
+    #[test]
+    fn from_storage_uses_noop_trace_sink() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let state = ServerState::from_storage(FilesystemStorage::new(temp_dir.path()));
+
+        state.record_trace(TraceEvent::RequestReceived(RequestReceivedTrace::new(
+            "s3lab-0000000000000001",
+            "GET",
+            "/",
+            ["authorization"],
+        )));
+    }
+
+    #[test]
+    fn trace_sink_can_be_injected_and_records_events() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let sink = RecordingTraceSink::default();
+        let recorded = sink.clone();
+        let state = ServerState::with_trace_sink(FilesystemStorage::new(temp_dir.path()), sink);
+        let event = TraceEvent::RouteResolved(RouteResolvedTrace::new(
+            "s3lab-0000000000000001",
+            "GET",
+            "/",
+            TraceS3Operation::ListBuckets,
+        ));
+
+        state.record_trace(event.clone());
+
+        assert_eq!(recorded.events(), vec![event]);
     }
 
     #[test]
