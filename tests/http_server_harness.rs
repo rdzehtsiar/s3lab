@@ -253,6 +253,63 @@ async fn list_objects_prefix_over_real_http() {
 }
 
 #[tokio::test]
+async fn list_objects_delimiter_over_real_http() {
+    let server = TestServer::start().await;
+
+    assert_eq!(
+        request(Method::PUT, &server.url("/bucket-a"), Bytes::new(), &[])
+            .await
+            .expect("create bucket")
+            .status(),
+        StatusCode::OK
+    );
+
+    for (key, body) in [
+        ("logs/a.txt", "aa"),
+        ("logs/archive/1.txt", "archive"),
+        ("logs/z.txt", "z"),
+        ("images/a.txt", "excluded"),
+    ] {
+        assert_eq!(
+            request(
+                Method::PUT,
+                &server.url(&format!("/bucket-a/{key}")),
+                Bytes::from(body.as_bytes().to_vec()),
+                &[],
+            )
+            .await
+            .expect("put object")
+            .status(),
+            StatusCode::OK
+        );
+    }
+
+    let list = request(
+        Method::GET,
+        &server.url("/bucket-a?list-type=2&prefix=logs%2F&delimiter=%2F"),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("list delimiter objects over HTTP");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = response_text(list).await.expect("list delimiter body");
+    assert_ordered_contains(
+        &list_body,
+        &[
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>bucket-a</Name><Prefix>logs/</Prefix><Delimiter>/</Delimiter><KeyCount>3</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
+            "<Contents><Key>logs/a.txt</Key><LastModified>",
+            "</LastModified><ETag>&quot;4124bc0a9335c27f086f24ba207a4912&quot;</ETag><Size>2</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            "<CommonPrefixes><Prefix>logs/archive/</Prefix></CommonPrefixes>",
+            "<Contents><Key>logs/z.txt</Key><LastModified>",
+            "</LastModified><ETag>&quot;fbade9e36a3f36d3d676c1b808451dd7&quot;</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>",
+        ],
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn list_objects_v2_uses_fixed_clock_through_real_http_harness() {
     let temp_dir = TempDir::new().expect("create fixed-clock data dir");
     let data_dir = temp_dir.path().to_path_buf();

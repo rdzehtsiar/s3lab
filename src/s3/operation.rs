@@ -34,6 +34,7 @@ pub enum S3Operation {
     ListObjectsV2 {
         bucket: BucketName,
         prefix: Option<ObjectKey>,
+        delimiter: Option<String>,
         continuation_token: Option<String>,
         max_keys: usize,
     },

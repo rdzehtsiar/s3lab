@@ -4,8 +4,8 @@ use s3lab::s3::bucket::BucketName;
 use s3lab::s3::object::{ObjectKey, MAX_OBJECT_KEY_UTF8_BYTES};
 use s3lab::storage::fs::{FilesystemStorage, StorageClock};
 use s3lab::storage::{
-    ListObjectsOptions, PutObjectRequest, Storage, StorageError, StoredObjectMetadata,
-    STORAGE_ROOT_DIR,
+    ListObjectsOptions, ObjectListingEntry, PutObjectRequest, Storage, StorageError,
+    StoredObjectMetadata, STORAGE_ROOT_DIR,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -1257,6 +1257,170 @@ fn list_objects_accepts_carriage_return_prefix() {
 }
 
 #[test]
+fn list_objects_groups_common_prefixes_with_prefix_and_delimiter() {
+    let (_temp_dir, storage) = storage_with_objects([
+        "photos/z.txt",
+        "photos/2026/a.jpg",
+        "logs/a.txt",
+        "photos/root.txt",
+        "photos/2025/a.jpg",
+        "photos/2026/b.jpg",
+    ]);
+    let bucket = BucketName::new("example-bucket");
+
+    let listing = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                prefix: Some(ObjectKey::new("photos/")),
+                delimiter: Some("/".to_owned()),
+                ..ListObjectsOptions::default()
+            },
+        )
+        .expect("list objects with prefix and delimiter");
+
+    assert_eq!(
+        listing_entry_markers(&listing.entries),
+        [
+            "prefix:photos/2025/",
+            "prefix:photos/2026/",
+            "object:photos/root.txt",
+            "object:photos/z.txt",
+        ]
+        .map(str::to_owned)
+    );
+    assert_eq!(
+        object_keys(&listing.objects),
+        ["photos/root.txt", "photos/z.txt"]
+    );
+    assert_eq!(
+        object_key_values(&listing.common_prefixes),
+        ["photos/2025/", "photos/2026/"]
+    );
+    assert!(!listing.is_truncated);
+}
+
+#[test]
+fn list_objects_sorts_and_deduplicates_common_prefixes() {
+    let (_temp_dir, storage) =
+        storage_with_objects(["b/2.txt", "a", "a/2.txt", "b/1.txt", "a/1.txt"]);
+    let bucket = BucketName::new("example-bucket");
+
+    let listing = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                delimiter: Some("/".to_owned()),
+                ..ListObjectsOptions::default()
+            },
+        )
+        .expect("list objects with delimiter");
+
+    assert_eq!(
+        listing_entry_markers(&listing.entries),
+        ["object:a", "prefix:a/", "prefix:b/"].map(str::to_owned)
+    );
+    assert_eq!(object_keys(&listing.objects), ["a"]);
+    assert_eq!(object_key_values(&listing.common_prefixes), ["a/", "b/"]);
+}
+
+#[test]
+fn list_objects_delimiter_pagination_counts_prefixes_and_objects() {
+    let (_temp_dir, storage) = storage_with_objects(["d/1.txt", "a.txt", "c.txt", "b/1.txt"]);
+    let bucket = BucketName::new("example-bucket");
+
+    let first_page = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                delimiter: Some("/".to_owned()),
+                continuation_token: None,
+                max_keys: 2,
+                ..ListObjectsOptions::default()
+            },
+        )
+        .expect("list first delimiter page");
+
+    assert_eq!(
+        listing_entry_markers(&first_page.entries),
+        ["object:a.txt", "prefix:b/"].map(str::to_owned)
+    );
+    assert_eq!(
+        first_page.objects.len() + first_page.common_prefixes.len(),
+        2
+    );
+    assert!(first_page.is_truncated);
+    assert_eq!(
+        first_page.next_continuation_token.as_deref(),
+        Some(continuation_token_for("c.txt").as_str())
+    );
+
+    let second_page = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                delimiter: Some("/".to_owned()),
+                continuation_token: first_page.next_continuation_token,
+                max_keys: 2,
+                ..ListObjectsOptions::default()
+            },
+        )
+        .expect("list second delimiter page");
+
+    assert_eq!(
+        listing_entry_markers(&second_page.entries),
+        ["object:c.txt", "prefix:d/"].map(str::to_owned)
+    );
+    assert!(!second_page.is_truncated);
+}
+
+#[test]
+fn list_objects_max_keys_zero_with_delimiter_returns_next_visible_entry_token() {
+    let (_temp_dir, storage) = storage_with_objects(["b.txt", "a/1.txt"]);
+    let bucket = BucketName::new("example-bucket");
+
+    let first_page = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                delimiter: Some("/".to_owned()),
+                continuation_token: None,
+                max_keys: 0,
+                ..ListObjectsOptions::default()
+            },
+        )
+        .expect("list first zero max keys delimiter page");
+
+    assert!(first_page.entries.is_empty());
+    assert!(first_page.objects.is_empty());
+    assert!(first_page.common_prefixes.is_empty());
+    assert!(first_page.is_truncated);
+    assert_eq!(
+        first_page.next_continuation_token.as_deref(),
+        Some(continuation_token_for("a/").as_str())
+    );
+
+    let second_page = storage
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                delimiter: Some("/".to_owned()),
+                continuation_token: first_page.next_continuation_token,
+                max_keys: 0,
+                ..ListObjectsOptions::default()
+            },
+        )
+        .expect("list second zero max keys delimiter page");
+
+    assert!(second_page.entries.is_empty());
+    assert!(second_page.is_truncated);
+    assert_eq!(
+        second_page.next_continuation_token.as_deref(),
+        Some(continuation_token_for("b.txt").as_str())
+    );
+}
+
+#[test]
 fn list_objects_ignores_hidden_incomplete_shards_and_object_dirs() {
     let (temp_dir, storage) = storage();
     let bucket = BucketName::new("example-bucket");
@@ -1457,6 +1621,7 @@ fn list_objects_paginates_with_tokens_for_next_unreturned_key() {
             &bucket,
             ListObjectsOptions {
                 prefix: None,
+                delimiter: None,
                 continuation_token: None,
                 max_keys: 2,
             },
@@ -1477,6 +1642,7 @@ fn list_objects_paginates_with_tokens_for_next_unreturned_key() {
             &bucket,
             ListObjectsOptions {
                 prefix: None,
+                delimiter: None,
                 continuation_token: first_page.next_continuation_token,
                 max_keys: 2,
             },
@@ -1498,6 +1664,7 @@ fn list_objects_paginates_after_prefix_filtering() {
             &bucket,
             ListObjectsOptions {
                 prefix: Some(ObjectKey::new("images/")),
+                delimiter: None,
                 continuation_token: None,
                 max_keys: 1,
             },
@@ -1517,6 +1684,7 @@ fn list_objects_paginates_after_prefix_filtering() {
             &bucket,
             ListObjectsOptions {
                 prefix: Some(ObjectKey::new("images/")),
+                delimiter: None,
                 continuation_token: first_page.next_continuation_token,
                 max_keys: 1,
             },
@@ -1537,6 +1705,7 @@ fn list_objects_max_keys_zero_returns_truncated_token_when_matching_objects_exis
             &bucket,
             ListObjectsOptions {
                 prefix: None,
+                delimiter: None,
                 continuation_token: None,
                 max_keys: 0,
             },
@@ -1562,6 +1731,7 @@ fn list_objects_max_keys_zero_continuation_token_advances_to_next_key() {
             &bucket,
             ListObjectsOptions {
                 prefix: None,
+                delimiter: None,
                 continuation_token: None,
                 max_keys: 0,
             },
@@ -1580,6 +1750,7 @@ fn list_objects_max_keys_zero_continuation_token_advances_to_next_key() {
             &bucket,
             ListObjectsOptions {
                 prefix: None,
+                delimiter: None,
                 continuation_token: first_page.next_continuation_token,
                 max_keys: 0,
             },
@@ -1604,6 +1775,7 @@ fn list_objects_max_keys_zero_is_not_truncated_without_matching_objects() {
             &bucket,
             ListObjectsOptions {
                 prefix: Some(ObjectKey::new("missing/")),
+                delimiter: None,
                 continuation_token: None,
                 max_keys: 0,
             },
@@ -1678,6 +1850,7 @@ fn list_objects_rejects_malformed_continuation_tokens() {
                 &bucket,
                 ListObjectsOptions {
                     prefix: None,
+                    delimiter: None,
                     continuation_token: Some(token.to_owned()),
                     max_keys: 1000,
                 },
@@ -1705,6 +1878,7 @@ fn list_objects_resumes_at_next_key_when_token_key_was_deleted() {
             &bucket,
             ListObjectsOptions {
                 prefix: None,
+                delimiter: None,
                 continuation_token: Some(continuation_token_for("b.txt")),
                 max_keys: 1000,
             },
@@ -1822,6 +1996,20 @@ fn object_keys(metadata: &[StoredObjectMetadata]) -> Vec<&str> {
         .iter()
         .map(|object| object.key.as_str())
         .collect::<Vec<_>>()
+}
+
+fn object_key_values(keys: &[ObjectKey]) -> Vec<&str> {
+    keys.iter().map(ObjectKey::as_str).collect::<Vec<_>>()
+}
+
+fn listing_entry_markers(entries: &[ObjectListingEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| match entry {
+            ObjectListingEntry::Object(object) => format!("object:{}", object.key.as_str()),
+            ObjectListingEntry::CommonPrefix(prefix) => format!("prefix:{}", prefix.as_str()),
+        })
+        .collect()
 }
 
 fn continuation_token_for(key: &str) -> String {

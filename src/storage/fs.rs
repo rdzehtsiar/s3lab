@@ -2,8 +2,9 @@
 
 use super::key::{encode_bucket_name, encode_object_key, EncodedObjectKey};
 use super::{
-    BucketSummary, ListObjectsOptions, ObjectListing, PutObjectRequest, Storage, StorageError,
-    StoredObject, StoredObjectMetadata, DEFAULT_OBJECT_CONTENT_TYPE, STORAGE_ROOT_DIR,
+    BucketSummary, ListObjectsOptions, ObjectListing, ObjectListingEntry, PutObjectRequest,
+    Storage, StorageError, StoredObject, StoredObjectMetadata, DEFAULT_OBJECT_CONTENT_TYPE,
+    STORAGE_ROOT_DIR,
 };
 use crate::s3::bucket::{is_valid_s3_bucket_name, BucketName};
 use crate::s3::object::{is_valid_s3_object_key_prefix, ObjectKey};
@@ -274,6 +275,13 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         {
             return Err(invalid_list_objects_prefix());
         }
+        if options
+            .delimiter
+            .as_ref()
+            .is_some_and(|delimiter| delimiter != "/")
+        {
+            return Err(invalid_list_objects_delimiter());
+        }
         let resume_key = options
             .continuation_token
             .as_deref()
@@ -284,7 +292,9 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         if !path_exists(&objects_dir)? {
             return Ok(ObjectListing {
                 bucket: bucket.clone(),
+                entries: Vec::new(),
                 objects: Vec::new(),
+                common_prefixes: Vec::new(),
                 max_keys: options.max_keys,
                 is_truncated: false,
                 next_continuation_token: None,
@@ -306,34 +316,42 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         })?;
 
         objects.sort_by(|left, right| left.key.cmp(&right.key));
+        let entries =
+            visible_list_objects_entries(objects, options.prefix.as_ref(), &options.delimiter);
         let start_index = resume_key.as_ref().map_or(0, |resume_key| {
-            objects.partition_point(|object| object.key < *resume_key)
+            entries.partition_point(|entry| entry.marker() < resume_key)
         });
         if options.max_keys == 0 {
             let start_index = resume_key.as_ref().map_or(0, |resume_key| {
-                objects.partition_point(|object| object.key <= *resume_key)
+                entries.partition_point(|entry| entry.marker() <= resume_key)
             });
-            let next_continuation_token = objects
+            let next_continuation_token = entries
                 .get(start_index)
-                .map(|object| encode_continuation_token(&object.key));
+                .map(|entry| encode_continuation_token(entry.marker()));
             return Ok(ObjectListing {
                 bucket: bucket.clone(),
+                entries: Vec::new(),
                 objects: Vec::new(),
+                common_prefixes: Vec::new(),
                 max_keys: options.max_keys,
                 is_truncated: next_continuation_token.is_some(),
                 next_continuation_token,
             });
         }
 
-        let remaining_objects = &objects[start_index..];
-        let page_count = remaining_objects.len().min(options.max_keys);
-        let next_continuation_token = remaining_objects
+        let remaining_entries = &entries[start_index..];
+        let page_count = remaining_entries.len().min(options.max_keys);
+        let next_continuation_token = remaining_entries
             .get(page_count)
-            .map(|object| encode_continuation_token(&object.key));
+            .map(|entry| encode_continuation_token(entry.marker()));
+        let page_entries = remaining_entries[..page_count].to_vec();
+        let (page_objects, page_common_prefixes) = object_listing_parts(&page_entries);
 
         Ok(ObjectListing {
             bucket: bucket.clone(),
-            objects: remaining_objects[..page_count].to_vec(),
+            entries: page_entries,
+            objects: page_objects,
+            common_prefixes: page_common_prefixes,
             max_keys: options.max_keys,
             is_truncated: next_continuation_token.is_some(),
             next_continuation_token,
@@ -568,6 +586,64 @@ enum VisibleCommittedObjectVisit {
     Stop,
 }
 
+impl ObjectListingEntry {
+    fn marker(&self) -> &ObjectKey {
+        match self {
+            Self::Object(metadata) => &metadata.key,
+            Self::CommonPrefix(prefix) => prefix,
+        }
+    }
+}
+
+fn visible_list_objects_entries(
+    objects: Vec<StoredObjectMetadata>,
+    prefix: Option<&ObjectKey>,
+    delimiter: &Option<String>,
+) -> Vec<ObjectListingEntry> {
+    if delimiter.is_none() {
+        return objects
+            .into_iter()
+            .map(ObjectListingEntry::Object)
+            .collect();
+    }
+
+    let prefix = prefix.map_or("", ObjectKey::as_str);
+    let mut entries = BTreeMap::new();
+    for object in objects {
+        let remaining_key = object
+            .key
+            .as_str()
+            .strip_prefix(prefix)
+            .expect("objects were filtered by prefix before delimiter grouping");
+        if let Some(delimiter_index) = remaining_key.find('/') {
+            let common_prefix =
+                ObjectKey::new(format!("{}{}", prefix, &remaining_key[..=delimiter_index]));
+            entries
+                .entry(common_prefix.clone())
+                .or_insert(ObjectListingEntry::CommonPrefix(common_prefix));
+        } else {
+            entries.insert(object.key.clone(), ObjectListingEntry::Object(object));
+        }
+    }
+
+    entries.into_values().collect()
+}
+
+fn object_listing_parts(
+    entries: &[ObjectListingEntry],
+) -> (Vec<StoredObjectMetadata>, Vec<ObjectKey>) {
+    let mut objects = Vec::new();
+    let mut common_prefixes = Vec::new();
+    for entry in entries {
+        match entry {
+            ObjectListingEntry::Object(metadata) => objects.push(metadata.clone()),
+            ObjectListingEntry::CommonPrefix(prefix) => common_prefixes.push(prefix.clone()),
+        }
+    }
+
+    (objects, common_prefixes)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct BucketRecord {
     bucket: String,
@@ -711,6 +787,12 @@ fn invalid_continuation_token() -> StorageError {
 fn invalid_list_objects_prefix() -> StorageError {
     StorageError::InvalidArgument {
         message: "invalid ListObjectsV2 prefix".to_owned(),
+    }
+}
+
+fn invalid_list_objects_delimiter() -> StorageError {
+    StorageError::InvalidArgument {
+        message: "unsupported ListObjectsV2 delimiter".to_owned(),
     }
 }
 

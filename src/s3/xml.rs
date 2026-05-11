@@ -21,10 +21,16 @@ pub struct ListBucketXml {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ListObjectsV2Xml {
     pub bucket: String,
-    pub objects: Vec<ListObjectXml>,
+    pub entries: Vec<ListObjectsV2XmlEntry>,
     pub max_keys: usize,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ListObjectsV2XmlEntry {
+    Object(ListObjectXml),
+    CommonPrefix(String),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -89,6 +95,7 @@ pub fn list_buckets_response_xml(listing: &ListBucketsXml) -> String {
 pub fn list_objects_v2_response_xml(
     listing: &ListObjectsV2Xml,
     prefix: Option<&str>,
+    delimiter: Option<&str>,
     continuation_token: Option<&str>,
 ) -> String {
     let mut writer = Writer::new(Vec::new());
@@ -99,7 +106,10 @@ pub fn list_objects_v2_response_xml(
         .expect("writing XML start element to memory cannot fail");
     write_text_element(&mut writer, "Name", listing.bucket.as_str());
     write_text_element(&mut writer, "Prefix", prefix.unwrap_or(""));
-    write_text_element(&mut writer, "KeyCount", &listing.objects.len().to_string());
+    if let Some(delimiter) = delimiter {
+        write_text_element(&mut writer, "Delimiter", delimiter);
+    }
+    write_text_element(&mut writer, "KeyCount", &listing.entries.len().to_string());
     write_text_element(&mut writer, "MaxKeys", &listing.max_keys.to_string());
     if let Some(token) = continuation_token {
         write_text_element(&mut writer, "ContinuationToken", token);
@@ -114,22 +124,19 @@ pub fn list_objects_v2_response_xml(
         },
     );
 
-    for object in &listing.objects {
-        writer
-            .write_event(Event::Start(BytesStart::new("Contents")))
-            .expect("writing XML start element to memory cannot fail");
-        write_text_element(&mut writer, "Key", object.key.as_str());
-        write_text_element(
-            &mut writer,
-            "LastModified",
-            &s3_xml_timestamp(object.last_modified),
-        );
-        write_text_element(&mut writer, "ETag", &object.etag);
-        write_text_element(&mut writer, "Size", &object.content_length.to_string());
-        write_text_element(&mut writer, "StorageClass", "STANDARD");
-        writer
-            .write_event(Event::End(BytesEnd::new("Contents")))
-            .expect("writing XML end element to memory cannot fail");
+    for entry in &listing.entries {
+        match entry {
+            ListObjectsV2XmlEntry::Object(object) => write_object_xml(&mut writer, object),
+            ListObjectsV2XmlEntry::CommonPrefix(prefix) => {
+                writer
+                    .write_event(Event::Start(BytesStart::new("CommonPrefixes")))
+                    .expect("writing XML start element to memory cannot fail");
+                write_text_element(&mut writer, "Prefix", prefix);
+                writer
+                    .write_event(Event::End(BytesEnd::new("CommonPrefixes")))
+                    .expect("writing XML end element to memory cannot fail");
+            }
+        }
     }
 
     if listing.is_truncated {
@@ -143,6 +150,24 @@ pub fn list_objects_v2_response_xml(
         .expect("writing XML end element to memory cannot fail");
 
     String::from_utf8(writer.into_inner()).expect("quick-xml writes valid UTF-8")
+}
+
+fn write_object_xml(writer: &mut Writer<Vec<u8>>, object: &ListObjectXml) {
+    writer
+        .write_event(Event::Start(BytesStart::new("Contents")))
+        .expect("writing XML start element to memory cannot fail");
+    write_text_element(writer, "Key", object.key.as_str());
+    write_text_element(
+        writer,
+        "LastModified",
+        &s3_xml_timestamp(object.last_modified),
+    );
+    write_text_element(writer, "ETag", &object.etag);
+    write_text_element(writer, "Size", &object.content_length.to_string());
+    write_text_element(writer, "StorageClass", "STANDARD");
+    writer
+        .write_event(Event::End(BytesEnd::new("Contents")))
+        .expect("writing XML end element to memory cannot fail");
 }
 
 fn write_xml_declaration(writer: &mut Writer<Vec<u8>>) {

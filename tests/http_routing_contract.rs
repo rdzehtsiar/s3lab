@@ -84,6 +84,7 @@ fn supported_routes_resolve_to_explicit_operations() {
             S3Operation::ListObjectsV2 {
                 bucket: BucketName::new("example-bucket"),
                 prefix: None,
+                delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
             },
@@ -94,6 +95,7 @@ fn supported_routes_resolve_to_explicit_operations() {
             S3Operation::ListObjectsV2 {
                 bucket: BucketName::new("example-bucket"),
                 prefix: Some(ObjectKey::new("images/")),
+                delimiter: None,
                 continuation_token: Some("page/2".to_owned()),
                 max_keys: 25,
             },
@@ -104,8 +106,20 @@ fn supported_routes_resolve_to_explicit_operations() {
             S3Operation::ListObjectsV2 {
                 bucket: BucketName::new("example-bucket"),
                 prefix: None,
+                delimiter: None,
                 continuation_token: None,
                 max_keys: 0,
+            },
+        ),
+        (
+            Method::GET,
+            "/example-bucket?list-type=2&delimiter=%2F",
+            S3Operation::ListObjectsV2 {
+                bucket: BucketName::new("example-bucket"),
+                prefix: None,
+                delimiter: Some("/".to_owned()),
+                continuation_token: None,
+                max_keys: 1000,
             },
         ),
     ];
@@ -337,6 +351,7 @@ fn list_objects_v2_prefix_accepts_carriage_return() {
         S3Operation::ListObjectsV2 {
             bucket: BucketName::new("example-bucket"),
             prefix: Some(ObjectKey::new("logs\r")),
+            delimiter: None,
             continuation_token: None,
             max_keys: 1000,
         }
@@ -578,6 +593,28 @@ async fn list_objects_v2_continuation_token_calls_storage() {
 }
 
 #[tokio::test]
+async fn list_objects_v2_slash_delimiter_calls_storage() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(ServerState::from_storage(storage));
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=2&delimiter=%2F",
+            Body::empty(),
+        ))
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        calls.lock().expect("calls lock").as_slice(),
+        ["list_objects"]
+    );
+}
+
+#[tokio::test]
 async fn list_objects_v2_max_keys_two_returns_paged_xml() {
     let temp_dir = TempDir::new().expect("temp dir");
     let app = router(ServerState::from_storage(FilesystemStorage::with_clock(
@@ -814,6 +851,26 @@ async fn malformed_list_objects_v2_max_keys_values_are_invalid_argument() {
 }
 
 #[tokio::test]
+async fn list_objects_v2_non_slash_delimiter_is_invalid_argument_without_storage_call() {
+    for uri in [
+        "/bucket?list-type=2&delimiter=.",
+        "/bucket?list-type=2&delimiter=%7C",
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(ServerState::from_storage(storage));
+
+        let response = app
+            .oneshot(request(Method::GET, uri, Body::empty()))
+            .await
+            .expect("route response");
+
+        assert_invalid_argument_xml(response, "/bucket").await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
 async fn list_objects_v2_xml_invalid_prefix_returns_invalid_argument_without_storage_call() {
     for uri in [
         "/bucket?list-type=2&prefix=logs%00",
@@ -836,7 +893,6 @@ async fn list_objects_v2_xml_invalid_prefix_returns_invalid_argument_without_sto
 #[tokio::test]
 async fn list_objects_v2_unsupported_params_are_not_implemented_without_storage_call() {
     for uri in [
-        "/bucket?list-type=2&delimiter=%2F",
         "/bucket?list-type=2&encoding-type=url",
         "/bucket?list-type=2&start-after=a.txt",
         "/bucket?list-type=2&fetch-owner=true",
@@ -2453,7 +2509,9 @@ impl Storage for RecordingStorage {
         self.record("list_objects");
         Ok(ObjectListing {
             bucket: bucket.clone(),
+            entries: Vec::new(),
             objects: Vec::new(),
+            common_prefixes: Vec::new(),
             max_keys: options.max_keys,
             is_truncated: false,
             next_continuation_token: None,

@@ -7,12 +7,12 @@ use crate::s3::operation::S3Operation;
 use crate::s3::time::http_date;
 use crate::s3::xml::{
     error_response_xml, list_buckets_response_xml, list_objects_v2_response_xml, ListBucketXml,
-    ListBucketsXml, ListObjectXml, ListObjectsV2Xml, XML_CONTENT_TYPE,
+    ListBucketsXml, ListObjectXml, ListObjectsV2Xml, ListObjectsV2XmlEntry, XML_CONTENT_TYPE,
 };
 use crate::server::state::ServerState;
 use crate::storage::{
-    BucketSummary, ListObjectsOptions, ObjectListing, PutObjectRequest, StorageError, StoredObject,
-    StoredObjectMetadata,
+    BucketSummary, ListObjectsOptions, ObjectListing, ObjectListingEntry, PutObjectRequest,
+    StorageError, StoredObject, StoredObjectMetadata,
 };
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::State;
@@ -185,6 +185,15 @@ fn resolve_bucket_get_operation(
             resource.to_owned(),
         ));
     }
+    if query
+        .get(DELIMITER)
+        .is_some_and(|delimiter| delimiter != "/")
+    {
+        return Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        ));
+    }
 
     if query.has_unsupported_list_objects_v2_param() {
         return Err(RouteRejection::new(
@@ -196,6 +205,7 @@ fn resolve_bucket_get_operation(
     Ok(S3Operation::ListObjectsV2 {
         bucket,
         prefix: query.get(PREFIX).cloned().map(ObjectKey::new),
+        delimiter: query.get(DELIMITER).cloned(),
         continuation_token: query.get(CONTINUATION_TOKEN).cloned(),
         max_keys,
     })
@@ -328,12 +338,14 @@ async fn execute_operation(
         S3Operation::ListObjectsV2 {
             bucket,
             prefix,
+            delimiter,
             continuation_token,
             max_keys,
         } => {
             let request_continuation_token = continuation_token.clone();
             let options = ListObjectsOptions {
                 prefix: prefix.clone(),
+                delimiter: delimiter.clone(),
                 continuation_token,
                 max_keys,
             };
@@ -345,6 +357,7 @@ async fn execute_operation(
                     xml_response(list_objects_v2_response_xml(
                         &listing,
                         prefix.as_ref().map(ObjectKey::as_str),
+                        delimiter.as_deref(),
                         request_continuation_token.as_deref(),
                     ))
                 })
@@ -670,14 +683,21 @@ fn list_buckets_xml(buckets: Vec<BucketSummary>) -> ListBucketsXml {
 fn list_objects_v2_xml(listing: ObjectListing) -> ListObjectsV2Xml {
     ListObjectsV2Xml {
         bucket: listing.bucket.as_str().to_owned(),
-        objects: listing
-            .objects
+        entries: listing
+            .entries
             .into_iter()
-            .map(|object| ListObjectXml {
-                key: object.key.as_str().to_owned(),
-                etag: object.etag,
-                content_length: object.content_length,
-                last_modified: object.last_modified,
+            .map(|entry| match entry {
+                ObjectListingEntry::Object(object) => {
+                    ListObjectsV2XmlEntry::Object(ListObjectXml {
+                        key: object.key.as_str().to_owned(),
+                        etag: object.etag,
+                        content_length: object.content_length,
+                        last_modified: object.last_modified,
+                    })
+                }
+                ObjectListingEntry::CommonPrefix(prefix) => {
+                    ListObjectsV2XmlEntry::CommonPrefix(prefix.as_str().to_owned())
+                }
             })
             .collect(),
         max_keys: listing.max_keys,
@@ -910,8 +930,7 @@ const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
     "object-lock",
 ];
 
-const UNSUPPORTED_LIST_OBJECTS_V2_PARAMS: &[&str] =
-    &[DELIMITER, ENCODING_TYPE, START_AFTER, FETCH_OWNER];
+const UNSUPPORTED_LIST_OBJECTS_V2_PARAMS: &[&str] = &[ENCODING_TYPE, START_AFTER, FETCH_OWNER];
 
 const UNSUPPORTED_PUT_OBJECT_HEADERS: &[&str] = &[
     "cache-control",

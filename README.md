@@ -40,7 +40,7 @@ Current Phase 1 behavior supports:
 
 - create, head, list, and delete buckets
 - put, get, head, list, and delete objects
-- `ListObjectsV2` with `prefix`, `max-keys`, and `continuation-token`
+- `ListObjectsV2` with `prefix`, `delimiter=/`, `max-keys`, and `continuation-token`
 - path-style localhost routing, such as `http://127.0.0.1:9000/example-bucket/object.txt`
 - S3-shaped XML responses and XML error responses
 - local filesystem persistence in the configured data directory

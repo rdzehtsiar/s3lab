@@ -84,15 +84,24 @@ pub struct StoredObjectMetadata {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ObjectListing {
     pub bucket: BucketName,
+    pub entries: Vec<ObjectListingEntry>,
     pub objects: Vec<StoredObjectMetadata>,
+    pub common_prefixes: Vec<ObjectKey>,
     pub max_keys: usize,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ObjectListingEntry {
+    Object(StoredObjectMetadata),
+    CommonPrefix(ObjectKey),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ListObjectsOptions {
     pub prefix: Option<ObjectKey>,
+    pub delimiter: Option<String>,
     pub continuation_token: Option<String>,
     pub max_keys: usize,
 }
@@ -101,6 +110,7 @@ impl Default for ListObjectsOptions {
     fn default() -> Self {
         Self {
             prefix: None,
+            delimiter: None,
             continuation_token: None,
             max_keys: 1000,
         }
@@ -160,6 +170,7 @@ mod tests {
             ListObjectsOptions::default(),
             ListObjectsOptions {
                 prefix: None,
+                delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
             }
@@ -214,7 +225,9 @@ mod tests {
     fn object_listing_preserves_bucket_objects_and_continuation_token() {
         let listing = ObjectListing {
             bucket: BucketName::new("example-bucket"),
+            entries: Vec::new(),
             objects: Vec::new(),
+            common_prefixes: Vec::new(),
             max_keys: 2,
             is_truncated: true,
             next_continuation_token: Some("token-1".to_owned()),
