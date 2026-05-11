@@ -17,6 +17,7 @@ This is not a general compatibility claim. Phase 1 smoke evidence only covers th
 - Phase 1 accepts signed client requests but does not validate SigV4 signatures yet.
 - Phase 1 supports path-style localhost routing, for example `http://127.0.0.1:9000/s3lab-smoke-bucket/object.txt`.
 - Virtual-host style routing, presigned URLs, and multipart uploads are deferred.
+- Phase 1 preserves valid `x-amz-meta-*` object metadata, normalizes metadata keys to lowercase, returns metadata on `GET` and `HEAD`, and rejects invalid, non-UTF8, or duplicate normalized metadata.
 
 ## Start S3Lab
 

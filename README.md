@@ -41,6 +41,7 @@ Current Phase 1 behavior supports:
 - create, head, list, and delete buckets
 - put, get, head, list, and delete objects
 - `ListObjectsV2` with `prefix`, `delimiter=/`, `max-keys`, and `continuation-token`
+- valid user metadata headers: `x-amz-meta-*` values are persisted, metadata keys are normalized to lowercase, and metadata is returned on `GET` and `HEAD`
 - path-style localhost routing, such as `http://127.0.0.1:9000/example-bucket/object.txt`
 - S3-shaped XML responses and XML error responses
 - local filesystem persistence in the configured data directory
@@ -59,6 +60,8 @@ Phase 1 is a narrow local endpoint for implemented bucket and object operations.
 - replay
 - failure injection
 - embedded or local UI
+
+Phase 1 rejects invalid user metadata, including an empty `x-amz-meta-` suffix, non-UTF8 metadata values, and duplicate metadata keys after lowercase normalization.
 
 Compatibility evidence is limited to the operations implemented in Phase 1 and the documented smoke recipes. Do not treat Phase 1 behavior as broad AWS S3 compatibility.
 
