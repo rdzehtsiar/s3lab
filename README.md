@@ -4,9 +4,9 @@
 [![codecov](https://codecov.io/gh/rdzehtsiar/s3lab/graph/badge.svg)](https://codecov.io/gh/rdzehtsiar/s3lab)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=rdzehtsiar_s3lab&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=rdzehtsiar_s3lab)
 
-S3Lab is planned as a fully offline S3 compatibility and protocol debugging lab for engineers who build, test, or troubleshoot S3-compatible workflows locally.
+S3Lab is an offline S3 compatibility and protocol debugging lab for engineers who build, test, or troubleshoot S3-compatible workflows locally.
 
-The intended experience is simple: download one binary, run it, point an AWS SDK or CLI at localhost, then inspect requests, debug compatibility issues, replay behavior, snapshot local state, and test failure scenarios without needing cloud access.
+The intended experience is simple: run the local endpoint, point an AWS SDK or CLI at localhost, then inspect and reproduce S3-shaped behavior without needing cloud access.
 
 ## What We Are Building
 
@@ -34,9 +34,43 @@ S3Lab is for engineers who need to answer practical questions such as:
 
 ## Project State
 
-This repository is currently at the public specification stage. The product direction and milestone plan exist, but the application itself has not been implemented yet.
+Phase 1 includes a local S3-shaped HTTP server backed by filesystem persistence. It is intended for local development and compatibility smoke testing, not production object storage.
 
-The immediate focus is to establish clear project intent, scope, limitations, and contribution direction before implementation begins. Early work should favor transparency, evidence-based compatibility claims, and a narrow offline-first product scope.
+Current Phase 1 behavior supports:
+
+- create, head, list, and delete buckets
+- put, get, head, list, and delete objects
+- `ListObjectsV2` with `prefix`, `max-keys`, and `continuation-token`
+- path-style localhost routing, such as `http://127.0.0.1:9000/example-bucket/object.txt`
+- S3-shaped XML responses and XML error responses
+- local filesystem persistence in the configured data directory
+
+This is not a general S3 compatibility claim. Compatibility should be treated as something to prove with focused tests and documented evidence.
+
+## Quick Start
+
+Run the Phase 1 server:
+
+```powershell
+cargo run -- serve
+```
+
+By default, S3Lab listens at `http://127.0.0.1:9000` and stores local data in `./s3lab-data`.
+
+Point AWS clients at the local endpoint and use dummy credentials. For example, with the AWS CLI:
+
+```powershell
+$env:AWS_ACCESS_KEY_ID = "s3lab"
+$env:AWS_SECRET_ACCESS_KEY = "s3lab-secret"
+$env:AWS_DEFAULT_REGION = "us-east-1"
+$env:AWS_EC2_METADATA_DISABLED = "true"
+
+aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket example-bucket
+```
+
+Use path-style localhost configuration for SDKs. Phase 1 accepts signed local requests with dummy credentials, so no cloud account is required.
+
+See [Phase 1 Smoke Tests](./docs/phase1-smoke-tests.md) for narrow AWS CLI, boto3, AWS SDK for JavaScript v3, and Go SDK recipes that exercise the implemented bucket and object lifecycle.
 
 ## Project Principles
 
@@ -54,7 +88,7 @@ The first product target is local S3-compatible development and debugging. Other
 
 ## Roadmap
 
-The current roadmap starts with project documentation and specification, then moves toward a minimal local S3-compatible server, request signing diagnostics, presigned URLs, snapshots, multipart uploads, an embedded local UI, compatibility testing, replay, failure injection, and eventually trusted packaged releases.
+The current roadmap continues from the Phase 1 local endpoint toward request signing diagnostics, presigned URLs, snapshots, multipart uploads, an embedded local UI, compatibility testing, replay, failure injection, and eventually trusted packaged releases.
 
 Compatibility should be treated as something to prove, not something to claim in advance.
 
