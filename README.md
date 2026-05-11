@@ -47,6 +47,21 @@ Current Phase 1 behavior supports:
 
 This is not a general S3 compatibility claim. Compatibility should be treated as something to prove with focused tests and documented evidence.
 
+## Phase 1 Limitations
+
+Phase 1 is a narrow local endpoint for implemented bucket and object operations. The following capabilities are deferred and are not implemented in Phase 1:
+
+- SigV4 signature validation
+- presigned URLs
+- virtual-host routing
+- multipart upload
+- snapshots
+- replay
+- failure injection
+- embedded or local UI
+
+Compatibility evidence is limited to the operations implemented in Phase 1 and the documented smoke recipes. Do not treat Phase 1 behavior as broad AWS S3 compatibility.
+
 ## Quick Start
 
 Run the Phase 1 server:
