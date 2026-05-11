@@ -4,6 +4,10 @@ use crate::s3::bucket::{is_valid_s3_bucket_name, BucketName};
 use crate::s3::error::{S3Error, S3ErrorCode, S3RequestId};
 use crate::s3::object::{is_valid_s3_object_key, is_valid_s3_object_key_prefix, ObjectKey};
 use crate::s3::operation::{ListObjectsEncoding, S3Operation};
+use crate::s3::sigv4::{
+    build_canonical_request, parse_authorization_header, verify_signature, SigV4Authorization,
+    SigV4ParseDiagnostic, SigV4VerificationDiagnostic, SigV4VerificationRequest,
+};
 use crate::s3::time::http_date;
 use crate::s3::xml::{
     error_response_xml, list_buckets_response_xml, list_objects_v2_response_xml, ListBucketXml,
@@ -14,21 +18,35 @@ use crate::storage::{
     BucketSummary, ListObjectsOptions, ObjectListing, ObjectListingEntry, PutObjectRequest,
     StorageError, StoredObject, StoredObjectMetadata,
 };
+use crate::trace::{
+    AuthDecision, AuthDecisionTrace, AuthRejectionReason, CanonicalRequestBuiltTrace,
+    RequestReceivedTrace, ResponseSentTrace, RouteRejectedTrace, RouteRejectionReason,
+    RouteResolvedTrace, SigV4ParseRejection, SigV4ParsedTrace, StorageMutation,
+    StorageMutationOutcome, StorageMutationTrace, TraceCredentialScope, TraceEvent,
+    TraceS3Operation,
+};
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::State;
 use axum::http::header::{
-    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE,
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE,
 };
 use axum::http::HeaderName;
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri};
 use http_body_util::LengthLimitError;
 use percent_encoding::percent_decode_str;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::PathBuf;
 
 const REQUEST_ID_HEADER: &str = "x-amz-request-id";
 const USER_METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
+const LOCAL_ACCESS_KEY_ID: &str = "s3lab";
+const LOCAL_SECRET_ACCESS_KEY: &str = "s3lab-secret";
+const X_AMZ_CONTENT_SHA256: &str = "x-amz-content-sha256";
+const X_AMZ_DATE: &str = "x-amz-date";
+const EMPTY_PAYLOAD_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 /// Phase 1 buffers PUT object bodies explicitly while allowing objects above Axum's 2 MiB default.
 pub const PHASE1_MAX_PUT_OBJECT_BODY_BYTES: usize = 8 * 1024 * 1024;
 const LIST_TYPE: &str = "list-type";
@@ -46,6 +64,8 @@ const X_AMZ_CHECKSUM_CRC64NVME: &str = "x-amz-checksum-crc64nvme";
 const X_AMZ_DECODED_CONTENT_LENGTH: &str = "x-amz-decoded-content-length";
 const X_AMZ_SDK_CHECKSUM_ALGORITHM: &str = "x-amz-sdk-checksum-algorithm";
 const X_AMZ_TRAILER: &str = "x-amz-trailer";
+const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+const STREAMING_PAYLOAD_PREFIX: &str = "STREAMING-";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RouteScope {
@@ -98,21 +118,33 @@ pub async fn handle_request(
 ) -> Response<Body> {
     let is_head = method == Method::HEAD;
     let request_id = state.next_request_id();
+    record_request_received(&state, &method, &uri, &headers, &request_id);
 
     let response = match resolve_operation(&method, &uri) {
         Ok(route_match) => {
-            execute_operation(
-                state,
-                headers,
-                body,
-                route_match.operation,
-                is_head,
-                request_id.clone(),
-            )
-            .await
+            record_route_resolved(&state, &method, &uri, &route_match.operation, &request_id);
+            if let Some(response) =
+                auth_rejection_response(&state, &method, &uri, &headers, is_head, &request_id)
+            {
+                response
+            } else {
+                execute_operation(
+                    state.clone(),
+                    headers,
+                    body,
+                    route_match.operation,
+                    is_head,
+                    request_id.clone(),
+                )
+                .await
+            }
         }
-        Err(rejection) => route_error_response(rejection, is_head, &request_id),
+        Err(rejection) => {
+            record_route_rejected(&state, &method, &uri, &rejection, &request_id);
+            route_error_response(rejection, is_head, &request_id)
+        }
     };
+    record_response_sent(&state, &request_id, &response);
     log_request_outcome(&method, &uri, response.status(), &request_id);
     response
 }
@@ -129,6 +161,543 @@ fn log_request_outcome(method: &Method, uri: &Uri, status: StatusCode, request_i
 
 fn safe_log_path(uri: &Uri) -> &str {
     uri.path()
+}
+
+fn auth_rejection_response(
+    state: &ServerState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Option<Response<Body>> {
+    let resource = resource_for_uri(uri);
+    let authorization = match authorization_header(headers, &resource, is_head, request_id) {
+        Ok(Some(authorization)) => authorization,
+        Ok(None) => {
+            state.record_trace(TraceEvent::SigV4Parsed(SigV4ParsedTrace::rejected(
+                request_id.as_str(),
+                SigV4ParseRejection::MissingAuthorization,
+            )));
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::UnsignedAccepted,
+            )));
+            return None;
+        }
+        Err(response) => {
+            state.record_trace(TraceEvent::SigV4Parsed(SigV4ParsedTrace::rejected(
+                request_id.as_str(),
+                SigV4ParseRejection::MalformedAuthorization,
+            )));
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+            )));
+            return Some(*response);
+        }
+    };
+
+    let authorization = match parse_authorization_header(authorization) {
+        Ok(authorization) => {
+            record_sigv4_parsed(state, request_id, &authorization);
+            authorization
+        }
+        Err(diagnostic) => {
+            state.record_trace(TraceEvent::SigV4Parsed(SigV4ParsedTrace::rejected(
+                request_id.as_str(),
+                sigv4_parse_rejection(&diagnostic),
+            )));
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+            )));
+            return Some(auth_error_response(
+                S3ErrorCode::AuthorizationHeaderMalformed,
+                diagnostic.message(),
+                &resource,
+                is_head,
+                request_id,
+            ));
+        }
+    };
+
+    if authorization.credential().access_key_id() != LOCAL_ACCESS_KEY_ID {
+        state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+            request_id.as_str(),
+            AuthDecision::Rejected(AuthRejectionReason::InvalidAccessKey),
+        )));
+        return Some(auth_error_response(
+            S3ErrorCode::InvalidAccessKeyId,
+            "The access key id is not configured for this local S3Lab server.",
+            &resource,
+            is_head,
+            request_id,
+        ));
+    }
+
+    let verification_request = match owned_sigv4_verification_request(
+        method, uri, headers, &resource, is_head, request_id,
+    ) {
+        Ok(request) => request,
+        Err(response) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+            )));
+            return Some(*response);
+        }
+    };
+    let query = verification_request.query_refs();
+    let header_values = verification_request.header_refs();
+    let request = SigV4VerificationRequest {
+        request_datetime: &verification_request.request_datetime,
+        method: &verification_request.method,
+        path: &verification_request.path,
+        query: &query,
+        headers: &header_values,
+        payload_hash: &verification_request.payload_hash,
+    };
+
+    match build_canonical_request(
+        request.method,
+        request.path,
+        request.query,
+        request.headers,
+        authorization.signed_headers(),
+        request.payload_hash,
+    ) {
+        Ok(canonical_request) => {
+            state.record_trace(TraceEvent::CanonicalRequestBuilt(
+                CanonicalRequestBuiltTrace::from_canonical_request(
+                    request_id.as_str(),
+                    authorization
+                        .signed_headers()
+                        .iter()
+                        .map(|header| header.as_str()),
+                    &canonical_request,
+                ),
+            ));
+        }
+        Err(diagnostic) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(auth_rejection_reason(&diagnostic)),
+            )));
+            return Some(sigv4_verification_error_response(
+                diagnostic, &resource, is_head, request_id,
+            ));
+        }
+    }
+
+    match verify_signature(&authorization, LOCAL_SECRET_ACCESS_KEY, request) {
+        Ok(_verification) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Accepted,
+            )));
+            None
+        }
+        Err(diagnostic) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(auth_rejection_reason(&diagnostic)),
+            )));
+            Some(sigv4_verification_error_response(
+                diagnostic, &resource, is_head, request_id,
+            ))
+        }
+    }
+}
+
+fn authorization_header<'a>(
+    headers: &'a HeaderMap,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Option<&'a str>, Box<Response<Body>>> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Box::new(auth_error_response(
+            S3ErrorCode::AuthorizationHeaderMalformed,
+            "Include exactly one Authorization header.",
+            resource,
+            is_head,
+            request_id,
+        )));
+    }
+
+    value.to_str().map(Some).map_err(|_| {
+        Box::new(auth_error_response(
+            S3ErrorCode::AuthorizationHeaderMalformed,
+            "Use a UTF-8 Authorization header value.",
+            resource,
+            is_head,
+            request_id,
+        ))
+    })
+}
+
+fn owned_sigv4_verification_request(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<OwnedSigV4VerificationRequest, Box<Response<Body>>> {
+    let request_datetime = single_utf8_header(
+        headers,
+        X_AMZ_DATE,
+        "Include exactly one x-amz-date header.",
+        resource,
+        is_head,
+        request_id,
+    )?;
+    let payload_hash = optional_single_utf8_header(
+        headers,
+        X_AMZ_CONTENT_SHA256,
+        "Include at most one x-amz-content-sha256 header.",
+        resource,
+        is_head,
+        request_id,
+    )?
+    .unwrap_or_else(|| EMPTY_PAYLOAD_SHA256.to_owned());
+
+    Ok(OwnedSigV4VerificationRequest {
+        request_datetime,
+        method: method.as_str().to_owned(),
+        path: uri.path().to_owned(),
+        query: sigv4_query_pairs(uri.query(), resource, is_head, request_id)?,
+        headers: sigv4_header_pairs(headers, resource, is_head, request_id)?,
+        payload_hash,
+    })
+}
+
+fn single_utf8_header(
+    headers: &HeaderMap,
+    name: &'static str,
+    message: &'static str,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<String, Box<Response<Body>>> {
+    optional_single_utf8_header(headers, name, message, resource, is_head, request_id)?.ok_or_else(
+        || {
+            Box::new(auth_error_response(
+                S3ErrorCode::AuthorizationHeaderMalformed,
+                message,
+                resource,
+                is_head,
+                request_id,
+            ))
+        },
+    )
+}
+
+fn optional_single_utf8_header(
+    headers: &HeaderMap,
+    name: &'static str,
+    message: &'static str,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Option<String>, Box<Response<Body>>> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Box::new(auth_error_response(
+            S3ErrorCode::AuthorizationHeaderMalformed,
+            message,
+            resource,
+            is_head,
+            request_id,
+        )));
+    }
+
+    value
+        .to_str()
+        .map(|value| Some(value.to_owned()))
+        .map_err(|_| {
+            Box::new(auth_error_response(
+                S3ErrorCode::AuthorizationHeaderMalformed,
+                "Signed request header values must be UTF-8.",
+                resource,
+                is_head,
+                request_id,
+            ))
+        })
+}
+
+fn sigv4_query_pairs(
+    raw_query: Option<&str>,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Vec<(String, String)>, Box<Response<Body>>> {
+    let mut query = Vec::new();
+    for raw_pair in raw_query.into_iter().flat_map(|query| query.split('&')) {
+        if raw_pair.is_empty() {
+            continue;
+        }
+        let (raw_name, raw_value) = raw_pair.split_once('=').unwrap_or((raw_pair, ""));
+        query.push((
+            decode_sigv4_query_component(raw_name, resource, is_head, request_id)?,
+            decode_sigv4_query_component(raw_value, resource, is_head, request_id)?,
+        ));
+    }
+    query.sort();
+    Ok(query)
+}
+
+fn decode_sigv4_query_component(
+    raw: &str,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<String, Box<Response<Body>>> {
+    if !has_valid_percent_encoding(raw) {
+        return Err(Box::new(auth_error_response(
+            S3ErrorCode::AuthorizationHeaderMalformed,
+            "Use valid percent-encoding in the signed request query.",
+            resource,
+            is_head,
+            request_id,
+        )));
+    }
+
+    percent_decode_str(raw)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| {
+            Box::new(auth_error_response(
+                S3ErrorCode::AuthorizationHeaderMalformed,
+                "Use UTF-8 query values in signed requests.",
+                resource,
+                is_head,
+                request_id,
+            ))
+        })
+}
+
+fn sigv4_header_pairs(
+    headers: &HeaderMap,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Vec<(String, String)>, Box<Response<Body>>> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            value
+                .to_str()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                .map_err(|_| {
+                    Box::new(auth_error_response(
+                        S3ErrorCode::AuthorizationHeaderMalformed,
+                        "Signed request header values must be UTF-8.",
+                        resource,
+                        is_head,
+                        request_id,
+                    ))
+                })
+        })
+        .collect()
+}
+
+fn sigv4_verification_error_response(
+    diagnostic: SigV4VerificationDiagnostic,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Response<Body> {
+    match diagnostic {
+        SigV4VerificationDiagnostic::MissingSignedHeader { .. } => auth_error_response(
+            S3ErrorCode::AccessDenied,
+            diagnostic.message(),
+            resource,
+            is_head,
+            request_id,
+        ),
+        SigV4VerificationDiagnostic::SignatureMismatch => auth_error_response(
+            S3ErrorCode::SignatureDoesNotMatch,
+            diagnostic.message(),
+            resource,
+            is_head,
+            request_id,
+        ),
+    }
+}
+
+fn auth_error_response(
+    code: S3ErrorCode,
+    message: impl Into<String>,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Response<Body> {
+    s3_error_response(
+        S3Error::with_message(code, message, resource, request_id.clone()),
+        is_head,
+    )
+}
+
+fn record_sigv4_parsed(
+    state: &ServerState,
+    request_id: &S3RequestId,
+    authorization: &SigV4Authorization,
+) {
+    let scope = authorization.credential().scope();
+    state.record_trace(TraceEvent::SigV4Parsed(SigV4ParsedTrace::accepted(
+        request_id.as_str(),
+        TraceCredentialScope::new(scope.date(), scope.region(), scope.service()),
+        authorization
+            .signed_headers()
+            .iter()
+            .map(|header| header.as_str()),
+    )));
+}
+
+fn sigv4_parse_rejection(diagnostic: &SigV4ParseDiagnostic) -> SigV4ParseRejection {
+    match diagnostic {
+        SigV4ParseDiagnostic::UnsupportedAlgorithm => SigV4ParseRejection::UnsupportedAlgorithm,
+        SigV4ParseDiagnostic::InvalidCredentialScope
+        | SigV4ParseDiagnostic::EmptyAccessKey
+        | SigV4ParseDiagnostic::InvalidCredentialDate
+        | SigV4ParseDiagnostic::EmptyRegion
+        | SigV4ParseDiagnostic::EmptyService
+        | SigV4ParseDiagnostic::InvalidCredentialScopeTerminator => {
+            SigV4ParseRejection::InvalidCredentialScope
+        }
+        SigV4ParseDiagnostic::EmptySignedHeaders
+        | SigV4ParseDiagnostic::InvalidSignedHeaderName
+        | SigV4ParseDiagnostic::DuplicateSignedHeader
+        | SigV4ParseDiagnostic::UnsortedSignedHeaders => SigV4ParseRejection::InvalidSignedHeaders,
+        SigV4ParseDiagnostic::InvalidSignatureLength
+        | SigV4ParseDiagnostic::InvalidSignatureHex => SigV4ParseRejection::InvalidSignature,
+        SigV4ParseDiagnostic::MalformedAuthorizationHeader
+        | SigV4ParseDiagnostic::MalformedParameter
+        | SigV4ParseDiagnostic::UnknownParameter
+        | SigV4ParseDiagnostic::MissingParameter { .. }
+        | SigV4ParseDiagnostic::DuplicateParameter { .. } => {
+            SigV4ParseRejection::MalformedAuthorization
+        }
+    }
+}
+
+fn auth_rejection_reason(diagnostic: &SigV4VerificationDiagnostic) -> AuthRejectionReason {
+    match diagnostic {
+        SigV4VerificationDiagnostic::MissingSignedHeader { .. } => {
+            AuthRejectionReason::MissingSignedHeader
+        }
+        SigV4VerificationDiagnostic::SignatureMismatch => AuthRejectionReason::SignatureMismatch,
+    }
+}
+
+fn record_request_received(
+    state: &ServerState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    request_id: &S3RequestId,
+) {
+    state.record_trace(TraceEvent::RequestReceived(RequestReceivedTrace::new(
+        request_id.as_str(),
+        method.as_str(),
+        uri.path(),
+        headers.keys().map(HeaderName::as_str),
+    )));
+}
+
+fn record_route_resolved(
+    state: &ServerState,
+    method: &Method,
+    uri: &Uri,
+    operation: &S3Operation,
+    request_id: &S3RequestId,
+) {
+    state.record_trace(TraceEvent::RouteResolved(RouteResolvedTrace::new(
+        request_id.as_str(),
+        method.as_str(),
+        uri.path(),
+        trace_operation(operation),
+    )));
+}
+
+fn record_route_rejected(
+    state: &ServerState,
+    method: &Method,
+    uri: &Uri,
+    rejection: &RouteRejection,
+    request_id: &S3RequestId,
+) {
+    state.record_trace(TraceEvent::RouteRejected(RouteRejectedTrace::new(
+        request_id.as_str(),
+        method.as_str(),
+        uri.path(),
+        route_rejection_reason(rejection),
+    )));
+}
+
+fn record_response_sent(state: &ServerState, request_id: &S3RequestId, response: &Response<Body>) {
+    state.record_trace(TraceEvent::ResponseSent(ResponseSentTrace::new(
+        request_id.as_str(),
+        response.status().as_u16(),
+        None::<String>,
+    )));
+}
+
+fn trace_operation(operation: &S3Operation) -> TraceS3Operation {
+    match operation {
+        S3Operation::ListBuckets => TraceS3Operation::ListBuckets,
+        S3Operation::CreateBucket { .. } => TraceS3Operation::CreateBucket,
+        S3Operation::HeadBucket { .. } => TraceS3Operation::HeadBucket,
+        S3Operation::DeleteBucket { .. } => TraceS3Operation::DeleteBucket,
+        S3Operation::PutObject { .. } => TraceS3Operation::PutObject,
+        S3Operation::GetObject { .. } => TraceS3Operation::GetObject,
+        S3Operation::HeadObject { .. } => TraceS3Operation::HeadObject,
+        S3Operation::DeleteObject { .. } => TraceS3Operation::DeleteObject,
+        S3Operation::ListObjectsV2 { .. } => TraceS3Operation::ListObjectsV2,
+    }
+}
+
+fn route_rejection_reason(rejection: &RouteRejection) -> RouteRejectionReason {
+    match rejection.code {
+        S3ErrorCode::InvalidBucketName => RouteRejectionReason::InvalidPath,
+        S3ErrorCode::InvalidArgument => RouteRejectionReason::InvalidQuery,
+        S3ErrorCode::MethodNotAllowed => RouteRejectionReason::MethodNotAllowed,
+        S3ErrorCode::NotImplemented => RouteRejectionReason::UnsupportedOperation,
+        _ => RouteRejectionReason::UnsupportedOperation,
+    }
+}
+
+fn record_storage_mutation_result<T>(
+    state: &ServerState,
+    request_id: &S3RequestId,
+    mutation: StorageMutation,
+    bucket: Option<&str>,
+    key: Option<&str>,
+    result: Result<T, &StorageError>,
+) {
+    let outcome = match result {
+        Ok(_) | Err(StorageError::NoSuchKey { .. }) => StorageMutationOutcome::Applied,
+        Err(error) => StorageMutationOutcome::Rejected {
+            error_code: s3_error_code_from_storage_error(error).as_str().to_owned(),
+        },
+    };
+
+    state.record_trace(TraceEvent::StorageMutation(StorageMutationTrace::new(
+        request_id.as_str(),
+        mutation,
+        bucket.map(str::to_owned),
+        key.map(str::to_owned),
+        outcome,
+    )));
 }
 
 fn resolve_root_operation(
@@ -360,9 +929,17 @@ fn create_bucket_response(
     bucket: BucketName,
     request_id: &S3RequestId,
 ) -> Result<Response<Body>, (StorageError, String)> {
-    state
-        .storage()
-        .create_bucket(&bucket)
+    let result = state.storage().create_bucket(&bucket);
+    record_storage_mutation_result(
+        state,
+        request_id,
+        StorageMutation::CreateBucket,
+        Some(bucket.as_str()),
+        None,
+        result.as_ref().map(|_| ()),
+    );
+
+    result
         .map(|()| empty_response(request_id))
         .map_err(|error| (error, bucket_resource(&bucket)))
 }
@@ -389,9 +966,17 @@ fn delete_bucket_response(
     bucket: BucketName,
     request_id: &S3RequestId,
 ) -> Result<Response<Body>, (StorageError, String)> {
-    state
-        .storage()
-        .delete_bucket(&bucket)
+    let result = state.storage().delete_bucket(&bucket);
+    record_storage_mutation_result(
+        state,
+        request_id,
+        StorageMutation::DeleteBucket,
+        Some(bucket.as_str()),
+        None,
+        result.as_ref().map(|_| ()),
+    );
+
+    result
         .map(|()| no_content_response(request_id))
         .map_err(|error| (error, bucket_resource(&bucket)))
 }
@@ -459,16 +1044,29 @@ async fn put_object_route_response(
             return Ok(*response);
         }
     }
+    if let Err(response) =
+        validate_signed_put_object_payload_hash(&headers, &body.bytes, &resource, request_id)
+    {
+        return Ok(*response);
+    }
 
-    state
-        .storage()
-        .put_object(PutObjectRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            bytes: body.bytes,
-            content_type,
-            user_metadata,
-        })
+    let result = state.storage().put_object(PutObjectRequest {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        bytes: body.bytes,
+        content_type,
+        user_metadata,
+    });
+    record_storage_mutation_result(
+        &state,
+        request_id,
+        StorageMutation::PutObject,
+        Some(bucket.as_str()),
+        Some(key.as_str()),
+        result.as_ref().map(|_| ()),
+    );
+
+    result
         .map(|metadata| put_object_response(metadata, request_id))
         .map_err(|error| (error, resource))
 }
@@ -519,7 +1117,17 @@ fn delete_object_response(
     key: ObjectKey,
     request_id: &S3RequestId,
 ) -> Result<Response<Body>, (StorageError, String)> {
-    match state.storage().delete_object(&bucket, &key) {
+    let result = state.storage().delete_object(&bucket, &key);
+    record_storage_mutation_result(
+        state,
+        request_id,
+        StorageMutation::DeleteObject,
+        Some(bucket.as_str()),
+        Some(key.as_str()),
+        result.as_ref().map(|_| ()),
+    );
+
+    match result {
         Ok(()) | Err(StorageError::NoSuchKey { .. }) => Ok(no_content_response(request_id)),
         Err(error) => Err((error, object_resource(&bucket, &key))),
     }
@@ -1425,6 +2033,69 @@ fn validate_put_object_checksum(
     }
 }
 
+fn validate_signed_put_object_payload_hash(
+    headers: &HeaderMap,
+    bytes: &[u8],
+    resource: &str,
+    request_id: &S3RequestId,
+) -> RouteResponseResult<()> {
+    if !headers.contains_key(AUTHORIZATION) {
+        return Ok(());
+    }
+
+    let Some(expected) = headers
+        .get(X_AMZ_CONTENT_SHA256)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return if bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(Box::new(s3_error_response(
+                S3Error::with_message(
+                    S3ErrorCode::XAmzContentSHA256Mismatch,
+                    "Signed PUT object requests with a body must include x-amz-content-sha256. Sign the exact bytes sent in the PUT request body, or send UNSIGNED-PAYLOAD when payload integrity is intentionally disabled.",
+                    resource,
+                    request_id.clone(),
+                ),
+                false,
+            )))
+        };
+    };
+    if !is_literal_sha256_payload_hash(expected) {
+        return Ok(());
+    }
+
+    let actual = sha256_lower_hex(bytes);
+    if expected.eq_ignore_ascii_case(&actual) {
+        Ok(())
+    } else {
+        Err(Box::new(s3_error_response(
+            S3Error::with_message(
+                S3ErrorCode::XAmzContentSHA256Mismatch,
+                "The x-amz-content-sha256 header value did not match the request body bytes. Sign the exact bytes sent in the PUT request body.",
+                resource,
+                request_id.clone(),
+            ),
+            false,
+        )))
+    }
+}
+
+fn is_literal_sha256_payload_hash(value: &str) -> bool {
+    value != UNSIGNED_PAYLOAD
+        && !value.starts_with(STREAMING_PAYLOAD_PREFIX)
+        && value.len() == 64
+        && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+fn sha256_lower_hex(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn put_object_checksums(
     checksums: impl IntoIterator<Item = PutObjectChecksum>,
 ) -> Vec<PutObjectChecksum> {
@@ -1435,6 +2106,32 @@ fn put_object_checksums(
 }
 
 type RouteResponseResult<T> = Result<T, Box<Response<Body>>>;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct OwnedSigV4VerificationRequest {
+    request_datetime: String,
+    method: String,
+    path: String,
+    query: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
+    payload_hash: String,
+}
+
+impl OwnedSigV4VerificationRequest {
+    fn query_refs(&self) -> Vec<(&str, &str)> {
+        self.query
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect()
+    }
+
+    fn header_refs(&self) -> Vec<(&str, &str)> {
+        self.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ListObjectsV2RouteRequest {

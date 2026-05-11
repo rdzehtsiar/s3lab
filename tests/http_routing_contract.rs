@@ -6,17 +6,24 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use axum::http::{HeaderValue, Method, Request, StatusCode, Uri};
 use s3lab::s3::bucket::BucketName;
-use s3lab::s3::error::S3ErrorCode;
+use s3lab::s3::error::{S3ErrorCode, STATIC_REQUEST_ID};
 use s3lab::s3::object::ObjectKey;
 use s3lab::s3::operation::{ListObjectsEncoding, S3Operation};
+use s3lab::s3::sigv4::{build_canonical_request, build_string_to_sign, parse_authorization_header};
 use s3lab::server::router;
 use s3lab::server::routes::{resolve_operation, PHASE1_MAX_PUT_OBJECT_BODY_BYTES};
-use s3lab::server::state::ServerState;
+use s3lab::server::state::{FixedRequestIdGenerator, ServerState};
 use s3lab::storage::fs::{FilesystemStorage, StorageClock};
 use s3lab::storage::{
     BucketSummary, ListObjectsOptions, ObjectListing, PutObjectRequest, Storage, StorageError,
     StoredObject, StoredObjectMetadata,
 };
+use s3lab::trace::{
+    AuthDecision, AuthDecisionTrace, CanonicalRequestBuiltTrace, RequestReceivedTrace,
+    ResponseSentTrace, RouteResolvedTrace, SigV4ParsedTrace, StorageMutation,
+    StorageMutationOutcome, StorageMutationTrace, TraceEvent, TraceS3Operation, TraceSink,
+};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use support::test_server_state;
@@ -601,6 +608,338 @@ async fn head_route_errors_have_request_id_and_no_body() {
         assert_head_error(response, status).await;
         assert_no_storage_calls(&calls);
     }
+}
+
+#[tokio::test]
+async fn unsigned_requests_remain_compatible_and_can_mutate_storage() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+
+    let response = app
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/object.txt",
+            Body::from("hello"),
+        ))
+        .await
+        .expect("unsigned put object");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(calls.lock().expect("calls lock").as_slice(), ["put_object"]);
+}
+
+#[tokio::test]
+async fn valid_signed_request_is_verified_before_storage_mutation() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let body = b"hello";
+    let headers = signed_request_headers(Method::PUT, "/bucket/object.txt", body);
+
+    let response = app
+        .oneshot(request_with_owned_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &headers,
+            Body::from(body.as_slice().to_vec()),
+        ))
+        .await
+        .expect("signed put object");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(calls.lock().expect("calls lock").as_slice(), ["put_object"]);
+}
+
+#[tokio::test]
+async fn signed_put_rejects_literal_payload_hash_mismatch_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let signed_body = b"signed-body";
+    let sent_body = b"sent-secret-body";
+    let headers = signed_request_headers(Method::PUT, "/bucket/object.txt", signed_body);
+
+    let response = app
+        .oneshot(request_with_owned_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &headers,
+            Body::from(sent_body.as_slice().to_vec()),
+        ))
+        .await
+        .expect("payload hash mismatch response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/xml")
+    );
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
+    assert!(body.contains("<Resource>/bucket/object.txt</Resource>"));
+    assert!(!body.contains("signed-body"));
+    assert!(!body.contains("sent-secret-body"));
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn signed_put_rejects_missing_payload_hash_with_body_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let sent_body = b"sent-secret-body";
+    let headers = signed_request_headers_without_payload_hash(Method::PUT, "/bucket/object.txt");
+
+    let response = app
+        .oneshot(request_with_owned_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &headers,
+            Body::from(sent_body.as_slice().to_vec()),
+        ))
+        .await
+        .expect("missing payload hash response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/xml")
+    );
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
+    assert!(body.contains("<Resource>/bucket/object.txt</Resource>"));
+    assert!(!body.contains("sent-secret-body"));
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn malformed_authorization_returns_s3_error_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[("authorization", "Bearer secret-value")],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("malformed auth response");
+
+    assert_s3_error_xml(
+        response,
+        StatusCode::BAD_REQUEST,
+        "AuthorizationHeaderMalformed",
+        "/bucket/object.txt",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn head_authorization_errors_preserve_empty_body_behavior() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::HEAD,
+            "/bucket/object.txt",
+            &[("authorization", "Bearer secret-value")],
+            Body::empty(),
+        ))
+        .await
+        .expect("head malformed auth response");
+
+    assert_head_error(response, StatusCode::BAD_REQUEST).await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn wrong_access_key_returns_s3_error_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=wrong-key/20260512/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000",
+            )],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("wrong access key response");
+
+    assert_s3_error_xml(
+        response,
+        StatusCode::FORBIDDEN,
+        "InvalidAccessKeyId",
+        "/bucket/object.txt",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn missing_signed_header_returns_s3_error_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("x-amz-date", "20260512T010203Z"),
+                (
+                    "authorization",
+                    "AWS4-HMAC-SHA256 Credential=s3lab/20260512/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+            ],
+            Body::from("hello"),
+        ))
+        .await
+        .expect("missing signed header response");
+
+    assert_s3_error_xml(
+        response,
+        StatusCode::FORBIDDEN,
+        "AccessDenied",
+        "/bucket/object.txt",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn signature_mismatch_returns_s3_error_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let body = b"hello";
+    let mut headers = signed_request_headers(Method::PUT, "/bucket/object.txt", body);
+    replace_authorization_signature(
+        &mut headers,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    );
+
+    let response = app
+        .oneshot(request_with_owned_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &headers,
+            Body::from(body.as_slice().to_vec()),
+        ))
+        .await
+        .expect("signature mismatch response");
+
+    assert_s3_error_xml(
+        response,
+        StatusCode::FORBIDDEN,
+        "SignatureDoesNotMatch",
+        "/bucket/object.txt",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn signed_request_trace_records_safe_auth_events() {
+    let storage = RecordingStorage::default();
+    let sink = TestTraceSink::default();
+    let recorded = sink.clone();
+    let state = ServerState::with_request_id_generator_and_trace_sink(
+        storage,
+        FixedRequestIdGenerator::new(STATIC_REQUEST_ID),
+        sink,
+    );
+    let app = router(state);
+    let body = b"hello";
+    let headers = signed_request_headers(Method::PUT, "/bucket/object.txt", body);
+    let authorization = header_value(&headers, "authorization").to_owned();
+
+    let response = app
+        .oneshot(request_with_owned_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &headers,
+            Body::from(body.as_slice().to_vec()),
+        ))
+        .await
+        .expect("signed put object");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = recorded.events();
+    assert!(
+        events.contains(&TraceEvent::RequestReceived(RequestReceivedTrace::new(
+            STATIC_REQUEST_ID,
+            "PUT",
+            "/bucket/object.txt",
+            [
+                "authorization",
+                "host",
+                "x-amz-content-sha256",
+                "x-amz-date"
+            ],
+        )))
+    );
+    assert!(
+        events.contains(&TraceEvent::RouteResolved(RouteResolvedTrace::new(
+            STATIC_REQUEST_ID,
+            "PUT",
+            "/bucket/object.txt",
+            TraceS3Operation::PutObject,
+        )))
+    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, TraceEvent::SigV4Parsed(SigV4ParsedTrace { .. }))));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TraceEvent::CanonicalRequestBuilt(CanonicalRequestBuiltTrace { .. })
+    )));
+    assert!(
+        events.contains(&TraceEvent::AuthDecision(AuthDecisionTrace::new(
+            STATIC_REQUEST_ID,
+            AuthDecision::Accepted,
+        )))
+    );
+    assert!(
+        events.contains(&TraceEvent::StorageMutation(StorageMutationTrace::new(
+            STATIC_REQUEST_ID,
+            StorageMutation::PutObject,
+            Some("bucket"),
+            Some("object.txt"),
+            StorageMutationOutcome::Applied,
+        )))
+    );
+    assert!(
+        events.contains(&TraceEvent::ResponseSent(ResponseSentTrace::new(
+            STATIC_REQUEST_ID,
+            200,
+            None::<String>,
+        )))
+    );
+
+    let debug = format!("{events:?}");
+    assert!(!debug.contains(&authorization));
+    assert!(!debug.contains(signature_from_authorization(&authorization)));
+    assert!(!debug.contains("s3lab-secret"));
 }
 
 #[tokio::test]
@@ -2663,6 +3002,204 @@ fn request_with_headers(
     builder.body(body).expect("valid request")
 }
 
+fn request_with_owned_headers(
+    method: Method,
+    uri: &str,
+    headers: &[(String, String)],
+    body: Body,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(
+            name,
+            HeaderValue::from_str(value).expect("valid test header"),
+        );
+    }
+    builder.body(body).expect("valid request")
+}
+
+fn signed_request_headers(method: Method, uri: &str, body: &[u8]) -> Vec<(String, String)> {
+    signed_request_headers_with_access_key(method, uri, body, "s3lab")
+}
+
+fn signed_request_headers_without_payload_hash(method: Method, uri: &str) -> Vec<(String, String)> {
+    let request_datetime = "20260512T010203Z";
+    let credential_scope = "20260512/us-east-1/s3/aws4_request";
+    let signed_headers = "host;x-amz-date";
+    let payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let parsed_uri = uri.parse::<Uri>().expect("valid URI");
+    let header_pairs = [("host", "localhost"), ("x-amz-date", request_datetime)];
+    let unsigned_authorization = format!(
+        "AWS4-HMAC-SHA256 Credential=s3lab/{credential_scope}, SignedHeaders={signed_headers}, Signature=0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    let authorization =
+        parse_authorization_header(&unsigned_authorization).expect("authorization shape");
+    let canonical_request = build_canonical_request(
+        method.as_str(),
+        parsed_uri.path(),
+        &[],
+        &header_pairs,
+        authorization.signed_headers(),
+        payload_hash,
+    )
+    .expect("canonical request");
+    let string_to_sign = build_string_to_sign(
+        request_datetime,
+        authorization.credential().scope(),
+        &canonical_request,
+    );
+    let signature = sigv4_signature(
+        "s3lab-secret",
+        "20260512",
+        "us-east-1",
+        "s3",
+        &string_to_sign,
+    );
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential=s3lab/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    vec![
+        ("host".to_owned(), "localhost".to_owned()),
+        ("x-amz-date".to_owned(), request_datetime.to_owned()),
+        ("authorization".to_owned(), authorization),
+    ]
+}
+
+fn signed_request_headers_with_access_key(
+    method: Method,
+    uri: &str,
+    body: &[u8],
+    access_key: &str,
+) -> Vec<(String, String)> {
+    let request_datetime = "20260512T010203Z";
+    let credential_scope = "20260512/us-east-1/s3/aws4_request";
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let payload_hash = sha256_lower_hex_bytes(body);
+    let parsed_uri = uri.parse::<Uri>().expect("valid URI");
+    let header_pairs = [
+        ("host", "localhost"),
+        ("x-amz-content-sha256", payload_hash.as_str()),
+        ("x-amz-date", request_datetime),
+    ];
+    let unsigned_authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature=0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    let authorization =
+        parse_authorization_header(&unsigned_authorization).expect("authorization shape");
+    let canonical_request = build_canonical_request(
+        method.as_str(),
+        parsed_uri.path(),
+        &[],
+        &header_pairs,
+        authorization.signed_headers(),
+        &payload_hash,
+    )
+    .expect("canonical request");
+    let string_to_sign = build_string_to_sign(
+        request_datetime,
+        authorization.credential().scope(),
+        &canonical_request,
+    );
+    let signature = sigv4_signature(
+        "s3lab-secret",
+        "20260512",
+        "us-east-1",
+        "s3",
+        &string_to_sign,
+    );
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    vec![
+        ("host".to_owned(), "localhost".to_owned()),
+        ("x-amz-date".to_owned(), request_datetime.to_owned()),
+        ("x-amz-content-sha256".to_owned(), payload_hash),
+        ("authorization".to_owned(), authorization),
+    ]
+}
+
+fn replace_authorization_signature(headers: &mut [(String, String)], signature: &str) {
+    let authorization = headers
+        .iter_mut()
+        .find(|(name, _value)| name == "authorization")
+        .expect("authorization header");
+    let (prefix, _old_signature) = authorization
+        .1
+        .rsplit_once("Signature=")
+        .expect("signature parameter");
+    authorization.1 = format!("{prefix}Signature={signature}");
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> &'a str {
+    headers
+        .iter()
+        .find(|(header_name, _value)| header_name == name)
+        .map(|(_name, value)| value.as_str())
+        .expect("header exists")
+}
+
+fn signature_from_authorization(authorization: &str) -> &str {
+    authorization
+        .rsplit_once("Signature=")
+        .map(|(_prefix, signature)| signature)
+        .expect("signature parameter")
+}
+
+fn sigv4_signature(
+    secret: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+    string_to_sign: &str,
+) -> String {
+    let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let region_key = hmac_sha256(&date_key, region.as_bytes());
+    let service_key = hmac_sha256(&region_key, service.as_bytes());
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+    hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()))
+}
+
+fn hmac_sha256(key: &[u8], value: &[u8]) -> [u8; 32] {
+    const HMAC_SHA256_BLOCK_SIZE: usize = 64;
+    let mut normalized_key = [0_u8; HMAC_SHA256_BLOCK_SIZE];
+    if key.len() > HMAC_SHA256_BLOCK_SIZE {
+        let digest = Sha256::digest(key);
+        normalized_key[..digest.len()].copy_from_slice(&digest);
+    } else {
+        normalized_key[..key.len()].copy_from_slice(key);
+    }
+
+    let mut outer_key_pad = [0x5c_u8; HMAC_SHA256_BLOCK_SIZE];
+    let mut inner_key_pad = [0x36_u8; HMAC_SHA256_BLOCK_SIZE];
+    for index in 0..HMAC_SHA256_BLOCK_SIZE {
+        outer_key_pad[index] ^= normalized_key[index];
+        inner_key_pad[index] ^= normalized_key[index];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_key_pad);
+    inner.update(value);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_key_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn sha256_lower_hex_bytes(value: &[u8]) -> String {
+    hex_encode(&Sha256::digest(value))
+}
+
+fn hex_encode(value: &[u8]) -> String {
+    value
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
 async fn body_bytes(response: axum::http::Response<Body>) -> Bytes {
     to_bytes(response.into_body(), usize::MAX)
         .await
@@ -2929,6 +3466,23 @@ fn fixed_last_modified() -> OffsetDateTime {
         Time::from_hms(12, 34, 56).expect("valid test time"),
     )
     .assume_utc()
+}
+
+#[derive(Debug, Clone, Default)]
+struct TestTraceSink {
+    events: Arc<Mutex<Vec<TraceEvent>>>,
+}
+
+impl TestTraceSink {
+    fn events(&self) -> Vec<TraceEvent> {
+        self.events.lock().expect("trace events lock").clone()
+    }
+}
+
+impl TraceSink for TestTraceSink {
+    fn record(&self, event: TraceEvent) {
+        self.events.lock().expect("trace events lock").push(event);
+    }
 }
 
 #[derive(Clone)]

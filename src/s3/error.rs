@@ -4,10 +4,13 @@ pub const STATIC_REQUEST_ID: &str = "s3lab-test-request-id";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum S3ErrorCode {
+    AccessDenied,
+    AuthorizationHeaderMalformed,
     BadDigest,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
     EntityTooLarge,
+    InvalidAccessKeyId,
     InternalError,
     InvalidArgument,
     InvalidBucketName,
@@ -15,15 +18,20 @@ pub enum S3ErrorCode {
     NoSuchBucket,
     NoSuchKey,
     NotImplemented,
+    SignatureDoesNotMatch,
+    XAmzContentSHA256Mismatch,
 }
 
 impl S3ErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::AccessDenied => "AccessDenied",
+            Self::AuthorizationHeaderMalformed => "AuthorizationHeaderMalformed",
             Self::BadDigest => "BadDigest",
             Self::BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou",
             Self::BucketNotEmpty => "BucketNotEmpty",
             Self::EntityTooLarge => "EntityTooLarge",
+            Self::InvalidAccessKeyId => "InvalidAccessKeyId",
             Self::InternalError => "InternalError",
             Self::InvalidArgument => "InvalidArgument",
             Self::InvalidBucketName => "InvalidBucketName",
@@ -31,11 +39,15 @@ impl S3ErrorCode {
             Self::NoSuchBucket => "NoSuchBucket",
             Self::NoSuchKey => "NoSuchKey",
             Self::NotImplemented => "NotImplemented",
+            Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
+            Self::XAmzContentSHA256Mismatch => "XAmzContentSHA256Mismatch",
         }
     }
 
     pub fn default_message(&self) -> &'static str {
         match self {
+            Self::AccessDenied => "Access denied.",
+            Self::AuthorizationHeaderMalformed => "The authorization header is malformed.",
             Self::BadDigest => "The Content-MD5 you specified did not match what we received.",
             Self::NoSuchBucket => "The specified bucket does not exist.",
             Self::NoSuchKey => "The specified key does not exist.",
@@ -44,11 +56,20 @@ impl S3ErrorCode {
             }
             Self::BucketNotEmpty => "The bucket you tried to delete is not empty.",
             Self::EntityTooLarge => "Your proposed upload exceeds the maximum allowed object size.",
+            Self::InvalidAccessKeyId => {
+                "The AWS access key ID you provided does not exist in S3Lab."
+            }
             Self::InvalidBucketName => "The specified bucket is not valid.",
             Self::InvalidArgument => "Invalid argument.",
             Self::MethodNotAllowed => "The specified method is not allowed against this resource.",
             Self::NotImplemented => {
                 "A header you provided implies functionality that is not implemented."
+            }
+            Self::SignatureDoesNotMatch => {
+                "The request signature we calculated does not match the signature you provided."
+            }
+            Self::XAmzContentSHA256Mismatch => {
+                "The x-amz-content-sha256 header value did not match the request body."
             }
             Self::InternalError => "We encountered an internal error. Please try again.",
         }
@@ -56,6 +77,8 @@ impl S3ErrorCode {
 
     pub fn http_status_code(&self) -> u16 {
         match self {
+            Self::AccessDenied | Self::InvalidAccessKeyId | Self::SignatureDoesNotMatch => 403,
+            Self::AuthorizationHeaderMalformed => 400,
             Self::BadDigest => 400,
             Self::NoSuchBucket | Self::NoSuchKey => 404,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => 409,
@@ -63,6 +86,7 @@ impl S3ErrorCode {
             Self::InvalidBucketName | Self::InvalidArgument => 400,
             Self::MethodNotAllowed => 405,
             Self::NotImplemented => 501,
+            Self::XAmzContentSHA256Mismatch => 400,
             Self::InternalError => 500,
         }
     }
@@ -144,19 +168,24 @@ mod tests {
     fn storage_related_error_codes_are_available() {
         assert_eq!(
             [
+                S3ErrorCode::AccessDenied,
+                S3ErrorCode::AuthorizationHeaderMalformed,
                 S3ErrorCode::BucketAlreadyOwnedByYou,
                 S3ErrorCode::BadDigest,
                 S3ErrorCode::BucketNotEmpty,
                 S3ErrorCode::EntityTooLarge,
+                S3ErrorCode::InvalidAccessKeyId,
                 S3ErrorCode::InternalError,
                 S3ErrorCode::InvalidArgument,
                 S3ErrorCode::InvalidBucketName,
                 S3ErrorCode::MethodNotAllowed,
                 S3ErrorCode::NoSuchBucket,
                 S3ErrorCode::NoSuchKey,
+                S3ErrorCode::SignatureDoesNotMatch,
+                S3ErrorCode::XAmzContentSHA256Mismatch,
             ]
             .len(),
-            10
+            15
         );
     }
 
@@ -168,16 +197,21 @@ mod tests {
     #[test]
     fn error_codes_map_to_http_status_codes() {
         let cases = [
+            (S3ErrorCode::AccessDenied, 403),
+            (S3ErrorCode::AuthorizationHeaderMalformed, 400),
             (S3ErrorCode::NoSuchBucket, 404),
             (S3ErrorCode::NoSuchKey, 404),
             (S3ErrorCode::BadDigest, 400),
             (S3ErrorCode::BucketAlreadyOwnedByYou, 409),
             (S3ErrorCode::BucketNotEmpty, 409),
             (S3ErrorCode::EntityTooLarge, 400),
+            (S3ErrorCode::InvalidAccessKeyId, 403),
             (S3ErrorCode::InvalidBucketName, 400),
             (S3ErrorCode::InvalidArgument, 400),
             (S3ErrorCode::MethodNotAllowed, 405),
             (S3ErrorCode::NotImplemented, 501),
+            (S3ErrorCode::SignatureDoesNotMatch, 403),
+            (S3ErrorCode::XAmzContentSHA256Mismatch, 400),
             (S3ErrorCode::InternalError, 500),
         ];
 

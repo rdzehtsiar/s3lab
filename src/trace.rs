@@ -280,6 +280,7 @@ pub enum SigV4ParseRejection {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AuthDecision {
     Accepted,
+    UnsignedAccepted,
     Rejected(AuthRejectionReason),
     NotConfigured,
 }
@@ -288,6 +289,8 @@ pub enum AuthDecision {
 pub enum AuthRejectionReason {
     MissingAuthorization,
     InvalidAuthorization,
+    InvalidAccessKey,
+    MissingSignedHeader,
     SignatureMismatch,
     Unsupported,
 }
