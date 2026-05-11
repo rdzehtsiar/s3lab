@@ -8,7 +8,7 @@ use axum::http::{HeaderValue, Method, Request, StatusCode, Uri};
 use s3lab::s3::bucket::BucketName;
 use s3lab::s3::error::S3ErrorCode;
 use s3lab::s3::object::ObjectKey;
-use s3lab::s3::operation::S3Operation;
+use s3lab::s3::operation::{ListObjectsEncoding, S3Operation};
 use s3lab::server::router;
 use s3lab::server::routes::{resolve_operation, PHASE1_MAX_PUT_OBJECT_BODY_BYTES};
 use s3lab::server::state::ServerState;
@@ -90,6 +90,19 @@ fn supported_routes_resolve_to_explicit_operations() {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                encoding: None,
+            },
+        ),
+        (
+            Method::GET,
+            "/example-bucket?list-type=2&encoding-type=url",
+            S3Operation::ListObjectsV2 {
+                bucket: BucketName::new("example-bucket"),
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+                encoding: Some(ListObjectsEncoding::Url),
             },
         ),
         (
@@ -101,6 +114,7 @@ fn supported_routes_resolve_to_explicit_operations() {
                 delimiter: None,
                 continuation_token: Some("page/2".to_owned()),
                 max_keys: 25,
+                encoding: None,
             },
         ),
         (
@@ -112,6 +126,7 @@ fn supported_routes_resolve_to_explicit_operations() {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 0,
+                encoding: None,
             },
         ),
         (
@@ -123,6 +138,7 @@ fn supported_routes_resolve_to_explicit_operations() {
                 delimiter: Some("/".to_owned()),
                 continuation_token: None,
                 max_keys: 1000,
+                encoding: None,
             },
         ),
     ];
@@ -309,6 +325,7 @@ fn x_id_query_param_is_ignored_when_resolving_routes() {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                encoding: None,
             },
         ),
         (
@@ -353,6 +370,7 @@ fn empty_query_pairs_are_skipped_when_resolving_routes() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            encoding: None,
         }
     );
 }
@@ -417,6 +435,7 @@ fn list_objects_v2_prefix_accepts_carriage_return() {
             delimiter: None,
             continuation_token: None,
             max_keys: 1000,
+            encoding: None,
         }
     );
 }
@@ -675,6 +694,52 @@ async fn list_objects_v2_slash_delimiter_calls_storage() {
         calls.lock().expect("calls lock").as_slice(),
         ["list_objects"]
     );
+}
+
+#[tokio::test]
+async fn list_objects_v2_encoding_type_url_returns_encoded_xml() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::with_clock(
+        temp_dir.path().to_path_buf(),
+        FixedClock(fixed_last_modified()),
+    )));
+
+    assert_eq!(
+        app.clone()
+            .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+            .await
+            .expect("create bucket")
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                Method::PUT,
+                "/bucket/folder/a%20b%281%29.txt",
+                Body::from("hello"),
+            ))
+            .await
+            .expect("put object")
+            .status(),
+        StatusCode::OK
+    );
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=2&encoding-type=url&prefix=folder%2F&delimiter=%2F",
+            Body::empty(),
+        ))
+        .await
+        .expect("list with URL encoding");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+
+    assert!(body.contains("<EncodingType>url</EncodingType>"));
+    assert!(body.contains("<Prefix>folder%2F</Prefix>"));
+    assert!(body.contains("<Delimiter>%2F</Delimiter>"));
+    assert!(body.contains("<Key>folder%2Fa%20b%281%29.txt</Key>"));
 }
 
 #[tokio::test]
@@ -956,7 +1021,6 @@ async fn list_objects_v2_xml_invalid_prefix_returns_invalid_argument_without_sto
 #[tokio::test]
 async fn list_objects_v2_unsupported_params_are_not_implemented_without_storage_call() {
     for uri in [
-        "/bucket?list-type=2&encoding-type=url",
         "/bucket?list-type=2&start-after=a.txt",
         "/bucket?list-type=2&fetch-owner=true",
     ] {
@@ -978,6 +1042,31 @@ async fn list_objects_v2_unsupported_params_are_not_implemented_without_storage_
         .await;
         assert_no_storage_calls(&calls);
     }
+}
+
+#[tokio::test]
+async fn list_objects_v2_unsupported_encoding_type_is_invalid_argument_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/bucket?list-type=2&encoding-type=xml",
+            Body::empty(),
+        ))
+        .await
+        .expect("route response");
+
+    assert_s3_error_xml(
+        response,
+        StatusCode::BAD_REQUEST,
+        "InvalidArgument",
+        "/bucket",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
 }
 
 #[tokio::test]
@@ -1875,6 +1964,72 @@ async fn put_object_rejects_mismatched_aws_chunked_crc32_trailer_without_storing
         ))
         .await
         .expect("put aws-chunked object with bad checksum trailer");
+    assert_s3_error_xml(
+        put,
+        StatusCode::BAD_REQUEST,
+        "BadDigest",
+        "/bucket/object.txt",
+    )
+    .await;
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get rejected aws-chunked object");
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn put_object_rejects_aws_chunked_oversized_chunk_size_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+
+    let put = app
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", "5"),
+            ],
+            Body::from("ffffffffffffffff\r\nhello\r\n"),
+        ))
+        .await
+        .expect("put aws-chunked object with oversized chunk size");
+
+    assert_invalid_argument_xml(put, "/bucket/object.txt").await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn put_object_rejects_mismatched_aws_chunked_header_checksum_even_when_trailer_matches() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &[
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", "5"),
+                ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                ("x-amz-checksum-crc32", "AAAAAA=="),
+                ("x-amz-trailer", "x-amz-checksum-crc32"),
+            ],
+            Body::from("5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n"),
+        ))
+        .await
+        .expect("put aws-chunked object with mismatched header checksum and valid trailer");
     assert_s3_error_xml(
         put,
         StatusCode::BAD_REQUEST,

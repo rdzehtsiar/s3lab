@@ -3,6 +3,11 @@
 use crate::s3::bucket::BucketName;
 use crate::s3::object::ObjectKey;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ListObjectsEncoding {
+    Url,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum S3Operation {
     ListBuckets,
@@ -37,6 +42,7 @@ pub enum S3Operation {
         delimiter: Option<String>,
         continuation_token: Option<String>,
         max_keys: usize,
+        encoding: Option<ListObjectsEncoding>,
     },
 }
 

@@ -3,7 +3,7 @@
 use crate::s3::bucket::{is_valid_s3_bucket_name, BucketName};
 use crate::s3::error::{S3Error, S3ErrorCode, S3RequestId};
 use crate::s3::object::{is_valid_s3_object_key, is_valid_s3_object_key_prefix, ObjectKey};
-use crate::s3::operation::S3Operation;
+use crate::s3::operation::{ListObjectsEncoding, S3Operation};
 use crate::s3::time::http_date;
 use crate::s3::xml::{
     error_response_xml, list_buckets_response_xml, list_objects_v2_response_xml, ListBucketXml,
@@ -229,6 +229,8 @@ fn resolve_bucket_get_operation(
         ));
     }
 
+    let encoding = parse_list_objects_encoding(query.get(ENCODING_TYPE), resource)?;
+
     if query.has_unsupported_list_objects_v2_param() {
         return Err(RouteRejection::new(
             S3ErrorCode::NotImplemented,
@@ -242,6 +244,7 @@ fn resolve_bucket_get_operation(
         delimiter: query.get(DELIMITER).cloned(),
         continuation_token: query.get(CONTINUATION_TOKEN).cloned(),
         max_keys,
+        encoding,
     })
 }
 
@@ -320,6 +323,7 @@ async fn execute_storage_operation(
             delimiter,
             continuation_token,
             max_keys,
+            encoding,
         } => list_objects_v2_route_response(
             &state,
             bucket,
@@ -327,6 +331,7 @@ async fn execute_storage_operation(
             delimiter,
             continuation_token,
             max_keys,
+            encoding,
             request_id,
         ),
     }
@@ -445,10 +450,12 @@ async fn put_object_route_response(
         Ok(body) => body,
         Err(response) => return Ok(response),
     };
-    if let Err(response) =
-        validate_put_object_checksum(&body.checksum, &body.bytes, &resource, request_id)
-    {
-        return Ok(response);
+    for checksum in &body.checksums {
+        if let Err(response) =
+            validate_put_object_checksum(checksum, &body.bytes, &resource, request_id)
+        {
+            return Ok(response);
+        }
     }
 
     state
@@ -523,6 +530,7 @@ fn list_objects_v2_route_response(
     delimiter: Option<String>,
     continuation_token: Option<String>,
     max_keys: usize,
+    encoding: Option<ListObjectsEncoding>,
     request_id: &S3RequestId,
 ) -> Result<Response<Body>, (StorageError, String)> {
     let request_continuation_token = continuation_token.clone();
@@ -537,13 +545,21 @@ fn list_objects_v2_route_response(
         .storage()
         .list_objects(&bucket, options)
         .map(|listing| {
-            let listing = list_objects_v2_xml(listing);
+            let listing = list_objects_v2_xml(listing, encoding);
+            let response_prefix = prefix
+                .as_ref()
+                .map(ObjectKey::as_str)
+                .map(|value| list_objects_xml_text(value, encoding));
+            let response_delimiter = delimiter
+                .as_deref()
+                .map(|value| list_objects_xml_text(value, encoding));
             xml_response(
                 list_objects_v2_response_xml(
                     &listing,
-                    prefix.as_ref().map(ObjectKey::as_str),
-                    delimiter.as_deref(),
+                    response_prefix.as_deref(),
+                    response_delimiter.as_deref(),
                     request_continuation_token.as_deref(),
+                    encoding.map(list_objects_encoding_value),
                 ),
                 request_id,
             )
@@ -746,6 +762,20 @@ fn parse_max_keys(value: Option<&String>, resource: &str) -> Result<usize, Route
     Ok(max_keys)
 }
 
+fn parse_list_objects_encoding(
+    value: Option<&String>,
+    resource: &str,
+) -> Result<Option<ListObjectsEncoding>, RouteRejection> {
+    match value.map(String::as_str) {
+        None => Ok(None),
+        Some("url") => Ok(Some(ListObjectsEncoding::Url)),
+        Some(_) => Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        )),
+    }
+}
+
 fn has_valid_percent_encoding(raw: &str) -> bool {
     let bytes = raw.as_bytes();
     let mut index = 0;
@@ -872,30 +902,59 @@ fn list_buckets_xml(buckets: Vec<BucketSummary>) -> ListBucketsXml {
     }
 }
 
-fn list_objects_v2_xml(listing: ObjectListing) -> ListObjectsV2Xml {
+fn list_objects_v2_xml(
+    listing: ObjectListing,
+    encoding: Option<ListObjectsEncoding>,
+) -> ListObjectsV2Xml {
     ListObjectsV2Xml {
-        bucket: listing.bucket.as_str().to_owned(),
+        bucket: list_objects_xml_text(listing.bucket.as_str(), encoding),
         entries: listing
             .entries
             .into_iter()
             .map(|entry| match entry {
                 ObjectListingEntry::Object(object) => {
                     ListObjectsV2XmlEntry::Object(ListObjectXml {
-                        key: object.key.as_str().to_owned(),
+                        key: list_objects_xml_text(object.key.as_str(), encoding),
                         etag: object.etag,
                         content_length: object.content_length,
                         last_modified: object.last_modified,
                     })
                 }
-                ObjectListingEntry::CommonPrefix(prefix) => {
-                    ListObjectsV2XmlEntry::CommonPrefix(prefix.as_str().to_owned())
-                }
+                ObjectListingEntry::CommonPrefix(prefix) => ListObjectsV2XmlEntry::CommonPrefix(
+                    list_objects_xml_text(prefix.as_str(), encoding),
+                ),
             })
             .collect(),
         max_keys: listing.max_keys,
         is_truncated: listing.is_truncated,
         next_continuation_token: listing.next_continuation_token,
     }
+}
+
+fn list_objects_xml_text(value: &str, encoding: Option<ListObjectsEncoding>) -> String {
+    match encoding {
+        Some(ListObjectsEncoding::Url) => s3_url_encode(value),
+        None => value.to_owned(),
+    }
+}
+
+fn list_objects_encoding_value(encoding: ListObjectsEncoding) -> &'static str {
+    match encoding {
+        ListObjectsEncoding::Url => "url",
+    }
+}
+
+fn s3_url_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(*byte));
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn object_response(
@@ -1158,14 +1217,17 @@ fn decode_put_object_body(
     match body_encoding {
         PutObjectBodyEncoding::Plain => Ok(PutObjectBody {
             bytes: bytes.to_vec(),
-            checksum: header_checksum,
+            checksums: put_object_checksums([header_checksum]),
         }),
         PutObjectBodyEncoding::AwsChunked => {
             let decoded = decode_aws_chunked_body(bytes, resource, request_id)?;
             validate_decoded_content_length(headers, decoded.bytes.len(), resource, request_id)?;
             Ok(PutObjectBody {
                 bytes: decoded.bytes,
-                checksum: decoded.trailer_checksum.unwrap_or(header_checksum),
+                checksums: put_object_checksums([header_checksum])
+                    .into_iter()
+                    .chain(decoded.trailer_checksum)
+                    .collect(),
             })
         }
     }
@@ -1224,11 +1286,14 @@ fn decode_aws_chunked_body(
         let chunk_end = position
             .checked_add(chunk_size)
             .ok_or_else(|| malformed_aws_chunked_response(resource, request_id))?;
-        if chunk_end + 2 > bytes.len() || &bytes[chunk_end..chunk_end + 2] != b"\r\n" {
+        let chunk_crlf_end = chunk_end
+            .checked_add(2)
+            .ok_or_else(|| malformed_aws_chunked_response(resource, request_id))?;
+        if chunk_crlf_end > bytes.len() || &bytes[chunk_end..chunk_crlf_end] != b"\r\n" {
             return Err(malformed_aws_chunked_response(resource, request_id));
         }
         decoded.extend_from_slice(&bytes[position..chunk_end]);
-        position = chunk_end + 2;
+        position = chunk_crlf_end;
     }
 }
 
@@ -1351,6 +1416,15 @@ fn validate_put_object_checksum(
     }
 }
 
+fn put_object_checksums(
+    checksums: impl IntoIterator<Item = PutObjectChecksum>,
+) -> Vec<PutObjectChecksum> {
+    checksums
+        .into_iter()
+        .filter(|checksum| !matches!(checksum, PutObjectChecksum::None))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PutObjectBodyEncoding {
     Plain,
@@ -1360,7 +1434,7 @@ enum PutObjectBodyEncoding {
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct PutObjectBody {
     bytes: Vec<u8>,
-    checksum: PutObjectChecksum,
+    checksums: Vec<PutObjectChecksum>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1585,7 +1659,7 @@ const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
     "object-lock",
 ];
 
-const UNSUPPORTED_LIST_OBJECTS_V2_PARAMS: &[&str] = &[ENCODING_TYPE, START_AFTER, FETCH_OWNER];
+const UNSUPPORTED_LIST_OBJECTS_V2_PARAMS: &[&str] = &[START_AFTER, FETCH_OWNER];
 
 const UNSUPPORTED_PUT_OBJECT_HEADERS: &[&str] = &[
     "cache-control",

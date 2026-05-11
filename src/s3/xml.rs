@@ -97,6 +97,7 @@ pub fn list_objects_v2_response_xml(
     prefix: Option<&str>,
     delimiter: Option<&str>,
     continuation_token: Option<&str>,
+    encoding_type: Option<&str>,
 ) -> String {
     let mut writer = Writer::new(Vec::new());
 
@@ -108,6 +109,9 @@ pub fn list_objects_v2_response_xml(
     write_text_element(&mut writer, "Prefix", prefix.unwrap_or(""));
     if let Some(delimiter) = delimiter {
         write_text_element(&mut writer, "Delimiter", delimiter);
+    }
+    if let Some(encoding_type) = encoding_type {
+        write_text_element(&mut writer, "EncodingType", encoding_type);
     }
     write_text_element(&mut writer, "KeyCount", &listing.entries.len().to_string());
     write_text_element(&mut writer, "MaxKeys", &listing.max_keys.to_string());

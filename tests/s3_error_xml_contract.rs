@@ -66,7 +66,7 @@ fn list_objects_v2_xml_represents_empty_prefixed_listing() {
     };
 
     assert_eq!(
-        list_objects_v2_response_xml(&listing, Some("logs/&<today>"), None, None),
+        list_objects_v2_response_xml(&listing, Some("logs/&<today>"), None, None, None),
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>empty-bucket</Name><Prefix>logs/&amp;&lt;today&gt;</Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"
     );
 }
@@ -85,7 +85,7 @@ fn list_objects_v2_xml_preserves_object_order_sizes_and_truncated_token() {
     };
 
     assert_eq!(
-        list_objects_v2_response_xml(&listing, None, None, None),
+        list_objects_v2_response_xml(&listing, None, None, None, None),
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>example-bucket</Name><Prefix></Prefix><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated><Contents><Key>photos/a&amp;b.txt</Key><LastModified>1970-01-01T00:00:00.000Z</LastModified><ETag>&quot;d41d8cd98f00b204e9800998ecf8427e&quot;</ETag><Size>11</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>photos/z&lt;last&gt;.txt</Key><LastModified>1970-01-01T00:00:00.000Z</LastModified><ETag>&quot;d41d8cd98f00b204e9800998ecf8427e&quot;</ETag><Size>42</Size><StorageClass>STANDARD</StorageClass></Contents><NextContinuationToken>next&amp;page&lt;2&gt;</NextContinuationToken></ListBucketResult>"
     );
 }
@@ -104,7 +104,7 @@ fn list_objects_v2_xml_echoes_request_continuation_token() {
     };
 
     assert_eq!(
-        list_objects_v2_response_xml(&listing, None, None, Some("page&2<now>")),
+        list_objects_v2_response_xml(&listing, None, None, Some("page&2<now>"), None),
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>example-bucket</Name><Prefix></Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><ContinuationToken>page&amp;2&lt;now&gt;</ContinuationToken><IsTruncated>false</IsTruncated><Contents><Key>photos/a.txt</Key><LastModified>1970-01-01T00:00:00.000Z</LastModified><ETag>&quot;d41d8cd98f00b204e9800998ecf8427e&quot;</ETag><Size>11</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>"
     );
 }
@@ -123,7 +123,7 @@ fn list_objects_v2_xml_escapes_carriage_return_as_character_reference() {
     };
 
     assert_eq!(
-        list_objects_v2_response_xml(&listing, Some("logs/\r"), None, None),
+        list_objects_v2_response_xml(&listing, Some("logs/\r"), None, None, None),
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>example-bucket</Name><Prefix>logs/&#13;</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>logs/&#13;object.txt</Key><LastModified>1970-01-01T00:00:00.000Z</LastModified><ETag>&quot;d41d8cd98f00b204e9800998ecf8427e&quot;</ETag><Size>4</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>"
     );
 }
@@ -142,7 +142,7 @@ fn list_objects_v2_xml_writes_delimiter_common_prefixes_and_key_count() {
     };
 
     assert_eq!(
-        list_objects_v2_response_xml(&listing, None, Some("/"), None),
+        list_objects_v2_response_xml(&listing, None, Some("/"), None, None),
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>example-bucket</Name><Prefix></Prefix><Delimiter>/</Delimiter><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>a.txt</Key><LastModified>1970-01-01T00:00:00.000Z</LastModified><ETag>&quot;d41d8cd98f00b204e9800998ecf8427e&quot;</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents><CommonPrefixes><Prefix>photos/&amp;&lt;raw&gt;/</Prefix></CommonPrefixes></ListBucketResult>"
     );
 }
