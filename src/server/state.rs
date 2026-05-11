@@ -91,7 +91,8 @@ mod tests {
 
     #[test]
     fn from_storage_wraps_filesystem_backed_state() {
-        let state = ServerState::from_storage(FilesystemStorage::new("./s3lab-data"));
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let state = ServerState::from_storage(FilesystemStorage::new(temp_dir.path()));
 
         assert_eq!(
             state

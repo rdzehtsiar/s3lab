@@ -27,7 +27,8 @@ fn default_runtime_config_matches_phase1_local_defaults() {
 fn planned_module_boundaries_are_available_to_tests() {
     let bucket = BucketName::new("example-bucket");
     let object = ObjectKey::new("prefix/example.txt");
-    let storage = FilesystemStorage::new("./s3lab-data");
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let storage = FilesystemStorage::new(temp_dir.path());
     let state = ServerState::from_storage(storage);
 
     assert_eq!(bucket.as_str(), "example-bucket");

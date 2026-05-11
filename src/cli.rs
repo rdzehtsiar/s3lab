@@ -137,8 +137,7 @@ where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString> + Clone,
 {
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = std::io::stdout();
 
     run_with_writer(args, &mut stdout).await
 }
@@ -184,9 +183,11 @@ where
     let listener = crate::server::bind_listener(&config).await?;
     let endpoint = crate::server::listener_endpoint(&listener)?;
 
-    writeln!(writer, "S3 endpoint:  {endpoint}")?;
-    writeln!(writer, "Data dir:     {}", config.data_dir.display())?;
-    writer.flush()?;
+    {
+        writeln!(writer, "S3 endpoint:  {endpoint}")?;
+        writeln!(writer, "Data dir:     {}", config.data_dir.display())?;
+        writer.flush()?;
+    }
     tracing::info!(
         endpoint = %endpoint,
         data_dir = %config.data_dir.display(),
@@ -216,6 +217,7 @@ fn init_tracing() {
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
         .try_init();
 }
 
