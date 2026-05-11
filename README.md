@@ -87,6 +87,17 @@ Use path-style localhost configuration for SDKs. Phase 1 accepts signed local re
 
 See [Phase 1 Smoke Tests](./docs/phase1-smoke-tests.md) for narrow AWS CLI, boto3, AWS SDK for JavaScript v3, and Go SDK recipes that exercise the implemented bucket and object lifecycle.
 
+## Local Verification
+
+Run the same local, credentials-free checks used by CI before opening a change:
+
+```powershell
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo llvm-cov --workspace --codecov --remap-path-prefix --output-path codecov.json
+```
+
 ## Project Principles
 
 - offline first
