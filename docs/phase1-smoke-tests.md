@@ -16,6 +16,7 @@ This is not a general compatibility claim. Phase 1 smoke evidence only covers th
 - Requests stay offline and target only the local S3Lab endpoint through `--endpoint-url`, boto3 `endpoint_url`, AWS SDK for JavaScript v3 `endpoint`, or the Go SDK local endpoint configuration.
 - Phase 1 accepts signed client requests but does not validate SigV4 signatures yet.
 - Phase 1 supports path-style localhost routing, for example `http://127.0.0.1:9000/s3lab-smoke-bucket/object.txt`.
+- Phase 1 uses conservative DNS-style bucket validation for local safety and practical SDK/CLI workflows, not complete AWS parity. Tests currently cover rejection of names that are too short, contain uppercase letters, underscores, adjacent dots, dot-hyphen or hyphen-dot pairs, IP-address-like names, slashes, or the modeled AWS reserved prefixes and suffixes.
 - Virtual-host style routing, presigned URLs, and multipart uploads are deferred.
 - Phase 1 preserves valid `x-amz-meta-*` object metadata, normalizes metadata keys to lowercase, returns metadata on `GET` and `HEAD`, and rejects invalid, non-UTF8, or duplicate normalized metadata.
 

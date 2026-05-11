@@ -63,6 +63,8 @@ Phase 1 is a narrow local endpoint for implemented bucket and object operations.
 
 Phase 1 rejects invalid user metadata, including an empty `x-amz-meta-` suffix, non-UTF8 metadata values, and duplicate metadata keys after lowercase normalization.
 
+Phase 1 uses conservative DNS-style bucket validation for local safety and practical SDK/CLI workflows, not complete AWS parity. Current tests cover rejection of names that are too short, contain uppercase letters, underscores, adjacent dots, dot-hyphen or hyphen-dot pairs, IP-address-like names, slashes, or the AWS reserved prefixes and suffixes currently modeled by the implementation.
+
 Compatibility evidence is limited to the operations implemented in Phase 1 and the documented smoke recipes. Do not treat Phase 1 behavior as broad AWS S3 compatibility.
 
 ## Quick Start
