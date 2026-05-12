@@ -1293,9 +1293,16 @@ mod tests {
     };
 
     const VALID_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260512/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789ABCDEF";
+    const VALID_IAM_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host;x-amz-date, Signature=b2e4af44cfad96d9ffa3c5653674a927b9b0995c33de22e1f843745ce37c1d5e";
     const EMPTY_PAYLOAD_SHA256: &str =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const TEST_SECRET_ACCESS_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+    const IAM_REQUEST_DATETIME: &str = "20150830T123600Z";
+    const IAM_QUERY: &[(&str, &str)] = &[("Action", "ListUsers"), ("Version", "2010-05-08")];
+    const IAM_HEADERS: &[(&str, &str)] = &[
+        ("Host", "iam.amazonaws.com"),
+        ("X-Amz-Date", IAM_REQUEST_DATETIME),
+    ];
 
     #[test]
     fn parses_valid_authorization_header() {
@@ -1507,24 +1514,11 @@ mod tests {
 
     #[test]
     fn verification_debug_redacts_canonical_request_and_string_to_sign() {
-        let authorization = parse_authorization_header(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host;x-amz-date, Signature=b2e4af44cfad96d9ffa3c5653674a927b9b0995c33de22e1f843745ce37c1d5e",
-        )
-        .expect("valid authorization");
+        let authorization = valid_iam_authorization();
         let verification = verify_signature(
             &authorization,
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            SigV4VerificationRequest {
-                request_datetime: "20150830T123600Z",
-                method: "GET",
-                path: "/",
-                query: &[("Action", "ListUsers"), ("Version", "2010-05-08")],
-                headers: &[
-                    ("Host", "iam.amazonaws.com"),
-                    ("X-Amz-Date", "20150830T123600Z"),
-                ],
-                payload_hash: EMPTY_PAYLOAD_SHA256,
-            },
+            TEST_SECRET_ACCESS_KEY,
+            valid_iam_verification_request(),
         )
         .expect("signature should verify");
         let debug = format!("{verification:?}");
@@ -1628,24 +1622,18 @@ mod tests {
 
     #[test]
     fn builds_string_to_sign_and_verifies_signature() {
-        let authorization = parse_authorization_header(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host;x-amz-date, Signature=b2e4af44cfad96d9ffa3c5653674a927b9b0995c33de22e1f843745ce37c1d5e",
-        )
-        .expect("valid authorization");
+        let authorization = valid_iam_authorization();
         let canonical = build_canonical_request(
             "GET",
             "/",
-            &[("Action", "ListUsers"), ("Version", "2010-05-08")],
-            &[
-                ("Host", "iam.amazonaws.com"),
-                ("X-Amz-Date", "20150830T123600Z"),
-            ],
+            IAM_QUERY,
+            IAM_HEADERS,
             authorization.signed_headers(),
             EMPTY_PAYLOAD_SHA256,
         )
         .expect("canonical request");
         let string_to_sign = build_string_to_sign(
-            "20150830T123600Z",
+            IAM_REQUEST_DATETIME,
             authorization.credential().scope(),
             &canonical,
         );
@@ -1660,18 +1648,8 @@ mod tests {
 
         let verification = verify_signature(
             &authorization,
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            SigV4VerificationRequest {
-                request_datetime: "20150830T123600Z",
-                method: "GET",
-                path: "/",
-                query: &[("Action", "ListUsers"), ("Version", "2010-05-08")],
-                headers: &[
-                    ("Host", "iam.amazonaws.com"),
-                    ("X-Amz-Date", "20150830T123600Z"),
-                ],
-                payload_hash: EMPTY_PAYLOAD_SHA256,
-            },
+            TEST_SECRET_ACCESS_KEY,
+            valid_iam_verification_request(),
         )
         .expect("signature should verify");
 
@@ -2046,6 +2024,21 @@ mod tests {
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect()
+    }
+
+    fn valid_iam_authorization() -> super::SigV4Authorization {
+        parse_authorization_header(VALID_IAM_AUTHORIZATION).expect("valid authorization")
+    }
+
+    fn valid_iam_verification_request() -> SigV4VerificationRequest<'static> {
+        SigV4VerificationRequest {
+            request_datetime: IAM_REQUEST_DATETIME,
+            method: "GET",
+            path: "/",
+            query: IAM_QUERY,
+            headers: IAM_HEADERS,
+            payload_hash: EMPTY_PAYLOAD_SHA256,
+        }
     }
 
     fn presigned_signature(query: &[(&str, &str)], payload_hash: &str) -> String {
