@@ -1659,6 +1659,467 @@ fn storage_reopens_from_same_root() {
 }
 
 #[test]
+fn snapshot_restore_returns_deterministic_saved_state_and_keeps_storage_usable() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, "b.txt", b"baseline-b"))
+        .expect("put baseline b");
+    storage
+        .put_object(put_request(&bucket, "a.txt", b"baseline-a"))
+        .expect("put baseline a");
+
+    storage.save_snapshot("baseline.v1").expect("save snapshot");
+    let baseline_journal =
+        fs::read(temp_dir.path().join("events").join("journal.jsonl")).expect("read journal");
+
+    storage
+        .put_object(put_request(&bucket, "b.txt", b"changed-b"))
+        .expect("overwrite object after snapshot");
+    storage
+        .create_bucket(&BucketName::new("other-bucket"))
+        .expect("create extra bucket after snapshot");
+
+    storage
+        .restore_snapshot("baseline.v1")
+        .expect("restore snapshot");
+
+    assert_eq!(
+        bucket_names(&storage.list_buckets().expect("list restored buckets")),
+        ["example-bucket"]
+    );
+    assert_eq!(
+        object_keys(
+            &storage
+                .list_objects(&bucket, ListObjectsOptions::default())
+                .expect("list restored objects")
+                .objects
+        ),
+        ["a.txt", "b.txt"]
+    );
+    assert_eq!(
+        storage
+            .get_object_bytes(&bucket, &ObjectKey::new("b.txt"))
+            .expect("read restored object"),
+        b"baseline-b"
+    );
+    assert_eq!(
+        fs::read(temp_dir.path().join("events").join("journal.jsonl"))
+            .expect("read restored journal"),
+        baseline_journal
+    );
+
+    let first_restore_components = filesystem_path_components(temp_dir.path());
+    storage
+        .put_object(put_request(&bucket, "c.txt", b"new-after-restore"))
+        .expect("storage remains writable after restore");
+    storage
+        .restore_snapshot("baseline.v1")
+        .expect("restore snapshot again");
+
+    assert_eq!(
+        filesystem_path_components(temp_dir.path()),
+        first_restore_components
+    );
+    assert!(matches!(
+        storage
+            .get_object_metadata(&bucket, &ObjectKey::new("c.txt"))
+            .expect_err("second restore removes post-restore object"),
+        StorageError::NoSuchKey { .. }
+    ));
+}
+
+#[test]
+fn save_snapshot_rejects_overwriting_existing_snapshot() {
+    let (_temp_dir, storage) = storage();
+
+    storage.save_snapshot("baseline").expect("save snapshot");
+    let error = storage
+        .save_snapshot("baseline")
+        .expect_err("snapshot overwrite is rejected");
+
+    assert!(matches!(error, StorageError::InvalidArgument { .. }));
+    assert!(error.to_string().contains("snapshot already exists"));
+}
+
+#[test]
+fn restore_snapshot_reports_missing_snapshot_as_invalid_argument() {
+    let (_temp_dir, storage) = storage();
+
+    let error = storage
+        .restore_snapshot("missing")
+        .expect_err("missing snapshot fails");
+
+    assert!(matches!(error, StorageError::InvalidArgument { .. }));
+    assert!(error.to_string().contains("snapshot does not exist"));
+}
+
+#[test]
+fn restore_snapshot_rejects_incomplete_snapshot_before_current_state_changes() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("object.txt");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"snapshot-body"))
+        .expect("put snapshot object");
+    storage.save_snapshot("baseline").expect("save snapshot");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"current-body"))
+        .expect("put current object");
+    fs::remove_dir_all(
+        temp_dir
+            .path()
+            .join("snapshots")
+            .join("baseline")
+            .join(STORAGE_ROOT_DIR),
+    )
+    .expect("remove manifest-declared snapshot buckets");
+
+    let error = storage
+        .restore_snapshot("baseline")
+        .expect_err("incomplete snapshot is rejected");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+    assert_eq!(
+        storage
+            .get_object_bytes(&bucket, &key)
+            .expect("current object remains readable"),
+        b"current-body"
+    );
+    assert_eq!(
+        bucket_names(&storage.list_buckets().expect("list current buckets")),
+        ["example-bucket"]
+    );
+}
+
+#[test]
+fn restore_snapshot_rejects_internally_corrupt_snapshot_before_current_state_changes() {
+    for corruption in [
+        SnapshotCorruption::MissingBucketMetadata,
+        SnapshotCorruption::CorruptBucketMetadata,
+        SnapshotCorruption::MissingObjectMetadata,
+        SnapshotCorruption::CorruptObjectMetadata,
+        SnapshotCorruption::MissingObjectContent,
+        SnapshotCorruption::CorruptObjectContent,
+    ] {
+        let (temp_dir, storage) = storage();
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("object.txt");
+        storage.create_bucket(&bucket).expect("create bucket");
+        storage
+            .put_object(put_request(&bucket, key.as_str(), b"snapshot-body"))
+            .expect("put snapshot object");
+        storage.save_snapshot("baseline").expect("save snapshot");
+        storage
+            .put_object(put_request(&bucket, key.as_str(), b"current-body"))
+            .expect("put current object");
+        storage
+            .create_bucket(&BucketName::new("current-only"))
+            .expect("create current-only bucket");
+
+        let snapshot_root = temp_dir.path().join("snapshots").join("baseline");
+        corruption.apply(&snapshot_root, &bucket, &key);
+
+        let error = storage
+            .restore_snapshot("baseline")
+            .expect_err("internally corrupt snapshot is rejected");
+
+        assert!(
+            matches!(error, StorageError::CorruptState { .. }),
+            "{corruption:?} should be reported as corrupt state: {error}"
+        );
+        assert_eq!(
+            storage
+                .get_object_bytes(&bucket, &key)
+                .expect("current object remains readable"),
+            b"current-body",
+            "{corruption:?} should not replace current object state"
+        );
+        assert_eq!(
+            bucket_names(&storage.list_buckets().expect("list current buckets")),
+            ["current-only", "example-bucket"],
+            "{corruption:?} should not replace current bucket state"
+        );
+    }
+}
+
+#[test]
+fn restore_snapshot_rejects_corrupt_journal_before_current_state_changes() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("object.txt");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"snapshot-body"))
+        .expect("put snapshot object");
+    storage.save_snapshot("baseline").expect("save snapshot");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"current-body"))
+        .expect("put current object");
+    storage
+        .create_bucket(&BucketName::new("current-only"))
+        .expect("create current-only bucket");
+    fs::write(
+        temp_dir
+            .path()
+            .join("snapshots")
+            .join("baseline")
+            .join("events")
+            .join("journal.jsonl"),
+        b"{not-json\n",
+    )
+    .expect("write corrupt snapshot journal");
+
+    let error = storage
+        .restore_snapshot("baseline")
+        .expect_err("corrupt snapshot journal is rejected");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+    assert_eq!(
+        storage
+            .get_object_bytes(&bucket, &key)
+            .expect("current object remains readable"),
+        b"current-body"
+    );
+    assert_eq!(
+        bucket_names(&storage.list_buckets().expect("list current buckets")),
+        ["current-only", "example-bucket"]
+    );
+}
+
+#[test]
+fn restore_snapshot_rejects_semantically_corrupt_journal_before_current_state_changes() {
+    for corruption in [
+        JournalSemanticCorruption::InvalidCommittedBucketName,
+        JournalSemanticCorruption::InvalidCommittedObjectKey,
+    ] {
+        let (temp_dir, storage) = storage();
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("object.txt");
+        storage.create_bucket(&bucket).expect("create bucket");
+        storage
+            .put_object(put_request(&bucket, key.as_str(), b"snapshot-body"))
+            .expect("put snapshot object");
+        storage.save_snapshot("baseline").expect("save snapshot");
+        storage
+            .put_object(put_request(&bucket, key.as_str(), b"current-body"))
+            .expect("put current object");
+        storage
+            .create_bucket(&BucketName::new("current-only"))
+            .expect("create current-only bucket");
+
+        let snapshot_root = temp_dir.path().join("snapshots").join("baseline");
+        corruption.apply(&snapshot_root);
+
+        let error = storage
+            .restore_snapshot("baseline")
+            .expect_err("semantically corrupt snapshot journal is rejected");
+
+        assert!(
+            matches!(error, StorageError::CorruptState { .. }),
+            "{corruption:?} should be reported as corrupt state: {error}"
+        );
+        assert_eq!(
+            storage
+                .get_object_bytes(&bucket, &key)
+                .expect("current object remains readable"),
+            b"current-body",
+            "{corruption:?} should not replace current object state"
+        );
+        assert_eq!(
+            bucket_names(&storage.list_buckets().expect("list current buckets")),
+            ["current-only", "example-bucket"],
+            "{corruption:?} should not replace current bucket state"
+        );
+    }
+}
+
+#[test]
+fn restore_snapshot_rejects_missing_journal_object_put_blob_before_current_state_changes() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("object.txt");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"snapshot-body"))
+        .expect("put snapshot object");
+    storage.save_snapshot("baseline").expect("save snapshot");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"current-body"))
+        .expect("put current object");
+    storage
+        .create_bucket(&BucketName::new("current-only"))
+        .expect("create current-only bucket");
+    fs::remove_file(snapshot_blob_path(
+        &temp_dir.path().join("snapshots").join("baseline"),
+        b"snapshot-body",
+    ))
+    .expect("remove snapshot object-put blob");
+
+    let error = storage
+        .restore_snapshot("baseline")
+        .expect_err("snapshot with missing object-put blob is rejected");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+    assert_eq!(
+        storage
+            .get_object_bytes(&bucket, &key)
+            .expect("current object remains readable"),
+        b"current-body"
+    );
+    assert_eq!(
+        bucket_names(&storage.list_buckets().expect("list current buckets")),
+        ["current-only", "example-bucket"]
+    );
+}
+
+#[test]
+fn restore_snapshot_rejects_corrupt_blob_before_current_state_changes() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("object.txt");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"snapshot-body"))
+        .expect("put snapshot object");
+    storage.save_snapshot("baseline").expect("save snapshot");
+    storage
+        .put_object(put_request(&bucket, key.as_str(), b"current-body"))
+        .expect("put current object");
+    storage
+        .create_bucket(&BucketName::new("current-only"))
+        .expect("create current-only bucket");
+    fs::write(
+        snapshot_blob_path(
+            &temp_dir.path().join("snapshots").join("baseline"),
+            b"snapshot-body",
+        ),
+        b"corrupt-snapshot-blob",
+    )
+    .expect("write corrupt snapshot blob");
+
+    let error = storage
+        .restore_snapshot("baseline")
+        .expect_err("corrupt snapshot blob is rejected");
+
+    assert!(matches!(error, StorageError::CorruptState { .. }));
+    assert_eq!(
+        storage
+            .get_object_bytes(&bucket, &key)
+            .expect("current object remains readable"),
+        b"current-body"
+    );
+    assert_eq!(
+        bucket_names(&storage.list_buckets().expect("list current buckets")),
+        ["current-only", "example-bucket"]
+    );
+}
+
+#[test]
+fn restore_empty_snapshot_uses_manifest_to_delete_current_state() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    storage.save_snapshot("empty").expect("save empty snapshot");
+    let manifest = fs::read_to_string(
+        temp_dir
+            .path()
+            .join("snapshots")
+            .join("empty")
+            .join("manifest.json"),
+    )
+    .expect("read empty snapshot manifest");
+    assert!(manifest.contains(r#""schema_version": 1"#));
+    assert!(manifest.contains(r#""buckets""#));
+    assert!(manifest.contains(r#""present": false"#));
+
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, "object.txt", b"current-body"))
+        .expect("put current object");
+
+    storage
+        .restore_snapshot("empty")
+        .expect("restore empty snapshot");
+
+    assert!(storage.list_buckets().expect("list buckets").is_empty());
+    assert!(!temp_dir.path().join(STORAGE_ROOT_DIR).exists());
+    assert!(!temp_dir.path().join("events").exists());
+    assert!(!temp_dir.path().join("blobs").exists());
+}
+
+#[test]
+fn reset_removes_current_state_but_preserves_snapshots() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    storage.create_bucket(&bucket).expect("create bucket");
+    storage
+        .put_object(put_request(&bucket, "object.txt", b"snapshot-body"))
+        .expect("put object");
+    storage.save_snapshot("baseline").expect("save snapshot");
+    fs::write(temp_dir.path().join(".mutation-dirty"), b"dirty\n").expect("write dirty marker");
+
+    storage.reset().expect("reset storage");
+
+    assert!(!temp_dir.path().join(STORAGE_ROOT_DIR).exists());
+    assert!(!temp_dir.path().join("events").exists());
+    assert!(!temp_dir.path().join("blobs").exists());
+    assert!(!temp_dir.path().join(".mutation-dirty").exists());
+    assert!(temp_dir.path().join("snapshots").join("baseline").is_dir());
+
+    storage
+        .restore_snapshot("baseline")
+        .expect("restore preserved snapshot");
+    assert_eq!(
+        storage
+            .get_object_bytes(&bucket, &ObjectKey::new("object.txt"))
+            .expect("read restored object"),
+        b"snapshot-body"
+    );
+}
+
+#[test]
+fn snapshot_names_are_validated_before_save_or_restore() {
+    let (_temp_dir, storage) = storage();
+
+    for name in [
+        "",
+        ".",
+        "..",
+        "bad/name",
+        "bad\\name",
+        "bad name",
+        "bad:name",
+        "caf\u{00e9}",
+    ] {
+        let save_error = storage
+            .save_snapshot(name)
+            .expect_err("invalid snapshot name fails save");
+        let restore_error = storage
+            .restore_snapshot(name)
+            .expect_err("invalid snapshot name fails restore");
+
+        assert!(
+            matches!(save_error, StorageError::InvalidArgument { .. }),
+            "save should reject invalid snapshot name: {name:?}"
+        );
+        assert!(
+            save_error.to_string().contains("invalid snapshot name"),
+            "save error should explain invalid name: {name:?}"
+        );
+        assert!(
+            matches!(restore_error, StorageError::InvalidArgument { .. }),
+            "restore should reject invalid snapshot name: {name:?}"
+        );
+        assert!(
+            restore_error.to_string().contains("invalid snapshot name"),
+            "restore error should explain invalid name: {name:?}"
+        );
+    }
+}
+
+#[test]
 fn list_objects_paginates_with_tokens_for_next_unreturned_key() {
     let (_temp_dir, storage) = storage_with_objects(["z.txt", "a.txt", "m.txt"]);
     let bucket = BucketName::new("example-bucket");
@@ -2063,6 +2524,13 @@ fn object_keys(metadata: &[StoredObjectMetadata]) -> Vec<&str> {
         .collect::<Vec<_>>()
 }
 
+fn bucket_names(buckets: &[s3lab::storage::BucketSummary]) -> Vec<&str> {
+    buckets
+        .iter()
+        .map(|bucket| bucket.name.as_str())
+        .collect::<Vec<_>>()
+}
+
 fn object_key_values(keys: &[ObjectKey]) -> Vec<&str> {
     keys.iter().map(ObjectKey::as_str).collect::<Vec<_>>()
 }
@@ -2165,6 +2633,83 @@ struct ObjectPaths {
     metadata: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SnapshotCorruption {
+    MissingBucketMetadata,
+    CorruptBucketMetadata,
+    MissingObjectMetadata,
+    CorruptObjectMetadata,
+    MissingObjectContent,
+    CorruptObjectContent,
+}
+
+impl SnapshotCorruption {
+    fn apply(self, snapshot_root: &Path, bucket: &BucketName, key: &ObjectKey) {
+        let bucket_metadata = bucket_dir(snapshot_root, bucket).join("bucket.json");
+        let object_paths = object_paths(snapshot_root, bucket, key);
+        match self {
+            Self::MissingBucketMetadata => {
+                fs::remove_file(bucket_metadata).expect("remove snapshot bucket metadata");
+            }
+            Self::CorruptBucketMetadata => {
+                fs::write(bucket_metadata, b"{not-json")
+                    .expect("write corrupt snapshot bucket metadata");
+            }
+            Self::MissingObjectMetadata => {
+                fs::remove_file(object_paths.metadata).expect("remove snapshot object metadata");
+            }
+            Self::CorruptObjectMetadata => {
+                fs::write(object_paths.metadata, b"{not-json")
+                    .expect("write corrupt snapshot object metadata");
+            }
+            Self::MissingObjectContent => {
+                fs::remove_file(object_paths.content).expect("remove snapshot object content");
+            }
+            Self::CorruptObjectContent => {
+                fs::write(object_paths.content, b"corrupt-body")
+                    .expect("write corrupt snapshot object content");
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JournalSemanticCorruption {
+    InvalidCommittedBucketName,
+    InvalidCommittedObjectKey,
+}
+
+impl JournalSemanticCorruption {
+    fn apply(self, snapshot_root: &Path) {
+        rewrite_snapshot_journal(snapshot_root, |line_index, record| match self {
+            Self::InvalidCommittedBucketName if line_index < 2 => {
+                record["mutation"]["bucket"] = serde_json::json!("Invalid_Bucket");
+            }
+            Self::InvalidCommittedObjectKey if (2..4).contains(&line_index) => {
+                record["mutation"]["key"] = serde_json::json!("");
+            }
+            _ => {}
+        });
+    }
+}
+
+fn rewrite_snapshot_journal(
+    snapshot_root: &Path,
+    mut rewrite: impl FnMut(usize, &mut serde_json::Value),
+) {
+    let journal_path = snapshot_root.join("events").join("journal.jsonl");
+    let journal = fs::read_to_string(&journal_path).expect("read snapshot journal");
+    let mut rewritten = Vec::new();
+    for (line_index, line) in journal.lines().enumerate() {
+        let mut record =
+            serde_json::from_str::<serde_json::Value>(line).expect("parse journal record");
+        rewrite(line_index, &mut record);
+        rewritten.extend(serde_json::to_vec(&record).expect("serialize journal record"));
+        rewritten.push(b'\n');
+    }
+    fs::write(journal_path, rewritten).expect("write rewritten snapshot journal");
+}
+
 fn encoded_bucket_path_component(bucket: &BucketName) -> String {
     format!("bucket-{}", sha256_lower_hex(bucket.as_str()))
 }
@@ -2177,8 +2722,20 @@ fn object_key_shard(key: &ObjectKey) -> String {
     sha256_lower_hex(key.as_str())[..2].to_owned()
 }
 
+fn snapshot_blob_path(snapshot_root: &Path, bytes: &[u8]) -> PathBuf {
+    let content_sha256 = sha256_lower_hex_bytes(bytes);
+    snapshot_root
+        .join("blobs")
+        .join(&content_sha256[..2])
+        .join(content_sha256)
+}
+
 fn sha256_lower_hex(value: &str) -> String {
-    let digest = Sha256::digest(value.as_bytes());
+    sha256_lower_hex_bytes(value.as_bytes())
+}
+
+fn sha256_lower_hex_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     lower_hex(&digest)
 }
 

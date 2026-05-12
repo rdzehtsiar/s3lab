@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::journal::{Journal, JournalMutation, JournalPhase, JournalRecord};
+use super::journal::{
+    Journal, JournalMutation, JournalPhase, JournalRecord, EVENTS_DIR, JOURNAL_FILE_NAME,
+};
 use super::key::{encode_bucket_name, encode_object_key, EncodedObjectKey};
 use super::{
     BucketSummary, ListObjectsOptions, ObjectListing, ObjectListingEntry, PutObjectRequest,
@@ -32,6 +34,10 @@ const OBJECTS_DIR: &str = "objects";
 const OBJECT_CONTENT_FILE: &str = "content.bin";
 const OBJECT_METADATA_FILE: &str = "metadata.json";
 const OBJECT_METADATA_SCHEMA_VERSION: u32 = 1;
+const SNAPSHOT_MANIFEST_FILE: &str = "manifest.json";
+const SNAPSHOT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const SNAPSHOTS_DIR: &str = "snapshots";
+const SNAPSHOT_STATE_DIRS: [&str; 3] = [STORAGE_ROOT_DIR, EVENTS_DIR, BLOBS_DIR];
 const CONTINUATION_TOKEN_PREFIX: &str = "s3lab-v1:";
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -44,6 +50,7 @@ static STORAGE_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_NEW_OBJECT_STATE_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_STAGED_RESTORE_RENAME: Cell<bool> = const { Cell::new(false) };
 }
 
 pub trait StorageClock {
@@ -81,6 +88,78 @@ impl<C> FilesystemStorage<C> {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn save_snapshot(&self, name: &str) -> Result<(), StorageError> {
+        validate_snapshot_name(name)?;
+        let _guard = lock_storage(&self.root, "save_snapshot")?;
+        self.recover_if_dirty()?;
+
+        let snapshot_dir = self.snapshot_dir(name);
+        if path_exists(&snapshot_dir)? {
+            return Err(snapshot_already_exists(name));
+        }
+
+        let temporary_snapshot_dir = create_temporary_sibling_dir(&snapshot_dir)?;
+        if let Err(error) = self.copy_current_state_to_snapshot(&temporary_snapshot_dir) {
+            remove_path_best_effort(&temporary_snapshot_dir);
+            return Err(error);
+        }
+
+        if let Err(error) = rename_path(&temporary_snapshot_dir, &snapshot_dir) {
+            remove_path_best_effort(&temporary_snapshot_dir);
+            if path_exists(&snapshot_dir)? {
+                return Err(snapshot_already_exists(name));
+            }
+
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    pub fn restore_snapshot(&self, name: &str) -> Result<(), StorageError> {
+        validate_snapshot_name(name)?;
+        let _guard = lock_storage(&self.root, "restore_snapshot")?;
+
+        let snapshot_dir = self.snapshot_dir(name);
+        let Some(snapshot_metadata) = storage_path_metadata(&snapshot_dir)? else {
+            return Err(snapshot_not_found(name));
+        };
+        if !snapshot_metadata.is_dir() {
+            return Err(corrupt_state(
+                snapshot_dir,
+                "snapshot path exists but is not a directory",
+            ));
+        }
+
+        let staged_paths = match self.stage_snapshot_restore(&snapshot_dir) {
+            Ok(staged_paths) => staged_paths,
+            Err(error) => {
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = validate_staged_snapshot_contents(&staged_paths) {
+            cleanup_staged_snapshot_paths(&staged_paths);
+            return Err(error);
+        }
+
+        if let Err(error) = self.replace_current_state_with_staged_snapshot(staged_paths) {
+            return Err(error);
+        }
+
+        remove_storage_path_if_exists(&self.dirty_marker_path())
+    }
+
+    pub fn reset(&self) -> Result<(), StorageError> {
+        let _guard = lock_storage(&self.root, "reset")?;
+        remove_storage_path_if_exists(&self.bucket_root())?;
+        remove_storage_path_if_exists(&self.events_dir())?;
+        remove_storage_path_if_exists(&self.blobs_dir())?;
+        remove_storage_path_if_exists(&self.dirty_marker_path())?;
+        sync_parent_dir_best_effort(&self.root);
+        Ok(())
     }
 }
 
@@ -416,6 +495,22 @@ impl<C> FilesystemStorage<C> {
         self.root.join(STORAGE_ROOT_DIR)
     }
 
+    fn events_dir(&self) -> PathBuf {
+        self.root.join(EVENTS_DIR)
+    }
+
+    fn blobs_dir(&self) -> PathBuf {
+        self.root.join(BLOBS_DIR)
+    }
+
+    fn snapshot_root(&self) -> PathBuf {
+        self.root.join(SNAPSHOTS_DIR)
+    }
+
+    fn snapshot_dir(&self, name: &str) -> PathBuf {
+        self.snapshot_root().join(name)
+    }
+
     fn bucket_dir(&self, bucket: &BucketName) -> PathBuf {
         self.bucket_root()
             .join(encode_bucket_name(bucket).as_path_component())
@@ -449,6 +544,181 @@ impl<C> FilesystemStorage<C> {
         self.root.join(DIRTY_MUTATION_MARKER_FILE)
     }
 
+    fn copy_current_state_to_snapshot(&self, snapshot_dir: &Path) -> Result<(), StorageError> {
+        let manifest = self.snapshot_manifest_for_current_state()?;
+        for (source, target_name) in self.snapshot_state_sources() {
+            if manifest
+                .state
+                .get(target_name)
+                .is_some_and(|entry| entry.present)
+            {
+                copy_storage_dir_tree(&source, &snapshot_dir.join(target_name))?;
+            }
+        }
+
+        write_snapshot_manifest(snapshot_dir, &manifest)?;
+        Ok(())
+    }
+
+    fn stage_snapshot_restore(
+        &self,
+        snapshot_dir: &Path,
+    ) -> Result<Vec<StagedSnapshotPath>, StorageError> {
+        let manifest = read_validated_snapshot_manifest(snapshot_dir)?;
+        let mut staged_paths = Vec::new();
+        for target_name in SNAPSHOT_STATE_DIRS {
+            let snapshot_child = snapshot_dir.join(target_name);
+            let target = self.root.join(target_name);
+            if !manifest
+                .state
+                .get(target_name)
+                .is_some_and(|entry| entry.present)
+            {
+                staged_paths.push(StagedSnapshotPath {
+                    target,
+                    temporary: None,
+                });
+                continue;
+            };
+
+            let temporary = match create_temporary_sibling_dir(&target) {
+                Ok(temporary) => temporary,
+                Err(error) => {
+                    cleanup_staged_snapshot_paths(&staged_paths);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = copy_storage_dir_contents(&snapshot_child, &temporary) {
+                remove_path_best_effort(&temporary);
+                cleanup_staged_snapshot_paths(&staged_paths);
+                return Err(error);
+            }
+            staged_paths.push(StagedSnapshotPath {
+                target,
+                temporary: Some(temporary),
+            });
+        }
+
+        Ok(staged_paths)
+    }
+
+    fn replace_current_state_with_staged_snapshot(
+        &self,
+        staged_paths: Vec<StagedSnapshotPath>,
+    ) -> Result<(), StorageError> {
+        let mut backups = Vec::new();
+        for staged_path in &staged_paths {
+            let backup = match move_existing_path_to_backup(&staged_path.target) {
+                Ok(backup) => backup,
+                Err(error) => {
+                    if let Err(rollback_error) = restore_snapshot_backups(backups) {
+                        cleanup_staged_snapshot_paths(&staged_paths);
+                        return Err(rollback_error);
+                    }
+                    cleanup_staged_snapshot_paths(&staged_paths);
+                    return Err(error);
+                }
+            };
+
+            if let Some(temporary) = &staged_path.temporary {
+                if let Err(error) = rename_staged_snapshot_path(temporary, &staged_path.target) {
+                    let current_restore = restore_snapshot_path_backup(&staged_path.target, backup);
+                    let previous_restore = restore_snapshot_backups(backups);
+                    cleanup_staged_snapshot_paths(&staged_paths);
+                    if let Err(rollback_error) = current_restore {
+                        return Err(rollback_error);
+                    }
+                    if let Err(rollback_error) = previous_restore {
+                        return Err(rollback_error);
+                    }
+                    return Err(error);
+                }
+            }
+
+            backups.push(SnapshotRestoreBackup {
+                target: staged_path.target.clone(),
+                backup,
+            });
+        }
+
+        for backup in backups {
+            discard_path_backup(backup.backup);
+        }
+
+        Ok(())
+    }
+
+    fn snapshot_manifest_for_current_state(&self) -> Result<SnapshotManifest, StorageError> {
+        let mut state = BTreeMap::new();
+        for (source, target_name) in self.snapshot_state_sources() {
+            let present = match storage_path_metadata(&source)? {
+                Some(metadata) if metadata.is_dir() => true,
+                Some(_) => {
+                    return Err(corrupt_state(
+                        source,
+                        "snapshot source path exists but is not a directory",
+                    ));
+                }
+                None => false,
+            };
+
+            state.insert(target_name.to_owned(), SnapshotManifestEntry { present });
+        }
+
+        Ok(SnapshotManifest {
+            schema_version: SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+            state,
+        })
+    }
+
+    fn snapshot_state_sources(&self) -> [(PathBuf, &'static str); 3] {
+        [
+            (self.bucket_root(), STORAGE_ROOT_DIR),
+            (self.events_dir(), EVENTS_DIR),
+            (self.blobs_dir(), BLOBS_DIR),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct SnapshotRestoreBackup {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+fn restore_snapshot_backups(backups: Vec<SnapshotRestoreBackup>) -> Result<(), StorageError> {
+    for backup in backups.into_iter().rev() {
+        restore_snapshot_path_backup(&backup.target, backup.backup)?;
+    }
+
+    Ok(())
+}
+
+fn restore_snapshot_path_backup(
+    path: &Path,
+    backup_path: Option<PathBuf>,
+) -> Result<(), StorageError> {
+    remove_storage_path_if_exists(path)?;
+    if let Some(backup_path) = backup_path {
+        rename_path(&backup_path, path)?;
+    }
+
+    Ok(())
+}
+
+fn rename_staged_snapshot_path(from: &Path, to: &Path) -> Result<(), StorageError> {
+    #[cfg(test)]
+    if FAIL_NEXT_STAGED_RESTORE_RENAME.with(|fail| fail.replace(false)) {
+        return Err(StorageError::Io {
+            path: to.to_path_buf(),
+            source: io::Error::other("forced staged restore rename failure"),
+        });
+    }
+
+    rename_path(from, to)
+}
+
+impl<C> FilesystemStorage<C> {
     fn recover_if_dirty(&self) -> Result<(), StorageError> {
         let marker_path = self.dirty_marker_path();
         let Some(metadata) = storage_path_metadata(&marker_path)? else {
@@ -905,6 +1175,12 @@ enum VisibleCommittedObjectVisit {
     Stop,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct StagedSnapshotPath {
+    target: PathBuf,
+    temporary: Option<PathBuf>,
+}
+
 impl ObjectListingEntry {
     fn marker(&self) -> &ObjectKey {
         match self {
@@ -966,6 +1242,19 @@ fn object_listing_parts(
 #[derive(Debug, Deserialize, Serialize)]
 struct BucketRecord {
     bucket: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotManifest {
+    schema_version: u32,
+    state: BTreeMap<String, SnapshotManifestEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotManifestEntry {
+    present: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1150,11 +1439,7 @@ fn validate_recovered_bucket_name(bucket: &BucketName, path: &Path) -> Result<()
 }
 
 fn validate_content_sha256(content_sha256: &str, path: &Path) -> Result<(), StorageError> {
-    if content_sha256.len() == 64
-        && content_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if is_valid_content_sha256(content_sha256) {
         return Ok(());
     }
 
@@ -1162,6 +1447,14 @@ fn validate_content_sha256(content_sha256: &str, path: &Path) -> Result<(), Stor
         path.to_path_buf(),
         "journal contains an invalid content sha256",
     ))
+}
+
+fn is_valid_content_sha256(content_sha256: &str) -> bool {
+    content_sha256.len() == 64 && content_sha256.bytes().all(is_lower_hex_byte)
+}
+
+fn is_lower_hex_byte(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
 }
 
 fn validate_blob_bytes(
@@ -1221,6 +1514,543 @@ fn journal_last_modified(
             format!("invalid journal object put last_modified_nanoseconds: {source}"),
         )
     })
+}
+
+fn validate_snapshot_name(name: &str) -> Result<(), StorageError> {
+    let has_valid_chars = name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if !name.is_empty() && name != "." && name != ".." && has_valid_chars {
+        return Ok(());
+    }
+
+    Err(StorageError::InvalidArgument {
+        message: format!(
+            "invalid snapshot name {name:?}; use a non-empty name containing only ASCII letters, digits, '_', '-', or '.', and do not use '.' or '..'"
+        ),
+    })
+}
+
+fn snapshot_already_exists(name: &str) -> StorageError {
+    StorageError::InvalidArgument {
+        message: format!("snapshot already exists: {name}"),
+    }
+}
+
+fn snapshot_not_found(name: &str) -> StorageError {
+    StorageError::InvalidArgument {
+        message: format!("snapshot does not exist: {name}"),
+    }
+}
+
+fn write_snapshot_manifest(
+    snapshot_dir: &Path,
+    manifest: &SnapshotManifest,
+) -> Result<(), StorageError> {
+    write_json_atomically(&snapshot_dir.join(SNAPSHOT_MANIFEST_FILE), manifest)
+}
+
+fn read_validated_snapshot_manifest(snapshot_dir: &Path) -> Result<SnapshotManifest, StorageError> {
+    let manifest_path = snapshot_dir.join(SNAPSHOT_MANIFEST_FILE);
+    let Some(manifest_metadata) = storage_path_metadata(&manifest_path)? else {
+        return Err(corrupt_state(manifest_path, "missing snapshot manifest"));
+    };
+    if !manifest_metadata.is_file() {
+        return Err(corrupt_state(
+            manifest_path,
+            "snapshot manifest path exists but is not a file",
+        ));
+    }
+
+    let manifest: SnapshotManifest = read_json(&manifest_path)?;
+    validate_snapshot_manifest(snapshot_dir, &manifest)?;
+    Ok(manifest)
+}
+
+fn validate_snapshot_manifest(
+    snapshot_dir: &Path,
+    manifest: &SnapshotManifest,
+) -> Result<(), StorageError> {
+    if manifest.schema_version != SNAPSHOT_MANIFEST_SCHEMA_VERSION {
+        return Err(corrupt_state(
+            snapshot_dir.join(SNAPSHOT_MANIFEST_FILE),
+            "unsupported snapshot manifest schema version",
+        ));
+    }
+
+    for required_name in SNAPSHOT_STATE_DIRS {
+        if !manifest.state.contains_key(required_name) {
+            return Err(corrupt_state(
+                snapshot_dir.join(SNAPSHOT_MANIFEST_FILE),
+                format!("snapshot manifest is missing state entry: {required_name}"),
+            ));
+        }
+    }
+    for state_name in manifest.state.keys() {
+        if !is_snapshot_state_dir_name(state_name) {
+            return Err(corrupt_state(
+                snapshot_dir.join(SNAPSHOT_MANIFEST_FILE),
+                format!("snapshot manifest contains unknown state entry: {state_name}"),
+            ));
+        }
+    }
+
+    for entry in sorted_directory_entries(snapshot_dir)? {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            return Err(corrupt_state(
+                entry.path(),
+                "snapshot top-level path is not valid UTF-8",
+            ));
+        };
+        if file_name != SNAPSHOT_MANIFEST_FILE && !is_snapshot_state_dir_name(file_name) {
+            return Err(corrupt_state(
+                entry.path(),
+                "snapshot contains unknown top-level path",
+            ));
+        }
+    }
+
+    for state_name in SNAPSHOT_STATE_DIRS {
+        let snapshot_child = snapshot_dir.join(state_name);
+        let child_metadata = storage_path_metadata(&snapshot_child)?;
+        let manifest_entry = manifest
+            .state
+            .get(state_name)
+            .expect("required snapshot state entries were checked above");
+        match (manifest_entry.present, child_metadata) {
+            (true, Some(metadata)) if metadata.is_dir() => {}
+            (true, Some(_)) => {
+                return Err(corrupt_state(
+                    snapshot_child,
+                    "snapshot state path exists but is not a directory",
+                ));
+            }
+            (true, None) => {
+                return Err(corrupt_state(
+                    snapshot_child,
+                    "snapshot manifest declares state path but it is missing",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(corrupt_state(
+                    snapshot_child,
+                    "snapshot manifest declares state path absent but it exists",
+                ));
+            }
+            (false, None) => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn is_snapshot_state_dir_name(name: &str) -> bool {
+    SNAPSHOT_STATE_DIRS.contains(&name)
+}
+
+fn copy_storage_dir_tree(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    create_dir_all(destination)?;
+    copy_storage_dir_contents(source, destination)
+}
+
+fn copy_storage_dir_contents(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    require_storage_directory(source, "missing snapshot source directory")?;
+    require_storage_directory(destination, "missing snapshot destination directory")?;
+
+    for entry in sorted_directory_entries(source)? {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let Some(metadata) = storage_path_metadata(&source_path)? else {
+            continue;
+        };
+
+        if metadata.is_dir() {
+            copy_storage_dir_tree(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            copy_storage_file(&source_path, &destination_path)?;
+        } else {
+            return Err(corrupt_state(
+                source_path,
+                "snapshot source path is neither a file nor a directory",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_storage_file(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    let bytes = read_bytes(source)?;
+    write_bytes_synced(destination, &bytes)
+}
+
+fn cleanup_staged_snapshot_paths(staged_paths: &[StagedSnapshotPath]) {
+    for staged_path in staged_paths {
+        if let Some(temporary) = &staged_path.temporary {
+            remove_path_best_effort(temporary);
+        }
+    }
+}
+
+fn validate_staged_snapshot_contents(
+    staged_paths: &[StagedSnapshotPath],
+) -> Result<(), StorageError> {
+    if let Some(bucket_root) = staged_snapshot_temporary_path(staged_paths, STORAGE_ROOT_DIR) {
+        validate_bucket_root_contents(bucket_root)?;
+    }
+
+    let blobs_dir = staged_snapshot_temporary_path(staged_paths, BLOBS_DIR);
+    if let Some(events_dir) = staged_snapshot_temporary_path(staged_paths, EVENTS_DIR) {
+        validate_snapshot_events_contents(events_dir, blobs_dir)?;
+    }
+
+    if let Some(blobs_dir) = blobs_dir {
+        validate_snapshot_blob_contents(blobs_dir)?;
+    }
+
+    Ok(())
+}
+
+fn staged_snapshot_temporary_path<'a>(
+    staged_paths: &'a [StagedSnapshotPath],
+    target_name: &str,
+) -> Option<&'a Path> {
+    staged_paths
+        .iter()
+        .find(|staged_path| staged_path.target.file_name() == Some(OsStr::new(target_name)))
+        .and_then(|staged_path| staged_path.temporary.as_deref())
+}
+
+fn validate_bucket_root_contents(bucket_root: &Path) -> Result<(), StorageError> {
+    require_storage_directory(bucket_root, "missing snapshot buckets directory")?;
+    for bucket_entry in sorted_directory_entries(bucket_root)? {
+        if is_hidden_storage_entry(&bucket_entry) {
+            continue;
+        }
+
+        let bucket_path = bucket_entry.path();
+        let Some(bucket_metadata) = storage_path_metadata(&bucket_path)? else {
+            continue;
+        };
+        if !bucket_metadata.is_dir() {
+            continue;
+        }
+
+        let metadata_path = bucket_path.join(BUCKET_METADATA_FILE);
+        if !path_exists(&metadata_path)? {
+            return Err(corrupt_state(metadata_path, "missing bucket metadata"));
+        }
+
+        let record: BucketRecord = read_json(&metadata_path)?;
+        validate_listed_bucket_record(&bucket_path, &metadata_path, &record)?;
+        let bucket = BucketName::new(record.bucket);
+        let objects_dir = bucket_path.join(OBJECTS_DIR);
+        require_storage_directory(&objects_dir, "missing bucket objects directory")?;
+        validate_bucket_objects(&bucket, bucket_root, &objects_dir)?;
+    }
+
+    Ok(())
+}
+
+fn validate_bucket_objects(
+    bucket: &BucketName,
+    bucket_root: &Path,
+    objects_dir: &Path,
+) -> Result<(), StorageError> {
+    for shard_entry in sorted_directory_entries(objects_dir)? {
+        let Some(shard_path) = visible_storage_directory_path(
+            &shard_entry,
+            "visible object shard path exists but is not a directory",
+        )?
+        else {
+            continue;
+        };
+
+        for object_entry in sorted_directory_entries(&shard_path)? {
+            let Some(object_path) = visible_storage_directory_path(
+                &object_entry,
+                "visible object path exists but is not a directory",
+            )?
+            else {
+                continue;
+            };
+
+            validate_bucket_object(bucket, bucket_root, &object_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_bucket_object(
+    bucket: &BucketName,
+    bucket_root: &Path,
+    object_path: &Path,
+) -> Result<(), StorageError> {
+    object_path_state(object_path)?;
+    let metadata_path = object_path.join(OBJECT_METADATA_FILE);
+    let metadata = object_metadata_from_path(&metadata_path)?;
+    if metadata.bucket != *bucket {
+        return Err(corrupt_state(
+            metadata_path,
+            "object metadata bucket does not match containing bucket",
+        ));
+    }
+
+    let encoded_key = encode_object_key(&metadata.key).map_err(|_| {
+        corrupt_state(
+            metadata_path.clone(),
+            "object metadata contains an invalid key",
+        )
+    })?;
+    let expected_metadata_path = bucket_root
+        .join(encode_bucket_name(bucket).as_path_component())
+        .join(OBJECTS_DIR)
+        .join(encoded_key.shard())
+        .join(encoded_key.as_path_component())
+        .join(OBJECT_METADATA_FILE);
+    if expected_metadata_path != metadata_path {
+        return Err(corrupt_state(
+            metadata_path,
+            "object metadata is stored under the wrong hashed path",
+        ));
+    }
+
+    validate_object_content(&object_path.join(OBJECT_CONTENT_FILE), &metadata)
+}
+
+fn validate_snapshot_events_contents(
+    events_dir: &Path,
+    blobs_dir: Option<&Path>,
+) -> Result<(), StorageError> {
+    require_storage_directory(events_dir, "missing snapshot events directory")?;
+    let journal_path = events_dir.join(JOURNAL_FILE_NAME);
+    if !path_exists(&journal_path)? {
+        return Ok(());
+    }
+
+    let records = Journal::at_path(&journal_path).read_records()?;
+    validate_snapshot_journal_mutation_semantics(&journal_path, blobs_dir, &records)?;
+    Ok(())
+}
+
+fn validate_snapshot_journal_mutation_semantics(
+    journal_path: &Path,
+    blobs_dir: Option<&Path>,
+    records: &[JournalRecord],
+) -> Result<(), StorageError> {
+    let mut pending = None;
+    for record in records {
+        match record.phase {
+            JournalPhase::Begin => pending = Some(&record.mutation),
+            JournalPhase::Commit => {
+                if pending == Some(&record.mutation) {
+                    validate_committed_snapshot_journal_mutation(
+                        journal_path,
+                        blobs_dir,
+                        &record.mutation,
+                    )?;
+                }
+                pending = None;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_committed_snapshot_journal_mutation(
+    journal_path: &Path,
+    blobs_dir: Option<&Path>,
+    mutation: &JournalMutation,
+) -> Result<(), StorageError> {
+    match mutation {
+        JournalMutation::BucketCreate { bucket } | JournalMutation::BucketDelete { bucket } => {
+            validate_journal_bucket_name(bucket, journal_path)
+        }
+        JournalMutation::ObjectDelete { bucket, key } => {
+            validate_journal_bucket_name(bucket, journal_path)?;
+            validate_journal_object_key(key, journal_path)
+        }
+        JournalMutation::ObjectPut {
+            bucket,
+            key,
+            content_length,
+            content_sha256,
+            etag,
+            last_modified_unix_seconds,
+            last_modified_nanoseconds,
+            ..
+        } => {
+            validate_journal_bucket_name(bucket, journal_path)?;
+            validate_journal_object_key(key, journal_path)?;
+            validate_content_sha256(content_sha256, journal_path)?;
+            journal_last_modified(
+                *last_modified_unix_seconds,
+                *last_modified_nanoseconds,
+                journal_path,
+            )?;
+            validate_journal_object_put_blob(
+                journal_path,
+                blobs_dir,
+                content_sha256,
+                *content_length,
+                etag,
+            )
+        }
+    }
+}
+
+fn validate_journal_bucket_name(bucket: &str, journal_path: &Path) -> Result<(), StorageError> {
+    if is_valid_s3_bucket_name(bucket) {
+        return Ok(());
+    }
+
+    Err(corrupt_state(
+        journal_path.to_path_buf(),
+        "journal contains an invalid bucket name",
+    ))
+}
+
+fn validate_journal_object_key(key: &str, journal_path: &Path) -> Result<(), StorageError> {
+    encode_object_key(&ObjectKey::new(key.to_owned())).map_err(|_| {
+        corrupt_state(
+            journal_path.to_path_buf(),
+            "journal contains an invalid object key",
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_journal_object_put_blob(
+    journal_path: &Path,
+    blobs_dir: Option<&Path>,
+    content_sha256: &str,
+    content_length: u64,
+    etag: &str,
+) -> Result<(), StorageError> {
+    let blobs_dir = blobs_dir.ok_or_else(|| {
+        corrupt_state(
+            journal_path.to_path_buf(),
+            "journal object put references a blob but snapshot blobs directory is missing",
+        )
+    })?;
+    let blob_path = blobs_dir.join(&content_sha256[..2]).join(content_sha256);
+    require_storage_file(
+        &blob_path,
+        "journal object put references a missing snapshot blob",
+    )?;
+    let bytes = fs::read(&blob_path).map_err(|source| StorageError::Io {
+        path: blob_path.clone(),
+        source,
+    })?;
+    validate_blob_bytes(&blob_path, content_sha256, content_length, &bytes)?;
+
+    let actual_etag = etag_for_bytes(&bytes);
+    if actual_etag == etag {
+        return Ok(());
+    }
+
+    Err(corrupt_state(
+        blob_path,
+        "snapshot blob ETag does not match journal object put",
+    ))
+}
+
+fn validate_snapshot_blob_contents(blobs_dir: &Path) -> Result<(), StorageError> {
+    require_storage_directory(blobs_dir, "missing snapshot blobs directory")?;
+    for shard_entry in sorted_directory_entries(blobs_dir)? {
+        let shard_path = shard_entry.path();
+        let Some(shard_metadata) = storage_path_metadata(&shard_path)? else {
+            continue;
+        };
+        if !shard_metadata.is_dir() {
+            return Err(corrupt_state(
+                shard_path,
+                "snapshot blob shard path exists but is not a directory",
+            ));
+        }
+
+        let shard_name = blob_path_component(&shard_path, "snapshot blob shard path")?;
+        validate_blob_shard_name(shard_name, &shard_path)?;
+        validate_snapshot_blob_shard(&shard_path, shard_name)?;
+    }
+
+    Ok(())
+}
+
+fn validate_snapshot_blob_shard(shard_path: &Path, shard_name: &str) -> Result<(), StorageError> {
+    for blob_entry in sorted_directory_entries(shard_path)? {
+        let blob_path = blob_entry.path();
+        let Some(blob_metadata) = storage_path_metadata(&blob_path)? else {
+            continue;
+        };
+        if !blob_metadata.is_file() {
+            return Err(corrupt_state(
+                blob_path,
+                "snapshot blob path exists but is not a file",
+            ));
+        }
+
+        let blob_name = blob_path_component(&blob_path, "snapshot blob path")?;
+        validate_snapshot_blob_name(blob_name, shard_name, &blob_path)?;
+        let bytes = read_bytes(&blob_path)?;
+        validate_blob_content_sha256(&blob_path, blob_name, &bytes)?;
+    }
+
+    Ok(())
+}
+
+fn blob_path_component<'a>(path: &'a Path, path_kind: &str) -> Result<&'a str, StorageError> {
+    path.file_name().and_then(OsStr::to_str).ok_or_else(|| {
+        corrupt_state(
+            path.to_path_buf(),
+            format!("{path_kind} is not valid UTF-8"),
+        )
+    })
+}
+
+fn validate_blob_shard_name(shard_name: &str, path: &Path) -> Result<(), StorageError> {
+    if shard_name.len() == 2 && shard_name.bytes().all(is_lower_hex_byte) {
+        return Ok(());
+    }
+
+    Err(corrupt_state(
+        path.to_path_buf(),
+        "snapshot blob shard name is not a two-character lowercase hex prefix",
+    ))
+}
+
+fn validate_snapshot_blob_name(
+    blob_name: &str,
+    shard_name: &str,
+    path: &Path,
+) -> Result<(), StorageError> {
+    if is_valid_content_sha256(blob_name) && blob_name.starts_with(shard_name) {
+        return Ok(());
+    }
+
+    Err(corrupt_state(
+        path.to_path_buf(),
+        "snapshot blob file name does not match its hashed storage path",
+    ))
+}
+
+fn validate_blob_content_sha256(
+    path: &Path,
+    expected_sha256: &str,
+    bytes: &[u8],
+) -> Result<(), StorageError> {
+    let actual_sha256 = sha256_for_bytes(bytes);
+    if actual_sha256 == expected_sha256 {
+        return Ok(());
+    }
+
+    Err(corrupt_state(
+        path.to_path_buf(),
+        "snapshot blob content sha256 does not match blob file name",
+    ))
 }
 
 fn sorted_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, StorageError> {
@@ -1427,6 +2257,11 @@ fn write_new_object_state(
 #[cfg(test)]
 fn fail_next_new_object_state_write_for_test() {
     FAIL_NEXT_NEW_OBJECT_STATE_WRITE.set(true);
+}
+
+#[cfg(test)]
+fn fail_next_staged_restore_rename_for_test() {
+    FAIL_NEXT_STAGED_RESTORE_RENAME.with(|fail| fail.set(true));
 }
 
 fn write_object_files_atomically(
@@ -1979,6 +2814,32 @@ fn remove_file_if_exists(path: &Path) -> Result<(), StorageError> {
     }
 }
 
+fn remove_storage_path_if_exists(path: &Path) -> Result<(), StorageError> {
+    let Some(metadata) = storage_path_metadata(path)? else {
+        return Ok(());
+    };
+
+    if metadata.is_dir() {
+        fs::remove_dir_all(path).map_err(|source| StorageError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    } else if metadata.is_file() {
+        fs::remove_file(path).map_err(|source| StorageError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    } else {
+        return Err(corrupt_state(
+            path.to_path_buf(),
+            "storage path is neither a file nor a directory",
+        ));
+    }
+
+    sync_parent_dir_best_effort(path);
+    Ok(())
+}
+
 fn remove_dir_all(path: &Path) -> Result<(), StorageError> {
     require_storage_directory(path, "missing storage directory")?;
     fs::remove_dir_all(path).map_err(|source| StorageError::Io {
@@ -1998,10 +2859,11 @@ fn corrupt_state(path: impl Into<PathBuf>, message: impl Into<String>) -> Storag
 mod tests {
     use super::{
         commit_object_files, create_temporary_sibling_dir,
-        fail_next_new_object_state_write_for_test, move_existing_path_to_backup,
-        replace_file_with_temporary, restore_path_backup, sha256_for_bytes, sibling_path,
-        storage_path_metadata, write_new_bucket_state, write_temporary_sibling, BucketRecord,
-        FilesystemStorage, StorageClock, StorageError, OBJECTS_DIR,
+        fail_next_new_object_state_write_for_test, fail_next_staged_restore_rename_for_test,
+        move_existing_path_to_backup, replace_file_with_temporary, restore_path_backup,
+        sha256_for_bytes, sibling_path, storage_path_metadata, write_new_bucket_state,
+        write_temporary_sibling, BucketRecord, FilesystemStorage, StorageClock, StorageError,
+        OBJECTS_DIR,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::object::ObjectKey;
@@ -2115,6 +2977,49 @@ mod tests {
             fs::read(&target_path).expect("read restored target"),
             b"current"
         );
+    }
+
+    #[test]
+    fn restore_snapshot_restores_current_state_when_staged_rename_fails() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let storage =
+            FilesystemStorage::with_clock(temp_dir.path().to_path_buf(), FixedClock(fixed_time()));
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("object.txt");
+        storage.create_bucket(&bucket).expect("create bucket");
+        storage
+            .put_object(PutObjectRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                bytes: b"snapshot".to_vec(),
+                content_type: None,
+                user_metadata: BTreeMap::new(),
+            })
+            .expect("put snapshot object");
+        storage.save_snapshot("baseline").expect("save snapshot");
+        storage
+            .put_object(PutObjectRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                bytes: b"current".to_vec(),
+                content_type: None,
+                user_metadata: BTreeMap::new(),
+            })
+            .expect("put current object");
+
+        fail_next_staged_restore_rename_for_test();
+        let error = storage
+            .restore_snapshot("baseline")
+            .expect_err("forced staged restore rename fails");
+
+        assert!(matches!(error, StorageError::Io { .. }));
+        assert_eq!(
+            storage
+                .get_object_bytes(&bucket, &key)
+                .expect("current state remains readable"),
+            b"current"
+        );
+        assert!(temp_dir.path().join("snapshots").join("baseline").is_dir());
     }
 
     #[test]
