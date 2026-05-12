@@ -884,6 +884,96 @@ async fn multipart_routes_call_storage_and_return_s3_shaped_success_responses() 
 }
 
 #[tokio::test]
+async fn multipart_request_trace_records_typed_operations_and_mutations_without_query_values() {
+    let storage = RecordingStorage::default();
+    let sink = TestTraceSink::default();
+    let recorded = sink.clone();
+    let state = ServerState::with_request_id_generator_and_trace_sink(
+        storage,
+        FixedRequestIdGenerator::new(STATIC_REQUEST_ID),
+        sink,
+    );
+    let app = router(state);
+    let upload_id = "upload-secret-token";
+    let part_body = b"part-secret-body".to_vec();
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::POST, "/bucket/key?uploads", Body::empty()))
+        .await
+        .expect("create multipart response");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let upload_part_uri = format!("/bucket/key?partNumber=1&uploadId={upload_id}");
+    let upload_part = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            &upload_part_uri,
+            Body::from(part_body.clone()),
+        ))
+        .await
+        .expect("upload part response");
+    assert_eq!(upload_part.status(), StatusCode::OK);
+
+    let complete_uri = format!("/bucket/key?uploadId={upload_id}");
+    let complete = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            &complete_uri,
+            Body::from(complete_multipart_xml(&[(1, "\"part-one-etag\"")])),
+        ))
+        .await
+        .expect("complete multipart response");
+    assert_eq!(complete.status(), StatusCode::OK);
+
+    let abort = app
+        .oneshot(request(Method::DELETE, &complete_uri, Body::empty()))
+        .await
+        .expect("abort multipart response");
+    assert_eq!(abort.status(), StatusCode::NO_CONTENT);
+
+    let events = recorded.events();
+    for (method, operation) in [
+        ("POST", TraceS3Operation::CreateMultipartUpload),
+        ("PUT", TraceS3Operation::UploadPart),
+        ("POST", TraceS3Operation::CompleteMultipartUpload),
+        ("DELETE", TraceS3Operation::AbortMultipartUpload),
+    ] {
+        assert!(
+            events.contains(&TraceEvent::RouteResolved(RouteResolvedTrace::new(
+                STATIC_REQUEST_ID,
+                method,
+                "/bucket/key",
+                operation,
+            )))
+        );
+    }
+    for mutation in [
+        StorageMutation::CreateMultipartUpload,
+        StorageMutation::UploadPart,
+        StorageMutation::CompleteMultipartUpload,
+        StorageMutation::AbortMultipartUpload,
+    ] {
+        assert!(
+            events.contains(&TraceEvent::StorageMutation(StorageMutationTrace::new(
+                STATIC_REQUEST_ID,
+                mutation,
+                Some("bucket"),
+                Some("key"),
+                StorageMutationOutcome::Applied,
+            )))
+        );
+    }
+
+    let debug = format!("{events:?}");
+    assert!(!debug.contains(upload_id));
+    assert!(!debug.contains("part-secret-body"));
+    assert!(!debug.contains("uploadId="));
+}
+
+#[tokio::test]
 async fn complete_multipart_upload_rejects_invalid_part_order_and_etag_before_completion() {
     for (body, code) in [
         (

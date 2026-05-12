@@ -336,6 +336,10 @@ pub enum StorageMutation {
     DeleteBucket,
     PutObject,
     DeleteObject,
+    CreateMultipartUpload,
+    UploadPart,
+    CompleteMultipartUpload,
+    AbortMultipartUpload,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -391,7 +395,8 @@ mod tests {
         AuthDecision, CanonicalRequestBuiltTrace, PayloadVerificationOutcome,
         PayloadVerificationPartialReason, PayloadVerificationTrace, RequestReceivedTrace,
         RouteRejectedTrace, RouteRejectionReason, RouteResolvedTrace, SigV4ParsedTrace,
-        TraceCredentialScope, TraceS3Operation,
+        StorageMutation, StorageMutationOutcome, StorageMutationTrace, TraceCredentialScope,
+        TraceS3Operation,
     };
 
     #[test]
@@ -517,6 +522,23 @@ mod tests {
 
         assert!(debug.contains("UnsignedPayloadMarker"));
         assert!(!debug.contains("sent-secret-body"));
+        assert!(!debug.contains("Signature="));
+    }
+
+    #[test]
+    fn multipart_storage_mutation_trace_is_typed_and_secret_free() {
+        let trace = StorageMutationTrace::new(
+            "s3lab-0000000000000001",
+            StorageMutation::UploadPart,
+            Some("bucket"),
+            Some("object.txt"),
+            StorageMutationOutcome::Applied,
+        );
+        let debug = format!("{trace:?}");
+
+        assert!(debug.contains("UploadPart"));
+        assert!(!debug.contains("upload-secret-token"));
+        assert!(!debug.contains("part-secret-body"));
         assert!(!debug.contains("Signature="));
     }
 }

@@ -1144,6 +1144,32 @@ fn record_storage_mutation_result<T>(
     )));
 }
 
+fn record_multipart_storage_mutation_result<T>(
+    state: &ServerState,
+    request_id: &S3RequestId,
+    mutation: StorageMutation,
+    bucket: &str,
+    key: &str,
+    result: Result<T, &StorageError>,
+) {
+    let outcome = match result {
+        Ok(_) => StorageMutationOutcome::Applied,
+        Err(error) => StorageMutationOutcome::Rejected {
+            error_code: s3_error_code_from_multipart_storage_error(error)
+                .as_str()
+                .to_owned(),
+        },
+    };
+
+    state.record_trace(TraceEvent::StorageMutation(StorageMutationTrace::new(
+        request_id.as_str(),
+        mutation,
+        Some(bucket.to_owned()),
+        Some(key.to_owned()),
+        outcome,
+    )));
+}
+
 fn resolve_root_operation(
     method: &Method,
     query: &QueryParams,
@@ -1746,14 +1772,24 @@ fn create_multipart_upload_response(
         Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
     };
 
-    match state
+    let result = state
         .storage()
         .create_multipart_upload(CreateMultipartUploadRequest {
             bucket: bucket.clone(),
             key: key.clone(),
             content_type,
             user_metadata,
-        }) {
+        });
+    record_multipart_storage_mutation_result(
+        state,
+        request_id,
+        StorageMutation::CreateMultipartUpload,
+        bucket.as_str(),
+        key.as_str(),
+        result.as_ref().map(|_| ()),
+    );
+
+    match result {
         Ok(upload) => Ok(xml_response(
             initiate_multipart_upload_response_xml(&InitiateMultipartUploadXml {
                 bucket: upload.bucket.as_str().to_owned(),
@@ -1837,13 +1873,23 @@ async fn upload_part_route_response(
         Err(response) => return Ok(*response),
     }
 
-    match state.storage().upload_part(UploadPartRequest {
+    let result = state.storage().upload_part(UploadPartRequest {
         bucket: route_request.bucket.clone(),
         key: route_request.key.clone(),
         upload_id: route_request.upload_id,
         part_number: route_request.part_number,
         bytes: body.bytes,
-    }) {
+    });
+    record_multipart_storage_mutation_result(
+        &state,
+        request_id,
+        StorageMutation::UploadPart,
+        route_request.bucket.as_str(),
+        route_request.key.as_str(),
+        result.as_ref().map(|_| ()),
+    );
+
+    match result {
         Ok(part) => Ok(upload_part_response(part.etag, request_id)),
         Err(error) => Ok(multipart_storage_error_response(
             error, resource, is_head, request_id,
@@ -1902,14 +1948,24 @@ async fn complete_multipart_upload_route_response(
         return Ok(*response);
     }
 
-    match state
+    let result = state
         .storage()
         .complete_multipart_upload(CompleteMultipartUploadRequest {
             bucket: bucket.clone(),
             key: key.clone(),
             upload_id,
             parts: completed_parts,
-        }) {
+        });
+    record_multipart_storage_mutation_result(
+        state,
+        request_id,
+        StorageMutation::CompleteMultipartUpload,
+        bucket.as_str(),
+        key.as_str(),
+        result.as_ref().map(|_| ()),
+    );
+
+    match result {
         Ok(metadata) => Ok(xml_response(
             complete_multipart_upload_response_xml(&CompleteMultipartUploadXml {
                 bucket: metadata.bucket.as_str().to_owned(),
@@ -1932,10 +1988,19 @@ fn abort_multipart_upload_response(
     request_id: &S3RequestId,
 ) -> Result<Response<Body>, (StorageError, String)> {
     let resource = object_resource(&bucket, &key);
-    match state
+    let result = state
         .storage()
-        .abort_multipart_upload(&bucket, &key, &upload_id)
-    {
+        .abort_multipart_upload(&bucket, &key, &upload_id);
+    record_multipart_storage_mutation_result(
+        state,
+        request_id,
+        StorageMutation::AbortMultipartUpload,
+        bucket.as_str(),
+        key.as_str(),
+        result.as_ref().map(|_| ()),
+    );
+
+    match result {
         Ok(()) => Ok(no_content_response(request_id)),
         Err(error) => Ok(multipart_storage_error_response(
             error, resource, false, request_id,
@@ -2353,21 +2418,36 @@ fn s3_error_from_multipart_storage_error(
         return s3_error_from_storage_error(error, resource, request_id);
     };
 
+    match s3_error_code_from_multipart_storage_error(&error) {
+        S3ErrorCode::NoSuchUpload => S3Error::new(S3ErrorCode::NoSuchUpload, resource, request_id),
+        S3ErrorCode::InvalidPartOrder => {
+            S3Error::with_message(S3ErrorCode::InvalidPartOrder, message, resource, request_id)
+        }
+        S3ErrorCode::InvalidPart => {
+            S3Error::with_message(S3ErrorCode::InvalidPart, message, resource, request_id)
+        }
+        _ => s3_error_from_storage_error(error, resource, request_id),
+    }
+}
+
+fn s3_error_code_from_multipart_storage_error(error: &StorageError) -> S3ErrorCode {
+    let StorageError::InvalidArgument { message } = error else {
+        return s3_error_code_from_storage_error(error);
+    };
+
     if message.contains("multipart upload does not exist")
         || message.contains("invalid multipart upload ID")
     {
-        return S3Error::new(S3ErrorCode::NoSuchUpload, resource, request_id);
-    }
-    if message.contains("completed multipart parts must be sorted") {
-        return S3Error::with_message(S3ErrorCode::InvalidPartOrder, message, resource, request_id);
-    }
-    if message.contains("completed multipart part")
+        S3ErrorCode::NoSuchUpload
+    } else if message.contains("completed multipart parts must be sorted") {
+        S3ErrorCode::InvalidPartOrder
+    } else if message.contains("completed multipart part")
         || message.contains("complete multipart upload requires")
     {
-        return S3Error::with_message(S3ErrorCode::InvalidPart, message, resource, request_id);
+        S3ErrorCode::InvalidPart
+    } else {
+        s3_error_code_from_storage_error(error)
     }
-
-    s3_error_from_storage_error(error, resource, request_id)
 }
 
 fn s3_error_code_from_storage_error(error: &StorageError) -> S3ErrorCode {

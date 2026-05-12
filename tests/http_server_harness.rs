@@ -5,11 +5,12 @@ mod support;
 use hyper::body::Bytes;
 use hyper::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use hyper::http::{Method, Response, StatusCode};
+use md5::Md5;
 use s3lab::s3::bucket::BucketName;
 use s3lab::s3::object::ObjectKey;
 use s3lab::s3::sigv4::{
-    build_canonical_request, build_string_to_sign, parse_query_authorization,
-    SIGV4_UNSIGNED_PAYLOAD,
+    build_canonical_request, build_string_to_sign, parse_authorization_header,
+    parse_query_authorization, SIGV4_UNSIGNED_PAYLOAD,
 };
 use s3lab::storage::fs::{FilesystemStorage, StorageClock};
 use s3lab::storage::STORAGE_ROOT_DIR;
@@ -442,6 +443,509 @@ async fn list_objects_v2_uses_fixed_clock_through_real_http_harness() {
 }
 
 #[tokio::test]
+async fn multipart_lifecycle_over_real_http() {
+    let server = TestServer::start().await;
+
+    assert_eq!(
+        request(Method::PUT, &server.url("/bucket-a"), Bytes::new(), &[])
+            .await
+            .expect("create bucket")
+            .status(),
+        StatusCode::OK
+    );
+
+    let create = request(
+        Method::POST,
+        &server.url("/bucket-a/path/object.bin?uploads"),
+        Bytes::new(),
+        &[
+            ("content-type", "application/octet-stream"),
+            ("x-amz-meta-case", "value"),
+        ],
+    )
+    .await
+    .expect("create multipart upload over HTTP");
+    assert_eq!(create.status(), StatusCode::OK);
+    assert_eq!(
+        create
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/xml")
+    );
+    let create_body = response_text(create).await.expect("create multipart body");
+    assert!(create_body.contains("<Bucket>bucket-a</Bucket>"));
+    assert!(create_body.contains("<Key>path/object.bin</Key>"));
+    let upload_id = xml_element_text(&create_body, "UploadId");
+
+    let invisible = request(
+        Method::GET,
+        &server.url("/bucket-a?list-type=2&prefix=path%2F"),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("list objects before multipart completion");
+    assert_eq!(invisible.status(), StatusCode::OK);
+    let invisible_body = response_text(invisible).await.expect("invisible list body");
+    assert!(invisible_body.contains("<KeyCount>0</KeyCount>"));
+    assert!(!invisible_body.contains("<Key>path/object.bin</Key>"));
+
+    let part_two = Bytes::from_static(b"world");
+    let upload_two = request(
+        Method::PUT,
+        &server.url(&format!(
+            "/bucket-a/path/object.bin?partNumber=2&uploadId={upload_id}"
+        )),
+        part_two.clone(),
+        &[],
+    )
+    .await
+    .expect("upload second part over HTTP");
+    assert_eq!(upload_two.status(), StatusCode::OK);
+    assert_eq!(
+        upload_two
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(md5_etag(part_two.as_ref()).as_str())
+    );
+
+    let part_one = Bytes::from_static(b"hello ");
+    let upload_one = request(
+        Method::PUT,
+        &server.url(&format!(
+            "/bucket-a/path/object.bin?partNumber=1&uploadId={upload_id}"
+        )),
+        part_one.clone(),
+        &[],
+    )
+    .await
+    .expect("upload first part over HTTP");
+    assert_eq!(upload_one.status(), StatusCode::OK);
+    assert_eq!(
+        upload_one
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(md5_etag(part_one.as_ref()).as_str())
+    );
+
+    let list_parts = request(
+        Method::GET,
+        &server.url(&format!("/bucket-a/path/object.bin?uploadId={upload_id}")),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("list multipart parts over HTTP");
+    assert_eq!(list_parts.status(), StatusCode::OK);
+    let list_parts_body = response_text(list_parts).await.expect("list parts body");
+    assert_ordered_contains(
+        &list_parts_body,
+        &[
+            "<ListPartsResult><Bucket>bucket-a</Bucket><Key>path/object.bin</Key>",
+            &format!("<UploadId>{upload_id}</UploadId>"),
+            "<PartNumber>1</PartNumber>",
+            &format!(
+                "<ETag>{}</ETag><Size>6</Size>",
+                md5_etag_xml(part_one.as_ref())
+            ),
+            "<PartNumber>2</PartNumber>",
+            &format!(
+                "<ETag>{}</ETag><Size>5</Size>",
+                md5_etag_xml(part_two.as_ref())
+            ),
+        ],
+    );
+
+    let complete_etag = multipart_etag_for(&[part_one.as_ref(), part_two.as_ref()]);
+    let complete = request(
+        Method::POST,
+        &server.url(&format!("/bucket-a/path/object.bin?uploadId={upload_id}")),
+        Bytes::from(complete_multipart_xml(&[
+            (1, &md5_etag(part_one.as_ref())),
+            (2, &md5_etag(part_two.as_ref())),
+        ])),
+        &[],
+    )
+    .await
+    .expect("complete multipart upload over HTTP");
+    assert_eq!(complete.status(), StatusCode::OK);
+    let complete_body = response_text(complete).await.expect("complete body");
+    assert_eq!(
+        complete_body,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CompleteMultipartUploadResult><Location>/bucket-a/path/object.bin</Location><Bucket>bucket-a</Bucket><Key>path/object.bin</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
+            xml_escape_text(&complete_etag)
+        )
+    );
+
+    let get = request(
+        Method::GET,
+        &server.url("/bucket-a/path/object.bin"),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("get completed multipart object over HTTP");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(
+        get.headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some("11")
+    );
+    assert_eq!(
+        get.headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/octet-stream")
+    );
+    assert_eq!(
+        get.headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(complete_etag.as_str())
+    );
+    assert_eq!(
+        get.headers()
+            .get("x-amz-meta-case")
+            .and_then(|value| value.to_str().ok()),
+        Some("value")
+    );
+    assert_eq!(
+        response_bytes(get).await.expect("completed object body"),
+        Bytes::from_static(b"hello world")
+    );
+
+    let visible = request(
+        Method::GET,
+        &server.url("/bucket-a?list-type=2&prefix=path%2F"),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("list completed multipart object");
+    assert_eq!(visible.status(), StatusCode::OK);
+    let visible_body = response_text(visible).await.expect("visible list body");
+    assert_ordered_contains(
+        &visible_body,
+        &[
+            "<KeyCount>1</KeyCount>",
+            "<Contents><Key>path/object.bin</Key><LastModified>",
+            &format!(
+                "</LastModified><ETag>{}</ETag><Size>11</Size>",
+                xml_escape_text(&complete_etag)
+            ),
+        ],
+    );
+
+    let completed_upload = request(
+        Method::GET,
+        &server.url(&format!("/bucket-a/path/object.bin?uploadId={upload_id}")),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("list completed upload parts");
+    assert_http_s3_error(
+        completed_upload,
+        StatusCode::NOT_FOUND,
+        "NoSuchUpload",
+        "/bucket-a/path/object.bin",
+    )
+    .await;
+
+    let abort_create = request(
+        Method::POST,
+        &server.url("/bucket-a/path/aborted.bin?uploads"),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("create upload to abort");
+    assert_eq!(abort_create.status(), StatusCode::OK);
+    let abort_upload_id = xml_element_text(
+        &response_text(abort_create)
+            .await
+            .expect("abort create body"),
+        "UploadId",
+    );
+    assert_eq!(
+        request(
+            Method::PUT,
+            &server.url(&format!(
+                "/bucket-a/path/aborted.bin?partNumber=1&uploadId={abort_upload_id}"
+            )),
+            Bytes::from_static(b"aborted"),
+            &[],
+        )
+        .await
+        .expect("upload part before abort")
+        .status(),
+        StatusCode::OK
+    );
+    let abort = request(
+        Method::DELETE,
+        &server.url(&format!(
+            "/bucket-a/path/aborted.bin?uploadId={abort_upload_id}"
+        )),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("abort multipart upload over HTTP");
+    assert_eq!(abort.status(), StatusCode::NO_CONTENT);
+    assert!(response_bytes(abort).await.expect("abort body").is_empty());
+
+    let aborted_object = request(
+        Method::GET,
+        &server.url("/bucket-a/path/aborted.bin"),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("get aborted multipart object");
+    assert_http_s3_error(
+        aborted_object,
+        StatusCode::NOT_FOUND,
+        "NoSuchKey",
+        "/bucket-a/path/aborted.bin",
+    )
+    .await;
+
+    let aborted_upload = request(
+        Method::GET,
+        &server.url(&format!(
+            "/bucket-a/path/aborted.bin?uploadId={abort_upload_id}"
+        )),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("list aborted multipart upload");
+    assert_http_s3_error(
+        aborted_upload,
+        StatusCode::NOT_FOUND,
+        "NoSuchUpload",
+        "/bucket-a/path/aborted.bin",
+    )
+    .await;
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn multipart_negative_cases_over_real_http() {
+    let server = TestServer::start().await;
+
+    assert_eq!(
+        request(Method::PUT, &server.url("/bucket-a"), Bytes::new(), &[])
+            .await
+            .expect("create bucket")
+            .status(),
+        StatusCode::OK
+    );
+
+    let missing_upload = request(
+        Method::PUT,
+        &server.url("/bucket-a/object.bin?partNumber=1&uploadId=missing-upload"),
+        Bytes::from_static(b"part"),
+        &[],
+    )
+    .await
+    .expect("upload part to missing upload");
+    assert_http_s3_error(
+        missing_upload,
+        StatusCode::NOT_FOUND,
+        "NoSuchUpload",
+        "/bucket-a/object.bin",
+    )
+    .await;
+
+    let upload_id = create_multipart_upload(&server, "/bucket-a/object.bin").await;
+    let part_one = Bytes::from_static(b"one");
+    let part_two = Bytes::from_static(b"two");
+    upload_part(
+        &server,
+        "/bucket-a/object.bin",
+        &upload_id,
+        1,
+        part_one.clone(),
+    )
+    .await;
+    upload_part(
+        &server,
+        "/bucket-a/object.bin",
+        &upload_id,
+        2,
+        part_two.clone(),
+    )
+    .await;
+
+    let invalid_order = request(
+        Method::POST,
+        &server.url(&format!("/bucket-a/object.bin?uploadId={upload_id}")),
+        Bytes::from(complete_multipart_xml(&[
+            (2, &md5_etag(part_two.as_ref())),
+            (1, &md5_etag(part_one.as_ref())),
+        ])),
+        &[],
+    )
+    .await
+    .expect("complete multipart with invalid part order");
+    assert_http_s3_error(
+        invalid_order,
+        StatusCode::BAD_REQUEST,
+        "InvalidPartOrder",
+        "/bucket-a/object.bin",
+    )
+    .await;
+
+    let etag_mismatch = request(
+        Method::POST,
+        &server.url(&format!("/bucket-a/object.bin?uploadId={upload_id}")),
+        Bytes::from(complete_multipart_xml(&[(1, "\"wrong-etag\"")])),
+        &[],
+    )
+    .await
+    .expect("complete multipart with ETag mismatch");
+    assert_http_s3_error(
+        etag_mismatch,
+        StatusCode::BAD_REQUEST,
+        "InvalidPart",
+        "/bucket-a/object.bin",
+    )
+    .await;
+
+    let malformed_xml = request(
+        Method::POST,
+        &server.url(&format!("/bucket-a/object.bin?uploadId={upload_id}")),
+        Bytes::from_static(b"<CompleteMultipartUpload><Part><ETag>\"etag\"</ETag></Part>"),
+        &[],
+    )
+    .await
+    .expect("complete multipart with malformed XML");
+    assert_http_s3_error(
+        malformed_xml,
+        StatusCode::BAD_REQUEST,
+        "InvalidArgument",
+        "/bucket-a/object.bin",
+    )
+    .await;
+
+    let abort = request(
+        Method::DELETE,
+        &server.url(&format!("/bucket-a/object.bin?uploadId={upload_id}")),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("abort upload after negative cases");
+    assert_eq!(abort.status(), StatusCode::NO_CONTENT);
+
+    let complete_aborted = request(
+        Method::POST,
+        &server.url(&format!("/bucket-a/object.bin?uploadId={upload_id}")),
+        Bytes::from(complete_multipart_xml(&[(1, &md5_etag(part_one.as_ref()))])),
+        &[],
+    )
+    .await
+    .expect("complete aborted multipart upload");
+    assert_http_s3_error(
+        complete_aborted,
+        StatusCode::NOT_FOUND,
+        "NoSuchUpload",
+        "/bucket-a/object.bin",
+    )
+    .await;
+
+    let aborted_object = request(
+        Method::GET,
+        &server.url("/bucket-a/object.bin"),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("get aborted multipart object");
+    assert_http_s3_error(
+        aborted_object,
+        StatusCode::NOT_FOUND,
+        "NoSuchKey",
+        "/bucket-a/object.bin",
+    )
+    .await;
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn upload_part_integrity_failures_over_real_http() {
+    let server = TestServer::start().await;
+    let host = server
+        .base_url()
+        .strip_prefix("http://")
+        .expect("loopback HTTP base URL");
+
+    assert_eq!(
+        request(Method::PUT, &server.url("/bucket-a"), Bytes::new(), &[])
+            .await
+            .expect("create bucket")
+            .status(),
+        StatusCode::OK
+    );
+
+    let checksum_upload_id = create_multipart_upload(&server, "/bucket-a/checksum.bin").await;
+    let checksum_mismatch = request(
+        Method::PUT,
+        &server.url(&format!(
+            "/bucket-a/checksum.bin?partNumber=1&uploadId={checksum_upload_id}"
+        )),
+        Bytes::from_static(b"checksum-body"),
+        &[("x-amz-checksum-crc32", "AAAAAA==")],
+    )
+    .await
+    .expect("upload part with checksum mismatch");
+    assert_http_s3_error(
+        checksum_mismatch,
+        StatusCode::BAD_REQUEST,
+        "BadDigest",
+        "/bucket-a/checksum.bin",
+    )
+    .await;
+
+    let signed_upload_id = create_multipart_upload(&server, "/bucket-a/signed.bin").await;
+    let signed_body = b"signed-body";
+    let sent_body = Bytes::from_static(b"sent-secret-body");
+    let path_and_query = format!("/bucket-a/signed.bin?partNumber=1&uploadId={signed_upload_id}");
+    let signed_headers = signed_request_headers(
+        Method::PUT,
+        &path_and_query,
+        host,
+        &sha256_lower_hex_bytes(signed_body),
+    );
+    let header_refs = owned_header_refs(&signed_headers);
+    let hash_mismatch = request(
+        Method::PUT,
+        &server.url(&path_and_query),
+        sent_body,
+        &header_refs,
+    )
+    .await
+    .expect("upload part with signed literal hash mismatch");
+    assert_http_s3_error(
+        hash_mismatch,
+        StatusCode::BAD_REQUEST,
+        "XAmzContentSHA256Mismatch",
+        "/bucket-a/signed.bin",
+    )
+    .await;
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn corrupted_persisted_response_metadata_returns_internal_error_over_real_http() {
     let server = TestServer::start().await;
 
@@ -801,6 +1305,126 @@ fn deterministic_bytes(len: usize) -> Bytes {
     )
 }
 
+async fn create_multipart_upload(server: &TestServer, path: &str) -> String {
+    let response = request(
+        Method::POST,
+        &server.url(&format!("{path}?uploads")),
+        Bytes::new(),
+        &[],
+    )
+    .await
+    .expect("create multipart upload");
+    assert_eq!(response.status(), StatusCode::OK);
+    xml_element_text(
+        &response_text(response).await.expect("create upload body"),
+        "UploadId",
+    )
+}
+
+async fn upload_part(
+    server: &TestServer,
+    path: &str,
+    upload_id: &str,
+    part_number: u32,
+    body: Bytes,
+) {
+    let response = request(
+        Method::PUT,
+        &server.url(&format!(
+            "{path}?partNumber={part_number}&uploadId={upload_id}"
+        )),
+        body,
+        &[],
+    )
+    .await
+    .expect("upload multipart part");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn assert_http_s3_error(
+    response: Response<hyper::body::Incoming>,
+    status: StatusCode,
+    code: &str,
+    resource: &str,
+) {
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/xml")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    let body = response_text(response).await.expect("S3 error body");
+    assert!(body.contains(&format!("<Code>{code}</Code>")));
+    assert!(body.contains(&format!(
+        "<Resource>{}</Resource>",
+        xml_escape_text(resource)
+    )));
+}
+
+fn complete_multipart_xml(parts: &[(u32, &str)]) -> String {
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (part_number, etag) in parts {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{part_number}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml
+}
+
+fn xml_element_text(xml: &str, element: &str) -> String {
+    let start_tag = format!("<{element}>");
+    let end_tag = format!("</{element}>");
+    let start = xml
+        .find(&start_tag)
+        .map(|index| index + start_tag.len())
+        .expect("XML start element");
+    let end = xml[start..]
+        .find(&end_tag)
+        .map(|index| start + index)
+        .expect("XML end element");
+
+    xml[start..end].to_owned()
+}
+
+fn md5_etag(bytes: &[u8]) -> String {
+    format!("\"{}\"", hex_encode(&Md5::digest(bytes)))
+}
+
+fn md5_etag_xml(bytes: &[u8]) -> String {
+    xml_escape_text(&md5_etag(bytes))
+}
+
+fn multipart_etag_for(parts: &[&[u8]]) -> String {
+    let mut joined_digests = Vec::new();
+    for part in parts {
+        joined_digests.extend_from_slice(&Md5::digest(part));
+    }
+
+    format!(
+        "\"{}-{}\"",
+        hex_encode(&Md5::digest(joined_digests)),
+        parts.len()
+    )
+}
+
+fn xml_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn presigned_object_path_query(method: Method, path: &str, host: &str) -> String {
     let request_datetime = "20260512T010203Z";
     let credential_scope = "20260512/us-east-1/s3/aws4_request";
@@ -847,6 +1471,86 @@ fn presigned_object_path_query(method: Method, path: &str, host: &str) -> String
     query.push(("X-Amz-Signature".to_owned(), signature));
 
     format!("{path}?{}", encoded_query(&query))
+}
+
+fn signed_request_headers(
+    method: Method,
+    path_and_query: &str,
+    host: &str,
+    payload_hash: &str,
+) -> Vec<(String, String)> {
+    let request_datetime = "20260512T010203Z";
+    let credential_scope = "20260512/us-east-1/s3/aws4_request";
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let path = path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(path, _query)| path);
+    let query = query_pairs(path_and_query);
+    let query_refs = query_refs(&query);
+    let header_pairs = [
+        ("host", host),
+        ("x-amz-content-sha256", payload_hash),
+        ("x-amz-date", request_datetime),
+    ];
+    let unsigned_authorization = format!(
+        "AWS4-HMAC-SHA256 Credential=s3lab/{credential_scope}, SignedHeaders={signed_headers}, Signature=0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    let authorization =
+        parse_authorization_header(&unsigned_authorization).expect("authorization shape");
+    let canonical_request = build_canonical_request(
+        method.as_str(),
+        path,
+        &query_refs,
+        &header_pairs,
+        authorization.signed_headers(),
+        payload_hash,
+    )
+    .expect("canonical request");
+    let string_to_sign = build_string_to_sign(
+        request_datetime,
+        authorization.credential().scope(),
+        &canonical_request,
+    );
+    let signature = sigv4_signature(
+        "s3lab-secret",
+        "20260512",
+        "us-east-1",
+        "s3",
+        &string_to_sign,
+    );
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential=s3lab/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    vec![
+        ("host".to_owned(), host.to_owned()),
+        ("x-amz-date".to_owned(), request_datetime.to_owned()),
+        ("x-amz-content-sha256".to_owned(), payload_hash.to_owned()),
+        ("authorization".to_owned(), authorization),
+    ]
+}
+
+fn query_pairs(path_and_query: &str) -> Vec<(String, String)> {
+    let Some((_path, query)) = path_and_query.split_once('?') else {
+        return Vec::new();
+    };
+
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            pair.split_once('=')
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .unwrap_or_else(|| (pair.to_owned(), String::new()))
+        })
+        .collect()
+}
+
+fn owned_header_refs(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+    headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect()
 }
 
 fn query_refs(query: &[(String, String)]) -> Vec<(&str, &str)> {
@@ -988,9 +1692,9 @@ fn object_key_shard(key: &ObjectKey) -> String {
 }
 
 fn sha256_lower_hex(value: &str) -> String {
-    let digest = Sha256::digest(value.as_bytes());
-    digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
+    sha256_lower_hex_bytes(value.as_bytes())
+}
+
+fn sha256_lower_hex_bytes(value: &[u8]) -> String {
+    hex_encode(&Sha256::digest(value))
 }
