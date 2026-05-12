@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 pub enum CliError {
     Parse(clap::Error),
     Config(crate::config::ConfigError),
+    Storage(crate::storage::StorageError),
     Server(crate::server::ServerError),
     ShutdownSignal(std::io::Error),
     Output(std::io::Error),
@@ -33,6 +34,10 @@ pub struct Cli {
 enum Command {
     /// Start the local S3 endpoint.
     Serve(ServeArgs),
+    /// Save or restore local storage snapshots.
+    Snapshot(SnapshotArgs),
+    /// Remove current local storage state while preserving snapshots.
+    Reset(ResetArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -50,6 +55,37 @@ pub struct ServeArgs {
     data_dir: PathBuf,
 }
 
+#[derive(Debug, Parser)]
+struct SnapshotArgs {
+    #[command(subcommand)]
+    command: SnapshotCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotCommand {
+    /// Save the current local storage state as a named snapshot.
+    Save(SnapshotOperationArgs),
+    /// Restore current local storage state from a named snapshot.
+    Restore(SnapshotOperationArgs),
+}
+
+#[derive(Debug, Parser)]
+struct SnapshotOperationArgs {
+    /// Snapshot name.
+    name: String,
+
+    /// Directory used for local S3Lab data.
+    #[arg(long, default_value = DEFAULT_DATA_DIR)]
+    data_dir: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+struct ResetArgs {
+    /// Directory used for local S3Lab data.
+    #[arg(long, default_value = DEFAULT_DATA_DIR)]
+    data_dir: PathBuf,
+}
+
 impl From<ServeArgs> for RuntimeConfig {
     fn from(args: ServeArgs) -> Self {
         Self::new(args.host, args.port, args.data_dir)
@@ -61,6 +97,7 @@ impl Display for CliError {
         match self {
             Self::Parse(error) => Display::fmt(error, formatter),
             Self::Config(error) => Display::fmt(error, formatter),
+            Self::Storage(error) => Display::fmt(error, formatter),
             Self::Server(error) => Display::fmt(error, formatter),
             Self::ShutdownSignal(error) => {
                 write!(
@@ -78,9 +115,11 @@ impl CliError {
         match self {
             Self::Parse(error) if error.use_stderr() => ExitCode::FAILURE,
             Self::Parse(_) => ExitCode::SUCCESS,
-            Self::Config(_) | Self::Server(_) | Self::ShutdownSignal(_) | Self::Output(_) => {
-                ExitCode::FAILURE
-            }
+            Self::Config(_)
+            | Self::Storage(_)
+            | Self::Server(_)
+            | Self::ShutdownSignal(_)
+            | Self::Output(_) => ExitCode::FAILURE,
         }
     }
 
@@ -89,9 +128,11 @@ impl CliError {
             Self::Parse(error) => {
                 let _ = error.print();
             }
-            Self::Config(_) | Self::Server(_) | Self::ShutdownSignal(_) | Self::Output(_) => {
-                eprintln!("{self}");
-            }
+            Self::Config(_)
+            | Self::Storage(_)
+            | Self::Server(_)
+            | Self::ShutdownSignal(_)
+            | Self::Output(_) => eprintln!("{self}"),
         }
     }
 }
@@ -101,6 +142,7 @@ impl Error for CliError {
         match self {
             Self::Parse(error) => Some(error),
             Self::Config(error) => Some(error),
+            Self::Storage(error) => Some(error),
             Self::Server(error) => Some(error),
             Self::ShutdownSignal(error) => Some(error),
             Self::Output(error) => Some(error),
@@ -117,6 +159,12 @@ impl From<clap::Error> for CliError {
 impl From<crate::config::ConfigError> for CliError {
     fn from(error: crate::config::ConfigError) -> Self {
         Self::Config(error)
+    }
+}
+
+impl From<crate::storage::StorageError> for CliError {
+    fn from(error: crate::storage::StorageError) -> Self {
+        Self::Storage(error)
     }
 }
 
@@ -152,7 +200,48 @@ where
 
     match cli.command {
         Command::Serve(args) => run_serve(args.into(), writer).await,
+        Command::Snapshot(args) => run_snapshot(args, writer),
+        Command::Reset(args) => run_reset(args, writer),
     }
+}
+
+fn run_snapshot<W>(args: SnapshotArgs, writer: &mut W) -> Result<(), CliError>
+where
+    W: Write,
+{
+    match args.command {
+        SnapshotCommand::Save(args) => {
+            let storage = open_storage(args.data_dir)?;
+            storage.save_snapshot(&args.name)?;
+            writeln!(writer, "Snapshot saved: {}", args.name)?;
+        }
+        SnapshotCommand::Restore(args) => {
+            let storage = open_storage(args.data_dir)?;
+            storage.restore_snapshot(&args.name)?;
+            writeln!(writer, "Snapshot restored: {}", args.name)?;
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn run_reset<W>(args: ResetArgs, writer: &mut W) -> Result<(), CliError>
+where
+    W: Write,
+{
+    let data_dir = args.data_dir;
+    let storage = open_storage(data_dir)?;
+    storage.reset()?;
+    writeln!(writer, "Storage reset: {}", storage.root().display())?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn open_storage(data_dir: PathBuf) -> Result<FilesystemStorage, CliError> {
+    crate::config::ensure_data_dir(&data_dir)?;
+
+    Ok(FilesystemStorage::new(data_dir))
 }
 
 async fn run_serve<W>(config: RuntimeConfig, writer: &mut W) -> Result<(), CliError>
@@ -237,15 +326,24 @@ where
 
     match cli.command {
         Command::Serve(args) => run_serve_until(args.into(), writer, shutdown).await,
+        Command::Snapshot(args) => run_snapshot(args, writer),
+        Command::Reset(args) => run_reset(args, writer),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{init_tracing, run_with_writer, run_with_writer_until, Cli, CliError};
+    use crate::config::DEFAULT_DATA_DIR;
+    use crate::s3::bucket::BucketName;
+    use crate::s3::object::ObjectKey;
+    use crate::storage::fs::FilesystemStorage;
+    use crate::storage::{PutObjectRequest, Storage};
     use clap::{CommandFactory, Parser};
+    use std::collections::BTreeMap;
     use std::error::Error;
     use std::io::Write;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::process::ExitCode;
 
@@ -329,11 +427,47 @@ mod tests {
     #[test]
     fn parsed_serve_defaults_match_phase1_contract() {
         let cli = Cli::try_parse_from(["s3lab", "serve"]).expect("valid serve command");
-        let super::Command::Serve(args) = cli.command;
+        let super::Command::Serve(args) = cli.command else {
+            panic!("parsed serve command");
+        };
 
         assert_eq!(args.host, "127.0.0.1");
         assert_eq!(args.port, 9000);
         assert_eq!(args.data_dir, PathBuf::from("./s3lab-data"));
+    }
+
+    #[test]
+    fn parsed_snapshot_and_reset_defaults_match_storage_contract() {
+        let cli =
+            Cli::try_parse_from(["s3lab", "snapshot", "save", "baseline"]).expect("snapshot save");
+        let super::Command::Snapshot(args) = cli.command else {
+            panic!("parsed snapshot command");
+        };
+        let super::SnapshotCommand::Save(args) = args.command else {
+            panic!("parsed snapshot save command");
+        };
+
+        assert_eq!(args.name, "baseline");
+        assert_eq!(args.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+
+        let cli = Cli::try_parse_from(["s3lab", "snapshot", "restore", "baseline"])
+            .expect("snapshot restore");
+        let super::Command::Snapshot(args) = cli.command else {
+            panic!("parsed snapshot command");
+        };
+        let super::SnapshotCommand::Restore(args) = args.command else {
+            panic!("parsed snapshot restore command");
+        };
+
+        assert_eq!(args.name, "baseline");
+        assert_eq!(args.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+
+        let cli = Cli::try_parse_from(["s3lab", "reset"]).expect("reset");
+        let super::Command::Reset(args) = cli.command else {
+            panic!("parsed reset command");
+        };
+
+        assert_eq!(args.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
     }
 
     #[test]
@@ -374,6 +508,218 @@ mod tests {
         assert!(help.contains("--host"));
         assert!(help.contains("--port"));
         assert!(help.contains("--data-dir"));
+    }
+
+    #[test]
+    fn snapshot_and_reset_help_documents_commands_and_options() {
+        let mut root = Cli::command();
+        let snapshot = root
+            .find_subcommand_mut("snapshot")
+            .expect("snapshot subcommand");
+        let mut snapshot_help = Vec::new();
+
+        snapshot
+            .write_long_help(&mut snapshot_help)
+            .expect("write snapshot help");
+
+        let snapshot_help = String::from_utf8(snapshot_help).expect("utf-8 help");
+        assert!(snapshot_help.contains("snapshot"));
+        assert!(snapshot_help.contains("save"));
+        assert!(snapshot_help.contains("restore"));
+
+        let save = snapshot
+            .find_subcommand_mut("save")
+            .expect("snapshot save subcommand");
+        let mut save_help = Vec::new();
+
+        save.write_long_help(&mut save_help)
+            .expect("write snapshot save help");
+
+        let save_help = String::from_utf8(save_help).expect("utf-8 help");
+        assert!(save_help.contains("<NAME>"));
+        assert!(save_help.contains("--data-dir"));
+
+        let reset = root.find_subcommand_mut("reset").expect("reset subcommand");
+        let mut reset_help = Vec::new();
+
+        reset
+            .write_long_help(&mut reset_help)
+            .expect("write reset help");
+
+        let reset_help = String::from_utf8(reset_help).expect("utf-8 help");
+        assert!(reset_help.contains("reset"));
+        assert!(reset_help.contains("--data-dir"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_save_prints_success_and_creates_missing_data_dir() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let data_dir = parent.path().join("missing").join("s3lab-data");
+        let mut output = Vec::new();
+
+        run_with_writer(
+            [
+                "s3lab",
+                "snapshot",
+                "save",
+                "baseline",
+                "--data-dir",
+                path_str(&data_dir),
+            ],
+            &mut output,
+        )
+        .await
+        .expect("snapshot save succeeds");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf-8 output"),
+            "Snapshot saved: baseline\n"
+        );
+        assert!(data_dir.is_dir());
+        assert!(data_dir.join("snapshots").join("baseline").is_dir());
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_prints_success_and_restores_saved_state() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let data_dir = parent.path().join("s3lab-data");
+        let storage = FilesystemStorage::new(&data_dir);
+        put_test_object(&storage, b"before restore");
+        let mut output = Vec::new();
+        let mut save_output = Vec::new();
+
+        run_with_writer(
+            [
+                "s3lab",
+                "snapshot",
+                "save",
+                "baseline",
+                "--data-dir",
+                path_str(&data_dir),
+            ],
+            &mut save_output,
+        )
+        .await
+        .expect("snapshot save succeeds");
+        put_test_object(&storage, b"after snapshot");
+
+        run_with_writer(
+            [
+                "s3lab",
+                "snapshot",
+                "restore",
+                "baseline",
+                "--data-dir",
+                path_str(&data_dir),
+            ],
+            &mut output,
+        )
+        .await
+        .expect("snapshot restore succeeds");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf-8 output"),
+            "Snapshot restored: baseline\n"
+        );
+        assert_eq!(test_object_bytes(&storage), b"before restore");
+    }
+
+    #[tokio::test]
+    async fn reset_prints_success_removes_current_state_and_preserves_snapshots() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let data_dir = parent.path().join("s3lab-data");
+        let storage = FilesystemStorage::new(&data_dir);
+        put_test_object(&storage, b"snapshot body");
+        storage.save_snapshot("baseline").expect("save snapshot");
+        let mut output = Vec::new();
+
+        run_with_writer(
+            ["s3lab", "reset", "--data-dir", path_str(&data_dir)],
+            &mut output,
+        )
+        .await
+        .expect("reset succeeds");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf-8 output"),
+            format!("Storage reset: {}\n", data_dir.display())
+        );
+        assert!(!storage
+            .bucket_exists(&BucketName::new("cli-bucket"))
+            .expect("bucket existence is readable"));
+        assert!(data_dir.join("snapshots").join("baseline").is_dir());
+
+        storage
+            .restore_snapshot("baseline")
+            .expect("preserved snapshot restores");
+        assert_eq!(test_object_bytes(&storage), b"snapshot body");
+    }
+
+    #[tokio::test]
+    async fn snapshot_commands_preserve_storage_errors_for_invalid_names_and_missing_snapshots() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let data_dir = parent.path().join("s3lab-data");
+
+        for args in [
+            ["s3lab", "snapshot", "save", "bad/name", "--data-dir"],
+            ["s3lab", "snapshot", "restore", "bad/name", "--data-dir"],
+        ] {
+            let mut output = Vec::new();
+            let error = run_with_writer(args.into_iter().chain([path_str(&data_dir)]), &mut output)
+                .await
+                .expect_err("invalid snapshot name fails");
+
+            assert!(matches!(error, CliError::Storage(_)));
+            assert!(error.to_string().contains("invalid snapshot name"));
+            assert!(output.is_empty());
+        }
+
+        let mut output = Vec::new();
+        let error = run_with_writer(
+            [
+                "s3lab",
+                "snapshot",
+                "restore",
+                "missing",
+                "--data-dir",
+                path_str(&data_dir),
+            ],
+            &mut output,
+        )
+        .await
+        .expect_err("missing snapshot fails");
+
+        assert!(matches!(error, CliError::Storage(_)));
+        assert!(error
+            .to_string()
+            .contains("snapshot does not exist: missing"));
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_reset_reject_file_data_dirs_before_storage_operations() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let file_path = parent.path().join("s3lab-data");
+        std::fs::write(&file_path, b"not a directory").expect("write test file");
+
+        for args in [
+            ["s3lab", "snapshot", "save", "baseline", "--data-dir"],
+            ["s3lab", "reset", "--data-dir", "", ""],
+        ] {
+            let args = args
+                .into_iter()
+                .filter(|arg| !arg.is_empty())
+                .chain([path_str(&file_path)]);
+            let mut output = Vec::new();
+
+            let error = run_with_writer(args, &mut output)
+                .await
+                .expect_err("file data dir should fail");
+
+            assert!(matches!(error, CliError::Config(_)));
+            assert!(error.to_string().contains("not a directory"));
+            assert!(output.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -610,5 +956,40 @@ mod tests {
         let error = CliError::Parse(Cli::try_parse_from(["s3lab", "unknown"]).unwrap_err());
 
         assert!(assert_error_trait(&error).contains("unrecognized subcommand"));
+    }
+
+    fn path_str(path: &Path) -> &str {
+        path.to_str().expect("utf-8 temp path")
+    }
+
+    fn put_test_object(storage: &FilesystemStorage, bytes: &[u8]) {
+        let bucket = BucketName::new("cli-bucket");
+        let key = ObjectKey::new("object.txt");
+
+        if !storage
+            .bucket_exists(&bucket)
+            .expect("bucket lookup succeeds")
+        {
+            storage.create_bucket(&bucket).expect("create test bucket");
+        }
+
+        storage
+            .put_object(PutObjectRequest {
+                bucket,
+                key,
+                bytes: bytes.to_vec(),
+                content_type: None,
+                user_metadata: BTreeMap::new(),
+            })
+            .expect("put test object");
+    }
+
+    fn test_object_bytes(storage: &FilesystemStorage) -> Vec<u8> {
+        storage
+            .get_object_bytes(
+                &BucketName::new("cli-bucket"),
+                &ObjectKey::new("object.txt"),
+            )
+            .expect("read test object")
     }
 }
