@@ -9,7 +9,10 @@ use s3lab::s3::bucket::BucketName;
 use s3lab::s3::error::{S3ErrorCode, STATIC_REQUEST_ID};
 use s3lab::s3::object::ObjectKey;
 use s3lab::s3::operation::{ListObjectsEncoding, S3Operation};
-use s3lab::s3::sigv4::{build_canonical_request, build_string_to_sign, parse_authorization_header};
+use s3lab::s3::sigv4::{
+    build_canonical_request, build_string_to_sign, parse_authorization_header,
+    parse_query_authorization, SIGV4_UNSIGNED_PAYLOAD,
+};
 use s3lab::server::router;
 use s3lab::server::routes::{resolve_operation, PHASE1_MAX_PUT_OBJECT_BODY_BYTES};
 use s3lab::server::state::{FixedRequestIdGenerator, ServerState};
@@ -316,6 +319,54 @@ fn duplicate_and_unknown_query_params_are_invalid_argument() {
     ] {
         let rejection = resolve_operation(&Method::GET, &Uri::from_static(uri))
             .expect_err("query must be rejected");
+
+        assert_eq!(rejection.code, S3ErrorCode::InvalidArgument);
+    }
+}
+
+#[test]
+fn object_get_and_put_routes_allow_presigned_query_auth_params() {
+    for (method, uri, expected_operation) in [
+        (
+            Method::GET,
+            "/bucket/object.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=s3lab%2F20260512%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260512T010203Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000&response-content-type=text%2Fplain",
+            S3Operation::GetObject {
+                bucket: BucketName::new("bucket"),
+                key: ObjectKey::new("object.txt"),
+            },
+        ),
+        (
+            Method::PUT,
+            "/bucket/object.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=s3lab%2F20260512%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260512T010203Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000",
+            S3Operation::PutObject {
+                bucket: BucketName::new("bucket"),
+                key: ObjectKey::new("object.txt"),
+            },
+        ),
+    ] {
+        let route = resolve_operation(&method, &uri.parse::<Uri>().expect("valid URI"))
+            .expect("presigned object route resolves");
+
+        assert_eq!(route.operation, expected_operation);
+    }
+}
+
+#[test]
+fn object_routes_keep_rejecting_non_presigned_unknown_query_params() {
+    for (method, uri) in [
+        (Method::GET, "/bucket/object.txt?unknown=value"),
+        (Method::PUT, "/bucket/object.txt?unknown=value"),
+        (
+            Method::GET,
+            "/bucket/object.txt?response-content-type=text%2Fplain",
+        ),
+        (
+            Method::PUT,
+            "/bucket/object.txt?response-content-type=text%2Fplain",
+        ),
+    ] {
+        let rejection = resolve_operation(&method, &uri.parse::<Uri>().expect("valid URI"))
+            .expect_err("ordinary object query remains strict");
 
         assert_eq!(rejection.code, S3ErrorCode::InvalidArgument);
     }
@@ -650,6 +701,281 @@ async fn valid_signed_request_is_verified_before_storage_mutation() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(calls.lock().expect("calls lock").as_slice(), ["put_object"]);
+}
+
+#[tokio::test]
+async fn valid_presigned_get_reads_existing_object() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
+
+    let create_bucket = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create_bucket.status(), StatusCode::OK);
+
+    let put_object = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/object.txt",
+            Body::from("hello from presigned get"),
+        ))
+        .await
+        .expect("put object");
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let uri = presigned_object_uri(
+        Method::GET,
+        "/bucket/object.txt",
+        "s3lab",
+        &[("response-content-type", "text/plain")],
+    );
+    let response = app
+        .oneshot(request_with_headers(
+            Method::GET,
+            &uri,
+            &[("host", "localhost")],
+            Body::empty(),
+        ))
+        .await
+        .expect("presigned get object");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_bytes(response).await.as_ref(),
+        b"hello from presigned get"
+    );
+}
+
+#[tokio::test]
+async fn valid_presigned_put_stores_body_bytes() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let app = router(test_server_state(FilesystemStorage::new(temp_dir.path())));
+
+    let create_bucket = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create_bucket.status(), StatusCode::OK);
+
+    let uri = presigned_object_uri(Method::PUT, "/bucket/object.txt", "s3lab", &[]);
+    let put = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::PUT,
+            &uri,
+            &[("host", "localhost")],
+            Body::from("hello from presigned put"),
+        ))
+        .await
+        .expect("presigned put object");
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get stored object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(body_bytes(get).await.as_ref(), b"hello from presigned put");
+}
+
+#[tokio::test]
+async fn mixed_header_and_presigned_query_auth_is_rejected_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let uri = presigned_object_uri(Method::GET, "/bucket/object.txt", "s3lab", &[]);
+    let headers = signed_request_headers(Method::GET, "/bucket/object.txt", b"");
+
+    let response = app
+        .oneshot(request_with_owned_headers(
+            Method::GET,
+            &uri,
+            &headers,
+            Body::empty(),
+        ))
+        .await
+        .expect("mixed auth response");
+
+    assert_s3_error_xml_with_message(
+        response,
+        StatusCode::BAD_REQUEST,
+        "AuthorizationHeaderMalformed",
+        "Use either an Authorization header or SigV4 presigned query parameters, not both.",
+        "/bucket/object.txt",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn bad_presigned_query_signature_is_rejected_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let uri = replace_query_signature(
+        &presigned_object_uri(Method::GET, "/bucket/object.txt", "s3lab", &[]),
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    );
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::GET,
+            &uri,
+            &[("host", "localhost")],
+            Body::empty(),
+        ))
+        .await
+        .expect("bad presigned signature response");
+
+    assert_s3_error_xml_with_message(
+        response,
+        StatusCode::FORBIDDEN,
+        "SignatureDoesNotMatch",
+        "The SigV4 signature did not match the canonical request; verify the method, path, query, signed headers, payload hash, credential scope, timestamp, and secret.",
+        "/bucket/object.txt",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn presigned_put_literal_payload_hash_mismatch_is_rejected_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let signed_body = b"signed-body";
+    let sent_body = b"sent-secret-body";
+    let uri = presigned_object_uri_with_payload_hash(
+        Method::PUT,
+        "/bucket/object.txt",
+        "s3lab",
+        &[],
+        &sha256_lower_hex_bytes(signed_body),
+    );
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::PUT,
+            &uri,
+            &[("host", "localhost")],
+            Body::from(sent_body.as_slice().to_vec()),
+        ))
+        .await
+        .expect("presigned payload hash mismatch response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
+    assert!(body.contains("<Message>The x-amz-content-sha256 header value did not match the request body bytes. Sign the exact bytes sent in the PUT request body.</Message>"));
+    assert!(body.contains("<Resource>/bucket/object.txt</Resource>"));
+    assert!(!body.contains("signed-body"));
+    assert!(!body.contains("sent-secret-body"));
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn unsupported_presigned_access_key_and_session_token_fail_without_storage_call() {
+    let cases = [
+        (
+            presigned_object_uri(Method::GET, "/bucket/object.txt", "wrong-key", &[]),
+            StatusCode::FORBIDDEN,
+            "InvalidAccessKeyId",
+            "The access key id is not configured for this local S3Lab server.",
+        ),
+        (
+            format!(
+                "{}&X-Amz-Security-Token=session-secret-token",
+                presigned_object_uri(Method::GET, "/bucket/object.txt", "s3lab", &[])
+            ),
+            StatusCode::BAD_REQUEST,
+            "AuthorizationHeaderMalformed",
+            "Session-token presigned URLs are not supported; omit X-Amz-Security-Token.",
+        ),
+    ];
+
+    for (uri, status, code, message) in cases {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(test_server_state(storage));
+
+        let response = app
+            .oneshot(request_with_headers(
+                Method::GET,
+                &uri,
+                &[("host", "localhost")],
+                Body::empty(),
+            ))
+            .await
+            .expect("presigned auth rejection");
+
+        assert_s3_error_xml_with_message(response, status, code, message, "/bucket/object.txt")
+            .await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn accepted_presigned_request_trace_records_path_only_and_redacts_query_auth() {
+    let storage = RecordingStorage::default();
+    let sink = TestTraceSink::default();
+    let recorded = sink.clone();
+    let state = ServerState::with_request_id_generator_and_trace_sink(
+        storage,
+        FixedRequestIdGenerator::new(STATIC_REQUEST_ID),
+        sink,
+    );
+    let app = router(state);
+    let uri = presigned_object_uri(
+        Method::GET,
+        "/bucket/object.txt",
+        "s3lab",
+        &[("response-content-type", "text/plain")],
+    );
+    let signature = query_signature_from_uri(&uri).to_owned();
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::GET,
+            &uri,
+            &[("host", "localhost")],
+            Body::empty(),
+        ))
+        .await
+        .expect("presigned get object");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = recorded.events();
+    assert!(
+        events.contains(&TraceEvent::RequestReceived(RequestReceivedTrace::new(
+            STATIC_REQUEST_ID,
+            "GET",
+            "/bucket/object.txt",
+            ["host"],
+        )))
+    );
+    assert!(
+        events.contains(&TraceEvent::RouteResolved(RouteResolvedTrace::new(
+            STATIC_REQUEST_ID,
+            "GET",
+            "/bucket/object.txt",
+            TraceS3Operation::GetObject,
+        )))
+    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, TraceEvent::CanonicalRequestBuilt(_))));
+
+    let debug = format!("{events:?}");
+    assert!(!debug.contains(&uri));
+    assert!(!debug.contains("X-Amz-Credential"));
+    assert!(!debug.contains("s3lab/20260512/us-east-1/s3/aws4_request"));
+    assert!(!debug.contains("s3lab%2F20260512%2Fus-east-1%2Fs3%2Faws4_request"));
+    assert!(!debug.contains(&signature));
+    assert!(!debug.contains("s3lab-secret"));
 }
 
 #[tokio::test]
@@ -3187,6 +3513,138 @@ fn request_with_owned_headers(
 
 fn signed_request_headers(method: Method, uri: &str, body: &[u8]) -> Vec<(String, String)> {
     signed_request_headers_with_access_key(method, uri, body, "s3lab")
+}
+
+fn presigned_object_uri(
+    method: Method,
+    path: &str,
+    access_key: &str,
+    extra_query: &[(&str, &str)],
+) -> String {
+    presigned_object_uri_with_optional_payload_hash(method, path, access_key, extra_query, None)
+}
+
+fn presigned_object_uri_with_payload_hash(
+    method: Method,
+    path: &str,
+    access_key: &str,
+    extra_query: &[(&str, &str)],
+    payload_hash: &str,
+) -> String {
+    presigned_object_uri_with_optional_payload_hash(
+        method,
+        path,
+        access_key,
+        extra_query,
+        Some(payload_hash),
+    )
+}
+
+fn presigned_object_uri_with_optional_payload_hash(
+    method: Method,
+    path: &str,
+    access_key: &str,
+    extra_query: &[(&str, &str)],
+    payload_hash: Option<&str>,
+) -> String {
+    let request_datetime = "20260512T010203Z";
+    let credential_scope = "20260512/us-east-1/s3/aws4_request";
+    let mut query = vec![
+        ("X-Amz-Algorithm".to_owned(), "AWS4-HMAC-SHA256".to_owned()),
+        (
+            "X-Amz-Credential".to_owned(),
+            format!("{access_key}/{credential_scope}"),
+        ),
+        ("X-Amz-Date".to_owned(), request_datetime.to_owned()),
+        ("X-Amz-Expires".to_owned(), "60".to_owned()),
+        ("X-Amz-SignedHeaders".to_owned(), "host".to_owned()),
+    ];
+    query.extend(
+        extra_query
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
+    if let Some(payload_hash) = payload_hash {
+        query.push(("X-Amz-Content-Sha256".to_owned(), payload_hash.to_owned()));
+    }
+    let unsigned_query_refs = query_refs(&query);
+    let mut query_with_placeholder = query.clone();
+    query_with_placeholder.push((
+        "X-Amz-Signature".to_owned(),
+        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+    ));
+    let placeholder_refs = query_refs(&query_with_placeholder);
+    let authorization =
+        parse_query_authorization(&placeholder_refs).expect("presigned query shape");
+    let canonical_request = build_canonical_request(
+        method.as_str(),
+        path,
+        &unsigned_query_refs,
+        &[("host", "localhost")],
+        authorization.signed_headers(),
+        payload_hash.unwrap_or(SIGV4_UNSIGNED_PAYLOAD),
+    )
+    .expect("canonical presigned request");
+    let string_to_sign = build_string_to_sign(
+        request_datetime,
+        authorization.credential().scope(),
+        &canonical_request,
+    );
+    let signature = sigv4_signature(
+        "s3lab-secret",
+        "20260512",
+        "us-east-1",
+        "s3",
+        &string_to_sign,
+    );
+    query.push(("X-Amz-Signature".to_owned(), signature));
+
+    format!("{path}?{}", encoded_query(&query))
+}
+
+fn replace_query_signature(uri: &str, signature: &str) -> String {
+    let (prefix, old_signature) = uri.rsplit_once("X-Amz-Signature=").expect("signature");
+    let suffix = old_signature
+        .find('&')
+        .map(|index| &old_signature[index..])
+        .unwrap_or("");
+    format!("{prefix}X-Amz-Signature={signature}{suffix}")
+}
+
+fn query_signature_from_uri(uri: &str) -> &str {
+    let (_prefix, signature_and_suffix) = uri.rsplit_once("X-Amz-Signature=").expect("signature");
+    signature_and_suffix
+        .split_once('&')
+        .map(|(signature, _suffix)| signature)
+        .unwrap_or(signature_and_suffix)
+}
+
+fn query_refs(query: &[(String, String)]) -> Vec<(&str, &str)> {
+    query
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect()
+}
+
+fn encoded_query(query: &[(String, String)]) -> String {
+    query
+        .iter()
+        .map(|(name, value)| format!("{}={}", aws_query_encode(name), aws_query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn aws_query_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn signed_request_headers_with_payload_hash(

@@ -5,8 +5,10 @@ use crate::s3::error::{S3Error, S3ErrorCode, S3RequestId};
 use crate::s3::object::{is_valid_s3_object_key, is_valid_s3_object_key_prefix, ObjectKey};
 use crate::s3::operation::{ListObjectsEncoding, S3Operation};
 use crate::s3::sigv4::{
-    build_canonical_request, parse_authorization_header, verify_signature, SigV4Authorization,
-    SigV4ParseDiagnostic, SigV4VerificationDiagnostic, SigV4VerificationRequest,
+    build_canonical_request, parse_authorization_header, parse_query_authorization,
+    verify_query_signature, verify_signature, SigV4Authorization, SigV4ParseDiagnostic,
+    SigV4QueryAuthorization, SigV4QueryParseDiagnostic, SigV4QueryVerificationRequest,
+    SigV4VerificationDiagnostic, SigV4VerificationRequest,
 };
 use crate::s3::time::http_date;
 use crate::s3::xml::{
@@ -65,6 +67,20 @@ const X_AMZ_CHECKSUM_CRC64NVME: &str = "x-amz-checksum-crc64nvme";
 const X_AMZ_DECODED_CONTENT_LENGTH: &str = "x-amz-decoded-content-length";
 const X_AMZ_SDK_CHECKSUM_ALGORITHM: &str = "x-amz-sdk-checksum-algorithm";
 const X_AMZ_TRAILER: &str = "x-amz-trailer";
+const X_AMZ_ALGORITHM_QUERY: &str = "X-Amz-Algorithm";
+const X_AMZ_CREDENTIAL_QUERY: &str = "X-Amz-Credential";
+const X_AMZ_DATE_QUERY: &str = "X-Amz-Date";
+const X_AMZ_EXPIRES_QUERY: &str = "X-Amz-Expires";
+const X_AMZ_SIGNED_HEADERS_QUERY: &str = "X-Amz-SignedHeaders";
+const X_AMZ_SIGNATURE_QUERY: &str = "X-Amz-Signature";
+const X_AMZ_CONTENT_SHA256_QUERY: &str = "X-Amz-Content-Sha256";
+const X_AMZ_SECURITY_TOKEN_QUERY: &str = "X-Amz-Security-Token";
+const RESPONSE_CACHE_CONTROL_QUERY: &str = "response-cache-control";
+const RESPONSE_CONTENT_DISPOSITION_QUERY: &str = "response-content-disposition";
+const RESPONSE_CONTENT_ENCODING_QUERY: &str = "response-content-encoding";
+const RESPONSE_CONTENT_LANGUAGE_QUERY: &str = "response-content-language";
+const RESPONSE_CONTENT_TYPE_QUERY: &str = "response-content-type";
+const RESPONSE_EXPIRES_QUERY: &str = "response-expires";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const STREAMING_PAYLOAD_PREFIX: &str = "STREAMING-";
 
@@ -134,6 +150,7 @@ pub async fn handle_request(
                     headers,
                     body,
                     route_match.operation,
+                    uri.clone(),
                     is_head,
                     request_id.clone(),
                 )
@@ -173,9 +190,46 @@ fn auth_rejection_response(
     request_id: &S3RequestId,
 ) -> Option<Response<Body>> {
     let resource = resource_for_uri(uri);
+    let query_pairs = match sigv4_query_pairs(uri.query(), &resource, is_head, request_id) {
+        Ok(query_pairs) => query_pairs,
+        Err(response) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+            )));
+            return Some(*response);
+        }
+    };
+    let has_query_authorization = has_presigned_query_authorization(&query_pairs);
     let authorization = match authorization_header(headers, &resource, is_head, request_id) {
-        Ok(Some(authorization)) => authorization,
+        Ok(Some(authorization)) => {
+            if has_query_authorization {
+                state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                    request_id.as_str(),
+                    AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+                )));
+                return Some(auth_error_response(
+                    S3ErrorCode::AuthorizationHeaderMalformed,
+                    "Use either an Authorization header or SigV4 presigned query parameters, not both.",
+                    &resource,
+                    is_head,
+                    request_id,
+                ));
+            }
+            authorization
+        }
         Ok(None) => {
+            if has_query_authorization {
+                return query_auth_rejection_response(
+                    state,
+                    method,
+                    uri,
+                    headers,
+                    query_pairs,
+                    is_head,
+                    request_id,
+                );
+            }
             state.record_trace(TraceEvent::SigV4Parsed(SigV4ParsedTrace::rejected(
                 request_id.as_str(),
                 SigV4ParseRejection::MissingAuthorization,
@@ -292,6 +346,137 @@ fn auth_rejection_response(
     }
 
     match verify_signature(&authorization, LOCAL_SECRET_ACCESS_KEY, request) {
+        Ok(_verification) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Accepted,
+            )));
+            None
+        }
+        Err(diagnostic) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(auth_rejection_reason(&diagnostic)),
+            )));
+            Some(sigv4_verification_error_response(
+                diagnostic, &resource, is_head, request_id,
+            ))
+        }
+    }
+}
+
+fn query_auth_rejection_response(
+    state: &ServerState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    query_pairs: Vec<(String, String)>,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Option<Response<Body>> {
+    let resource = resource_for_uri(uri);
+    let query_refs = query_pairs
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let authorization = match parse_query_authorization(&query_refs) {
+        Ok(authorization) => {
+            record_sigv4_query_parsed(state, request_id, &authorization);
+            authorization
+        }
+        Err(diagnostic) => {
+            state.record_trace(TraceEvent::SigV4Parsed(SigV4ParsedTrace::rejected(
+                request_id.as_str(),
+                sigv4_query_parse_rejection(&diagnostic),
+            )));
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+            )));
+            return Some(auth_error_response(
+                S3ErrorCode::AuthorizationHeaderMalformed,
+                diagnostic.message(),
+                &resource,
+                is_head,
+                request_id,
+            ));
+        }
+    };
+
+    if authorization.credential().access_key_id() != LOCAL_ACCESS_KEY_ID {
+        state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+            request_id.as_str(),
+            AuthDecision::Rejected(AuthRejectionReason::InvalidAccessKey),
+        )));
+        return Some(auth_error_response(
+            S3ErrorCode::InvalidAccessKeyId,
+            "The access key id is not configured for this local S3Lab server.",
+            &resource,
+            is_head,
+            request_id,
+        ));
+    }
+
+    let header_values = match sigv4_header_pairs(headers, &resource, is_head, request_id) {
+        Ok(headers) => headers,
+        Err(response) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+            )));
+            return Some(*response);
+        }
+    };
+    let header_refs = header_values
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let method = method.as_str();
+    let path = uri.path();
+
+    let query_without_signature = query_refs
+        .iter()
+        .copied()
+        .filter(|(name, _)| *name != X_AMZ_SIGNATURE_QUERY)
+        .collect::<Vec<_>>();
+    match build_canonical_request(
+        method,
+        path,
+        &query_without_signature,
+        &header_refs,
+        authorization.signed_headers(),
+        authorization.payload_hash(),
+    ) {
+        Ok(canonical_request) => {
+            state.record_trace(TraceEvent::CanonicalRequestBuilt(
+                CanonicalRequestBuiltTrace::from_canonical_request(
+                    request_id.as_str(),
+                    authorization
+                        .signed_headers()
+                        .iter()
+                        .map(|header| header.as_str()),
+                    &canonical_request,
+                ),
+            ));
+        }
+        Err(diagnostic) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(auth_rejection_reason(&diagnostic)),
+            )));
+            return Some(sigv4_verification_error_response(
+                diagnostic, &resource, is_head, request_id,
+            ));
+        }
+    }
+
+    let request = SigV4QueryVerificationRequest {
+        method,
+        path,
+        query: &query_refs,
+        headers: &header_refs,
+    };
+    match verify_query_signature(&authorization, LOCAL_SECRET_ACCESS_KEY, request) {
         Ok(_verification) => {
             state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
                 request_id.as_str(),
@@ -456,6 +641,12 @@ fn sigv4_query_pairs(
     Ok(query)
 }
 
+fn has_presigned_query_authorization(query: &[(String, String)]) -> bool {
+    query
+        .iter()
+        .any(|(name, _)| PRESIGNED_QUERY_AUTH_PARAMS.contains(&name.as_str()))
+}
+
 fn decode_sigv4_query_component(
     raw: &str,
     resource: &str,
@@ -564,6 +755,22 @@ fn record_sigv4_parsed(
     )));
 }
 
+fn record_sigv4_query_parsed(
+    state: &ServerState,
+    request_id: &S3RequestId,
+    authorization: &SigV4QueryAuthorization,
+) {
+    let scope = authorization.credential().scope();
+    state.record_trace(TraceEvent::SigV4Parsed(SigV4ParsedTrace::accepted(
+        request_id.as_str(),
+        TraceCredentialScope::new(scope.date(), scope.region(), scope.service()),
+        authorization
+            .signed_headers()
+            .iter()
+            .map(|header| header.as_str()),
+    )));
+}
+
 fn sigv4_parse_rejection(diagnostic: &SigV4ParseDiagnostic) -> SigV4ParseRejection {
     match diagnostic {
         SigV4ParseDiagnostic::UnsupportedAlgorithm => SigV4ParseRejection::UnsupportedAlgorithm,
@@ -586,6 +793,38 @@ fn sigv4_parse_rejection(diagnostic: &SigV4ParseDiagnostic) -> SigV4ParseRejecti
         | SigV4ParseDiagnostic::UnknownParameter
         | SigV4ParseDiagnostic::MissingParameter { .. }
         | SigV4ParseDiagnostic::DuplicateParameter { .. } => {
+            SigV4ParseRejection::MalformedAuthorization
+        }
+    }
+}
+
+fn sigv4_query_parse_rejection(diagnostic: &SigV4QueryParseDiagnostic) -> SigV4ParseRejection {
+    match diagnostic {
+        SigV4QueryParseDiagnostic::UnsupportedAlgorithm => {
+            SigV4ParseRejection::UnsupportedAlgorithm
+        }
+        SigV4QueryParseDiagnostic::InvalidCredentialScope
+        | SigV4QueryParseDiagnostic::EmptyAccessKey
+        | SigV4QueryParseDiagnostic::InvalidCredentialDate
+        | SigV4QueryParseDiagnostic::EmptyRegion
+        | SigV4QueryParseDiagnostic::EmptyService
+        | SigV4QueryParseDiagnostic::InvalidCredentialScopeTerminator => {
+            SigV4ParseRejection::InvalidCredentialScope
+        }
+        SigV4QueryParseDiagnostic::EmptySignedHeaders
+        | SigV4QueryParseDiagnostic::InvalidSignedHeaderName
+        | SigV4QueryParseDiagnostic::DuplicateSignedHeader
+        | SigV4QueryParseDiagnostic::UnsortedSignedHeaders => {
+            SigV4ParseRejection::InvalidSignedHeaders
+        }
+        SigV4QueryParseDiagnostic::InvalidSignatureLength
+        | SigV4QueryParseDiagnostic::InvalidSignatureHex => SigV4ParseRejection::InvalidSignature,
+        SigV4QueryParseDiagnostic::MissingParameter { .. }
+        | SigV4QueryParseDiagnostic::DuplicateParameter { .. }
+        | SigV4QueryParseDiagnostic::UnsupportedSessionToken
+        | SigV4QueryParseDiagnostic::InvalidRequestDate
+        | SigV4QueryParseDiagnostic::InvalidExpires
+        | SigV4QueryParseDiagnostic::InvalidContentSha256 => {
             SigV4ParseRejection::MalformedAuthorization
         }
     }
@@ -825,13 +1064,23 @@ fn resolve_object_operation(
     query: &QueryParams,
     resource: &str,
 ) -> Result<S3Operation, RouteRejection> {
-    reject_query_params(query, resource)?;
-
     match *method {
-        Method::PUT => Ok(S3Operation::PutObject { bucket, key }),
-        Method::GET => Ok(S3Operation::GetObject { bucket, key }),
-        Method::HEAD => Ok(S3Operation::HeadObject { bucket, key }),
-        Method::DELETE => Ok(S3Operation::DeleteObject { bucket, key }),
+        Method::PUT => {
+            reject_object_query_params(query, resource)?;
+            Ok(S3Operation::PutObject { bucket, key })
+        }
+        Method::GET => {
+            reject_object_query_params(query, resource)?;
+            Ok(S3Operation::GetObject { bucket, key })
+        }
+        Method::HEAD => {
+            reject_query_params(query, resource)?;
+            Ok(S3Operation::HeadObject { bucket, key })
+        }
+        Method::DELETE => {
+            reject_query_params(query, resource)?;
+            Ok(S3Operation::DeleteObject { bucket, key })
+        }
         _ => Err(RouteRejection::new(
             S3ErrorCode::MethodNotAllowed,
             resource.to_owned(),
@@ -844,11 +1093,21 @@ async fn execute_operation(
     headers: HeaderMap,
     body: Body,
     operation: S3Operation,
+    uri: Uri,
     is_head: bool,
     request_id: S3RequestId,
 ) -> Response<Body> {
-    let result =
-        execute_storage_operation(state, headers, body, operation, is_head, &request_id).await;
+    let presigned_payload_hash = presigned_payload_hash(&uri, is_head, &request_id);
+    let result = execute_storage_operation(
+        state,
+        headers,
+        body,
+        operation,
+        presigned_payload_hash,
+        is_head,
+        &request_id,
+    )
+    .await;
 
     match result {
         Ok(response) => {
@@ -867,6 +1126,7 @@ async fn execute_storage_operation(
     headers: HeaderMap,
     body: Body,
     operation: S3Operation,
+    presigned_payload_hash: RouteResponseResult<Option<String>>,
     is_head: bool,
     request_id: &S3RequestId,
 ) -> Result<Response<Body>, (StorageError, String)> {
@@ -876,7 +1136,19 @@ async fn execute_storage_operation(
         S3Operation::HeadBucket { bucket } => head_bucket_response(&state, bucket, request_id),
         S3Operation::DeleteBucket { bucket } => delete_bucket_response(&state, bucket, request_id),
         S3Operation::PutObject { bucket, key } => {
-            put_object_route_response(state, headers, body, bucket, key, is_head, request_id).await
+            put_object_route_response(
+                state,
+                headers,
+                body,
+                PutObjectRouteRequest {
+                    bucket,
+                    key,
+                    presigned_payload_hash,
+                },
+                is_head,
+                request_id,
+            )
+            .await
         }
         S3Operation::GetObject { bucket, key } => {
             get_object_route_response(&state, &headers, bucket, key, is_head, request_id)
@@ -986,12 +1258,11 @@ async fn put_object_route_response(
     state: ServerState,
     headers: HeaderMap,
     body: Body,
-    bucket: BucketName,
-    key: ObjectKey,
+    route_request: PutObjectRouteRequest,
     is_head: bool,
     request_id: &S3RequestId,
 ) -> Result<Response<Body>, (StorageError, String)> {
-    let resource = object_resource(&bucket, &key);
+    let resource = object_resource(&route_request.bucket, &route_request.key);
     if let Some(header_name) = unsupported_put_object_header(&headers) {
         log_put_object_rejection(
             &headers,
@@ -1045,7 +1316,13 @@ async fn put_object_route_response(
             return Ok(*response);
         }
     }
-    match validate_signed_put_object_payload_hash(&headers, &body.bytes, &resource, request_id) {
+    match validate_signed_put_object_payload_hash(
+        &headers,
+        route_request.presigned_payload_hash,
+        &body.bytes,
+        &resource,
+        request_id,
+    ) {
         Ok(Some(outcome)) => {
             state.record_trace(TraceEvent::PayloadVerification(
                 PayloadVerificationTrace::new(request_id.as_str(), outcome),
@@ -1056,8 +1333,8 @@ async fn put_object_route_response(
     }
 
     let result = state.storage().put_object(PutObjectRequest {
-        bucket: bucket.clone(),
-        key: key.clone(),
+        bucket: route_request.bucket.clone(),
+        key: route_request.key.clone(),
         bytes: body.bytes,
         content_type,
         user_metadata,
@@ -1066,8 +1343,8 @@ async fn put_object_route_response(
         &state,
         request_id,
         StorageMutation::PutObject,
-        Some(bucket.as_str()),
-        Some(key.as_str()),
+        Some(route_request.bucket.as_str()),
+        Some(route_request.key.as_str()),
         result.as_ref().map(|_| ()),
     );
 
@@ -1312,6 +1589,26 @@ fn parse_query(raw_query: Option<&str>, resource: &str) -> Result<QueryParams, R
 
 fn reject_query_params(query: &QueryParams, resource: &str) -> Result<(), RouteRejection> {
     if query.values.is_empty() {
+        return Ok(());
+    }
+
+    Err(RouteRejection::new(
+        S3ErrorCode::InvalidArgument,
+        resource.to_owned(),
+    ))
+}
+
+fn reject_object_query_params(query: &QueryParams, resource: &str) -> Result<(), RouteRejection> {
+    if query.values.is_empty() {
+        return Ok(());
+    }
+
+    if query.has_presigned_query_authorization()
+        && query.values.keys().all(|name| {
+            PRESIGNED_QUERY_AUTH_PARAMS.contains(&name.as_str())
+                || PRESIGNED_RESPONSE_OVERRIDE_PARAMS.contains(&name.as_str())
+        })
+    {
         return Ok(());
     }
 
@@ -2040,35 +2337,43 @@ fn validate_put_object_checksum(
 
 fn validate_signed_put_object_payload_hash(
     headers: &HeaderMap,
+    presigned_payload_hash: RouteResponseResult<Option<String>>,
     bytes: &[u8],
     resource: &str,
     request_id: &S3RequestId,
 ) -> RouteResponseResult<Option<PayloadVerificationOutcome>> {
-    if !headers.contains_key(AUTHORIZATION) {
-        return Ok(None);
-    }
-
-    let Some(expected) = headers
-        .get(X_AMZ_CONTENT_SHA256)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return if bytes.is_empty() {
-            Ok(None)
-        } else {
-            Err(Box::new(s3_error_response(
-                S3Error::with_message(
-                    S3ErrorCode::XAmzContentSHA256Mismatch,
-                    "Signed PUT object requests with a body must include x-amz-content-sha256. Sign the exact bytes sent in the PUT request body, or send UNSIGNED-PAYLOAD when payload integrity is intentionally disabled.",
-                    resource,
-                    request_id.clone(),
-                ),
-                false,
-            )))
+    let expected = if headers.contains_key(AUTHORIZATION) {
+        let Some(expected) = headers
+            .get(X_AMZ_CONTENT_SHA256)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Err(Box::new(s3_error_response(
+                    S3Error::with_message(
+                        S3ErrorCode::XAmzContentSHA256Mismatch,
+                        "Signed PUT object requests with a body must include x-amz-content-sha256. Sign the exact bytes sent in the PUT request body, or send UNSIGNED-PAYLOAD when payload integrity is intentionally disabled.",
+                        resource,
+                        request_id.clone(),
+                    ),
+                    false,
+                )))
+            };
         };
+        Some(expected.to_owned())
+    } else {
+        presigned_payload_hash?
     };
 
-    match payload_hash_policy(expected) {
-        PayloadHashPolicy::LiteralSha256 => validate_literal_payload_hash(expected, bytes, resource, request_id).map(Some),
+    let Some(expected) = expected else {
+        return Ok(None);
+    };
+
+    match payload_hash_policy(&expected) {
+        PayloadHashPolicy::LiteralSha256 => {
+            validate_literal_payload_hash(&expected, bytes, resource, request_id).map(Some)
+        }
         PayloadHashPolicy::UnsignedPayload => Ok(Some(PayloadVerificationOutcome::Partial(
             PayloadVerificationPartialReason::UnsignedPayloadMarker,
         ))),
@@ -2085,6 +2390,23 @@ fn validate_signed_put_object_payload_hash(
             false,
         ))),
     }
+}
+
+fn presigned_payload_hash(
+    uri: &Uri,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> RouteResponseResult<Option<String>> {
+    let resource = resource_for_uri(uri);
+    let query = sigv4_query_pairs(uri.query(), &resource, is_head, request_id)?;
+    if !has_presigned_query_authorization(&query) {
+        return Ok(None);
+    }
+
+    Ok(query
+        .into_iter()
+        .find(|(name, _)| name == X_AMZ_CONTENT_SHA256_QUERY)
+        .map(|(_, value)| value))
 }
 
 fn validate_literal_payload_hash(
@@ -2186,6 +2508,13 @@ struct ListObjectsV2RouteRequest {
     continuation_token: Option<String>,
     max_keys: usize,
     encoding: Option<ListObjectsEncoding>,
+}
+
+#[derive(Debug)]
+struct PutObjectRouteRequest {
+    bucket: BucketName,
+    key: ObjectKey,
+    presigned_payload_hash: RouteResponseResult<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2389,6 +2718,12 @@ impl QueryParams {
             .keys()
             .any(|name| UNSUPPORTED_LIST_OBJECTS_V2_PARAMS.contains(&name.as_str()))
     }
+
+    fn has_presigned_query_authorization(&self) -> bool {
+        self.values
+            .keys()
+            .any(|name| PRESIGNED_QUERY_AUTH_PARAMS.contains(&name.as_str()))
+    }
 }
 
 impl RouteRejection {
@@ -2423,6 +2758,26 @@ const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
 ];
 
 const UNSUPPORTED_LIST_OBJECTS_V2_PARAMS: &[&str] = &[START_AFTER, FETCH_OWNER];
+
+const PRESIGNED_QUERY_AUTH_PARAMS: &[&str] = &[
+    X_AMZ_ALGORITHM_QUERY,
+    X_AMZ_CREDENTIAL_QUERY,
+    X_AMZ_DATE_QUERY,
+    X_AMZ_EXPIRES_QUERY,
+    X_AMZ_SIGNED_HEADERS_QUERY,
+    X_AMZ_SIGNATURE_QUERY,
+    X_AMZ_CONTENT_SHA256_QUERY,
+    X_AMZ_SECURITY_TOKEN_QUERY,
+];
+
+const PRESIGNED_RESPONSE_OVERRIDE_PARAMS: &[&str] = &[
+    RESPONSE_CACHE_CONTROL_QUERY,
+    RESPONSE_CONTENT_DISPOSITION_QUERY,
+    RESPONSE_CONTENT_ENCODING_QUERY,
+    RESPONSE_CONTENT_LANGUAGE_QUERY,
+    RESPONSE_CONTENT_TYPE_QUERY,
+    RESPONSE_EXPIRES_QUERY,
+];
 
 const UNSUPPORTED_PUT_OBJECT_HEADERS: &[&str] = &[
     "cache-control",
