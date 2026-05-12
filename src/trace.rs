@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
+use crate::encoding::hex_encode;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum TraceEvent {
     RequestReceived(RequestReceivedTrace),
@@ -376,18 +378,6 @@ fn trace_path_without_query(path: impl Into<String>) -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_encode(&digest)
-}
-
-fn hex_encode(value: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(value.len() * 2);
-
-    for byte in value {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-
-    encoded
 }
 
 #[cfg(test)]

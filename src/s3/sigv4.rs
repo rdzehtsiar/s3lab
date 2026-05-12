@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
 
+use crate::encoding::hex_encode;
+
 const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const QUERY_ALGORITHM_PARAM: &str = "X-Amz-Algorithm";
 const QUERY_CREDENTIAL_PARAM: &str = "X-Amz-Credential";
@@ -1239,18 +1241,6 @@ impl Debug for RedactedPairs<'_> {
             self.pairs.len()
         )
     }
-}
-
-fn hex_encode(value: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(value.len() * 2);
-
-    for byte in value {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-
-    encoded
 }
 
 fn percent_encode(value: &str, encode_slash: bool) -> String {

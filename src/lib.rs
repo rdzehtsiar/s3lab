@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod config;
+mod encoding;
 pub mod s3;
 pub mod server;
 pub mod storage;
