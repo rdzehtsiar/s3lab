@@ -25,11 +25,15 @@ S3Lab is not intended to be production object storage, a hosted SaaS service, or
 
 ## Current State
 
-S3Lab is at the very beginning of development.
+S3Lab is in early milestone development.
 
 The repository contains an early Rust codebase and the first pieces of a local S3-shaped endpoint, but the project should still be treated as experimental and incomplete. APIs, commands, storage layout, responses, tests, and documentation may change quickly.
 
 Do not rely on S3Lab for production workloads. Do not assume general S3 compatibility unless a specific operation and client workflow is covered by tests or documented smoke evidence.
+
+The current local endpoint has narrow contract coverage for path-style bucket and object workflows: create, list, head, get, put, and delete operations for local buckets and objects. Unsigned requests remain accepted for local debugging. SigV4 header-auth requests using `Authorization: AWS4-HMAC-SHA256 ...` are validated against the static local credentials `s3lab` / `s3lab-secret`.
+
+For signed `PUT` object requests, S3Lab checks literal `x-amz-content-sha256` body hashes when present. `UNSIGNED-PAYLOAD` and AWS streaming payload markers are accepted as partial payload validation and traced as partial. Presigned URL authentication, configurable credentials, strict authentication mode, trace persistence/API/UI, and full streaming chunk-signature validation are not implemented yet.
 
 ## Intended Users
 

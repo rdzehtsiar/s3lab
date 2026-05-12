@@ -1,8 +1,8 @@
-# Phase 1 Smoke Tests
+# Milestone 2 Smoke Tests
 
-This page documents narrow AWS CLI, Python boto3, AWS SDK for JavaScript v3, and Go SDK smoke recipes for S3Lab Phase 1. It is intended to produce local evidence that the current Phase 1 endpoint can accept a basic bucket and object lifecycle against `localhost`.
+This page documents narrow AWS CLI, Python boto3, AWS SDK for JavaScript v3, and Go SDK smoke recipes for S3Lab milestone 2. It is intended to produce local evidence that the current endpoint accepts a basic bucket and object lifecycle against `localhost`.
 
-This is not a general compatibility claim. Phase 1 smoke evidence only covers the operations exercised below.
+This is not a general compatibility claim. Milestone 2 smoke evidence only covers the operations exercised below.
 
 ## Shared Assumptions
 
@@ -12,13 +12,16 @@ This is not a general compatibility claim. Phase 1 smoke evidence only covers th
 - Python and boto3 are installed for the boto3 recipe.
 - Node.js and npm are installed for the AWS SDK for JavaScript v3 recipe.
 - Go is installed for the Go SDK recipe.
-- Clients use dummy credentials. No cloud account is required.
+- Clients use the static local S3Lab credentials `s3lab` / `s3lab-secret`. No cloud account is required.
 - Requests stay offline and target only the local S3Lab endpoint through `--endpoint-url`, boto3 `endpoint_url`, AWS SDK for JavaScript v3 `endpoint`, or the Go SDK local endpoint configuration.
-- Phase 1 accepts signed client requests but does not validate SigV4 signatures yet.
-- Phase 1 supports path-style localhost routing, for example `http://127.0.0.1:9000/s3lab-smoke-bucket/object.txt`.
-- Phase 1 uses conservative DNS-style bucket validation for local safety and practical SDK/CLI workflows, not complete AWS parity. Tests currently cover rejection of names that are too short, contain uppercase letters, underscores, adjacent dots, dot-hyphen or hyphen-dot pairs, IP-address-like names, slashes, or the modeled AWS reserved prefixes and suffixes.
-- Virtual-host style routing, presigned URLs, and multipart uploads are deferred.
-- Phase 1 preserves valid `x-amz-meta-*` object metadata, normalizes metadata keys to lowercase, returns metadata on `GET` and `HEAD`, and rejects invalid, non-UTF8, or duplicate normalized metadata.
+- Unsigned requests remain accepted for local debugging workflows.
+- SigV4 header-auth requests with `Authorization: AWS4-HMAC-SHA256 ...` are validated against the static local credentials.
+- Signed `PUT` object requests with literal `x-amz-content-sha256` values are checked against the request body bytes.
+- `UNSIGNED-PAYLOAD` and AWS `STREAMING-*` payload markers are accepted as partial payload validation and traced as partial.
+- Path-style localhost routing is supported, for example `http://127.0.0.1:9000/s3lab-smoke-bucket/object.txt`.
+- S3Lab uses conservative DNS-style bucket validation for local safety and practical SDK/CLI workflows, not complete AWS parity. Tests currently cover rejection of names that are too short, contain uppercase letters, underscores, adjacent dots, dot-hyphen or hyphen-dot pairs, IP-address-like names, slashes, or the modeled AWS reserved prefixes and suffixes.
+- Virtual-host style routing, presigned URL authentication, configurable credentials, strict authentication mode, multipart uploads, trace persistence/API/UI, and full streaming chunk-signature validation are deferred.
+- S3Lab preserves valid `x-amz-meta-*` object metadata, normalizes metadata keys to lowercase, returns metadata on `GET` and `HEAD`, and rejects invalid, non-UTF8, or duplicate normalized metadata.
 
 ## Start S3Lab
 
@@ -54,7 +57,7 @@ $Key = "hello.txt"
 $Body = Join-Path $env:TEMP "s3lab-smoke-body.txt"
 $Download = Join-Path $env:TEMP "s3lab-smoke-download.txt"
 
-Set-Content -Path $Body -Value "hello from s3lab phase 1" -NoNewline
+Set-Content -Path $Body -Value "hello from s3lab milestone 2" -NoNewline
 
 aws --endpoint-url $Endpoint s3api create-bucket --bucket $Bucket
 aws --endpoint-url $Endpoint s3api put-object --bucket $Bucket --key $Key --body $Body
@@ -68,7 +71,7 @@ aws --endpoint-url $Endpoint s3api delete-bucket --bucket $Bucket
 The downloaded file should contain:
 
 ```text
-hello from s3lab phase 1
+hello from s3lab milestone 2
 ```
 
 ## Python boto3 Smoke Recipe
@@ -82,7 +85,7 @@ from botocore.config import Config
 endpoint_url = "http://127.0.0.1:9000"
 bucket = "s3lab-smoke-boto3-bucket"
 key = "hello.txt"
-body = b"hello from s3lab phase 1"
+body = b"hello from s3lab milestone 2"
 
 s3 = boto3.client(
     "s3",
@@ -113,7 +116,7 @@ The output should include:
 
 ```text
 ['hello.txt']
-hello from s3lab phase 1
+hello from s3lab milestone 2
 ```
 
 ## AWS SDK for JavaScript v3 Smoke Recipe
@@ -144,7 +147,7 @@ import {
 const endpoint = "http://127.0.0.1:9000";
 const bucket = "s3lab-smoke-js-bucket";
 const key = "hello.txt";
-const body = "hello from s3lab phase 1";
+const body = "hello from s3lab milestone 2";
 
 const client = new S3Client({
   endpoint,
@@ -179,7 +182,7 @@ The output should include:
 
 ```text
 [ 'hello.txt' ]
-hello from s3lab phase 1
+hello from s3lab milestone 2
 ```
 
 ## Go SDK Smoke Recipe
@@ -217,7 +220,7 @@ func main() {
 	endpoint := "http://127.0.0.1:9000"
 	bucket := "s3lab-smoke-go-bucket"
 	key := "hello.txt"
-	body := "hello from s3lab phase 1"
+	body := "hello from s3lab milestone 2"
 
 	cfg, err := config.LoadDefaultConfig(
 		ctx,
@@ -297,12 +300,12 @@ The output should include:
 
 ```text
 hello.txt
-hello from s3lab phase 1
+hello from s3lab milestone 2
 ```
 
 ## What This Exercises
 
-These recipes exercise only this local Phase 1 path:
+These recipes exercise only this local milestone 2 path:
 
 - create one bucket
 - put one object
@@ -311,4 +314,4 @@ These recipes exercise only this local Phase 1 path:
 - delete the object
 - delete the bucket
 
-It does not prove broad AWS S3 compatibility. It does not cover virtual-host style addressing, presigned URLs, multipart uploads, signature validation, bucket policies, ACLs, object tags, encryption headers, range reads, or production storage behavior.
+It does not prove broad AWS S3 compatibility. It does not cover virtual-host style addressing, presigned URL authentication, configurable credentials, strict authentication mode, multipart uploads, bucket policies, ACLs, object tags, encryption headers, range reads, trace persistence/API/UI, full streaming chunk-signature validation, or production storage behavior.

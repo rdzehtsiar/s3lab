@@ -802,6 +802,7 @@ async fn signed_put_rejects_literal_payload_hash_mismatch_without_storage_call()
     );
     let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
     assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
+    assert!(body.contains("<Message>The x-amz-content-sha256 header value did not match the request body bytes. Sign the exact bytes sent in the PUT request body.</Message>"));
     assert!(body.contains("<Resource>/bucket/object.txt</Resource>"));
     assert!(!body.contains("signed-body"));
     assert!(!body.contains("sent-secret-body"));
@@ -840,6 +841,7 @@ async fn signed_put_rejects_unsupported_payload_hash_marker_without_storage_call
     );
     let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
     assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
+    assert!(body.contains("<Message>Signed PUT object requests must use a literal SHA-256 x-amz-content-sha256 value, UNSIGNED-PAYLOAD, or a STREAMING-* payload marker.</Message>"));
     assert!(body.contains("<Resource>/bucket/object.txt</Resource>"));
     assert!(!body.contains("NOT-A-SUPPORTED-PAYLOAD-MARKER"));
     assert!(!body.contains("sent-secret-body"));
@@ -874,6 +876,7 @@ async fn signed_put_rejects_missing_payload_hash_with_body_without_storage_call(
     );
     let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
     assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
+    assert!(body.contains("<Message>Signed PUT object requests with a body must include x-amz-content-sha256. Sign the exact bytes sent in the PUT request body, or send UNSIGNED-PAYLOAD when payload integrity is intentionally disabled.</Message>"));
     assert!(body.contains("<Resource>/bucket/object.txt</Resource>"));
     assert!(!body.contains("sent-secret-body"));
     assert_no_storage_calls(&calls);
@@ -895,10 +898,11 @@ async fn malformed_authorization_returns_s3_error_without_storage_call() {
         .await
         .expect("malformed auth response");
 
-    assert_s3_error_xml(
+    assert_s3_error_xml_with_message(
         response,
         StatusCode::BAD_REQUEST,
         "AuthorizationHeaderMalformed",
+        "Use AWS4-HMAC-SHA256 as the Authorization algorithm.",
         "/bucket/object.txt",
     )
     .await;
@@ -944,10 +948,11 @@ async fn wrong_access_key_returns_s3_error_without_storage_call() {
         .await
         .expect("wrong access key response");
 
-    assert_s3_error_xml(
+    assert_s3_error_xml_with_message(
         response,
         StatusCode::FORBIDDEN,
         "InvalidAccessKeyId",
+        "The access key id is not configured for this local S3Lab server.",
         "/bucket/object.txt",
     )
     .await;
@@ -976,10 +981,11 @@ async fn missing_signed_header_returns_s3_error_without_storage_call() {
         .await
         .expect("missing signed header response");
 
-    assert_s3_error_xml(
+    assert_s3_error_xml_with_message(
         response,
         StatusCode::FORBIDDEN,
         "AccessDenied",
+        "A header listed in SignedHeaders was not present in the request; include it before signing or remove it from SignedHeaders.",
         "/bucket/object.txt",
     )
     .await;
@@ -1008,10 +1014,11 @@ async fn signature_mismatch_returns_s3_error_without_storage_call() {
         .await
         .expect("signature mismatch response");
 
-    assert_s3_error_xml(
+    assert_s3_error_xml_with_message(
         response,
         StatusCode::FORBIDDEN,
         "SignatureDoesNotMatch",
+        "The SigV4 signature did not match the canonical request; verify the method, path, query, signed headers, payload hash, credential scope, timestamp, and secret.",
         "/bucket/object.txt",
     )
     .await;
@@ -3428,6 +3435,34 @@ async fn assert_s3_error_xml(
     );
     let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
     assert!(body.contains(&format!("<Code>{code}</Code>")));
+    assert!(body.contains(&format!("<Resource>{}</Resource>", xml_text(resource))));
+}
+
+async fn assert_s3_error_xml_with_message(
+    response: axum::http::Response<Body>,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    resource: &str,
+) {
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/xml")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains(&format!("<Code>{code}</Code>")));
+    assert!(body.contains(&format!("<Message>{}</Message>", xml_text(message))));
     assert!(body.contains(&format!("<Resource>{}</Resource>", xml_text(resource))));
 }
 
