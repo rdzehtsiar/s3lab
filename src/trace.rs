@@ -12,6 +12,7 @@ pub enum TraceEvent {
     SigV4Parsed(SigV4ParsedTrace),
     CanonicalRequestBuilt(CanonicalRequestBuiltTrace),
     AuthDecision(AuthDecisionTrace),
+    PayloadVerification(PayloadVerificationTrace),
     StorageMutation(StorageMutationTrace),
     ResponseSent(ResponseSentTrace),
 }
@@ -171,6 +172,21 @@ impl AuthDecisionTrace {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PayloadVerificationTrace {
+    pub request_id: String,
+    pub outcome: PayloadVerificationOutcome,
+}
+
+impl PayloadVerificationTrace {
+    pub fn new(request_id: impl Into<String>, outcome: PayloadVerificationOutcome) -> Self {
+        Self {
+            request_id: request_id.into(),
+            outcome,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StorageMutationTrace {
     pub request_id: String,
     pub mutation: StorageMutation,
@@ -286,6 +302,18 @@ pub enum AuthDecision {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PayloadVerificationOutcome {
+    Full,
+    Partial(PayloadVerificationPartialReason),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PayloadVerificationPartialReason {
+    UnsignedPayloadMarker,
+    StreamingPayloadMarker,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AuthRejectionReason {
     MissingAuthorization,
     InvalidAuthorization,
@@ -365,9 +393,10 @@ fn hex_encode(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthDecision, CanonicalRequestBuiltTrace, RequestReceivedTrace, RouteRejectedTrace,
-        RouteRejectionReason, RouteResolvedTrace, SigV4ParsedTrace, TraceCredentialScope,
-        TraceS3Operation,
+        AuthDecision, CanonicalRequestBuiltTrace, PayloadVerificationOutcome,
+        PayloadVerificationPartialReason, PayloadVerificationTrace, RequestReceivedTrace,
+        RouteRejectedTrace, RouteRejectionReason, RouteResolvedTrace, SigV4ParsedTrace,
+        TraceCredentialScope, TraceS3Operation,
     };
 
     #[test]
@@ -479,5 +508,20 @@ mod tests {
         assert!(debug.contains("SignatureMismatch"));
         assert!(!debug.contains("secret"));
         assert!(!debug.contains("0000000000000000000000000000000000000000000000000000000000000000"));
+    }
+
+    #[test]
+    fn payload_verification_trace_uses_typed_partial_reasons() {
+        let trace = PayloadVerificationTrace::new(
+            "s3lab-0000000000000001",
+            PayloadVerificationOutcome::Partial(
+                PayloadVerificationPartialReason::UnsignedPayloadMarker,
+            ),
+        );
+        let debug = format!("{trace:?}");
+
+        assert!(debug.contains("UnsignedPayloadMarker"));
+        assert!(!debug.contains("sent-secret-body"));
+        assert!(!debug.contains("Signature="));
     }
 }

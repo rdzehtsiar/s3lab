@@ -19,7 +19,8 @@ use s3lab::storage::{
     StoredObject, StoredObjectMetadata,
 };
 use s3lab::trace::{
-    AuthDecision, AuthDecisionTrace, CanonicalRequestBuiltTrace, RequestReceivedTrace,
+    AuthDecision, AuthDecisionTrace, CanonicalRequestBuiltTrace, PayloadVerificationOutcome,
+    PayloadVerificationPartialReason, PayloadVerificationTrace, RequestReceivedTrace,
     ResponseSentTrace, RouteResolvedTrace, SigV4ParsedTrace, StorageMutation,
     StorageMutationOutcome, StorageMutationTrace, TraceEvent, TraceS3Operation, TraceSink,
 };
@@ -652,6 +653,127 @@ async fn valid_signed_request_is_verified_before_storage_mutation() {
 }
 
 #[tokio::test]
+async fn signed_put_accepts_unsigned_payload_marker_as_partial_verification() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let sink = TestTraceSink::default();
+    let recorded = sink.clone();
+    let state = ServerState::with_request_id_generator_and_trace_sink(
+        storage,
+        FixedRequestIdGenerator::new(STATIC_REQUEST_ID),
+        sink,
+    );
+    let app = router(state);
+    let sent_body = b"sent-secret-body";
+    let headers = signed_request_headers_with_payload_hash(
+        Method::PUT,
+        "/bucket/object.txt",
+        "UNSIGNED-PAYLOAD",
+    );
+    let authorization = header_value(&headers, "authorization").to_owned();
+
+    let response = app
+        .oneshot(request_with_owned_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &headers,
+            Body::from(sent_body.as_slice().to_vec()),
+        ))
+        .await
+        .expect("signed put object with unsigned payload marker");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(calls.lock().expect("calls lock").as_slice(), ["put_object"]);
+    let events = recorded.events();
+    assert!(events.contains(&TraceEvent::PayloadVerification(
+        PayloadVerificationTrace::new(
+            STATIC_REQUEST_ID,
+            PayloadVerificationOutcome::Partial(
+                PayloadVerificationPartialReason::UnsignedPayloadMarker,
+            ),
+        )
+    )));
+    let debug = format!("{events:?}");
+    assert!(!debug.contains("sent-secret-body"));
+    assert!(!debug.contains(&authorization));
+    assert!(!debug.contains(signature_from_authorization(&authorization)));
+}
+
+#[tokio::test]
+async fn signed_put_accepts_streaming_payload_marker_with_aws_chunked_body() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let sink = TestTraceSink::default();
+    let recorded = sink.clone();
+    let state = ServerState::with_request_id_generator_and_trace_sink(
+        FilesystemStorage::new(temp_dir.path()),
+        FixedRequestIdGenerator::new(STATIC_REQUEST_ID),
+        sink,
+    );
+    let app = router(state);
+
+    let create = app
+        .clone()
+        .oneshot(request(Method::PUT, "/bucket", Body::empty()))
+        .await
+        .expect("create bucket");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let mut headers = signed_request_headers_with_payload_hash(
+        Method::PUT,
+        "/bucket/object.txt",
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+    );
+    headers.extend([
+        ("content-encoding".to_owned(), "aws-chunked".to_owned()),
+        ("x-amz-decoded-content-length".to_owned(), "5".to_owned()),
+        (
+            "x-amz-sdk-checksum-algorithm".to_owned(),
+            "CRC32".to_owned(),
+        ),
+        (
+            "x-amz-trailer".to_owned(),
+            "x-amz-checksum-crc32".to_owned(),
+        ),
+    ]);
+
+    let put = app
+        .clone()
+        .oneshot(request_with_owned_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &headers,
+            Body::from(
+                "5;chunk-signature=signature\r\nhello\r\n0;chunk-signature=signature\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n",
+            ),
+        ))
+        .await
+        .expect("put signed aws-chunked object");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_put_object_success_headers(&put);
+    assert!(body_bytes(put).await.is_empty());
+
+    let get = app
+        .oneshot(request(Method::GET, "/bucket/object.txt", Body::empty()))
+        .await
+        .expect("get signed aws-chunked object");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(body_bytes(get).await, Bytes::from_static(b"hello"));
+
+    let events = recorded.events();
+    assert!(events.contains(&TraceEvent::PayloadVerification(
+        PayloadVerificationTrace::new(
+            STATIC_REQUEST_ID,
+            PayloadVerificationOutcome::Partial(
+                PayloadVerificationPartialReason::StreamingPayloadMarker,
+            ),
+        )
+    )));
+    let debug = format!("{events:?}");
+    assert!(!debug.contains("hello"));
+    assert!(!debug.contains("chunk-signature=signature"));
+}
+
+#[tokio::test]
 async fn signed_put_rejects_literal_payload_hash_mismatch_without_storage_call() {
     let storage = RecordingStorage::default();
     let calls = Arc::clone(&storage.calls);
@@ -682,6 +804,44 @@ async fn signed_put_rejects_literal_payload_hash_mismatch_without_storage_call()
     assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
     assert!(body.contains("<Resource>/bucket/object.txt</Resource>"));
     assert!(!body.contains("signed-body"));
+    assert!(!body.contains("sent-secret-body"));
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn signed_put_rejects_unsupported_payload_hash_marker_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let sent_body = b"sent-secret-body";
+    let headers = signed_request_headers_with_payload_hash(
+        Method::PUT,
+        "/bucket/object.txt",
+        "NOT-A-SUPPORTED-PAYLOAD-MARKER",
+    );
+
+    let response = app
+        .oneshot(request_with_owned_headers(
+            Method::PUT,
+            "/bucket/object.txt",
+            &headers,
+            Body::from(sent_body.as_slice().to_vec()),
+        ))
+        .await
+        .expect("unsupported payload hash marker response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/xml")
+    );
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf-8 XML body");
+    assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
+    assert!(body.contains("<Resource>/bucket/object.txt</Resource>"));
+    assert!(!body.contains("NOT-A-SUPPORTED-PAYLOAD-MARKER"));
     assert!(!body.contains("sent-secret-body"));
     assert_no_storage_calls(&calls);
 }
@@ -3022,6 +3182,14 @@ fn signed_request_headers(method: Method, uri: &str, body: &[u8]) -> Vec<(String
     signed_request_headers_with_access_key(method, uri, body, "s3lab")
 }
 
+fn signed_request_headers_with_payload_hash(
+    method: Method,
+    uri: &str,
+    payload_hash: &str,
+) -> Vec<(String, String)> {
+    signed_request_headers_with_payload_hash_and_access_key(method, uri, payload_hash, "s3lab")
+}
+
 fn signed_request_headers_without_payload_hash(method: Method, uri: &str) -> Vec<(String, String)> {
     let request_datetime = "20260512T010203Z";
     let credential_scope = "20260512/us-east-1/s3/aws4_request";
@@ -3072,14 +3240,24 @@ fn signed_request_headers_with_access_key(
     body: &[u8],
     access_key: &str,
 ) -> Vec<(String, String)> {
+    let payload_hash = sha256_lower_hex_bytes(body);
+
+    signed_request_headers_with_payload_hash_and_access_key(method, uri, &payload_hash, access_key)
+}
+
+fn signed_request_headers_with_payload_hash_and_access_key(
+    method: Method,
+    uri: &str,
+    payload_hash: &str,
+    access_key: &str,
+) -> Vec<(String, String)> {
     let request_datetime = "20260512T010203Z";
     let credential_scope = "20260512/us-east-1/s3/aws4_request";
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-    let payload_hash = sha256_lower_hex_bytes(body);
     let parsed_uri = uri.parse::<Uri>().expect("valid URI");
     let header_pairs = [
         ("host", "localhost"),
-        ("x-amz-content-sha256", payload_hash.as_str()),
+        ("x-amz-content-sha256", payload_hash),
         ("x-amz-date", request_datetime),
     ];
     let unsigned_authorization = format!(
@@ -3093,7 +3271,7 @@ fn signed_request_headers_with_access_key(
         &[],
         &header_pairs,
         authorization.signed_headers(),
-        &payload_hash,
+        payload_hash,
     )
     .expect("canonical request");
     let string_to_sign = build_string_to_sign(
@@ -3115,7 +3293,7 @@ fn signed_request_headers_with_access_key(
     vec![
         ("host".to_owned(), "localhost".to_owned()),
         ("x-amz-date".to_owned(), request_datetime.to_owned()),
-        ("x-amz-content-sha256".to_owned(), payload_hash),
+        ("x-amz-content-sha256".to_owned(), payload_hash.to_owned()),
         ("authorization".to_owned(), authorization),
     ]
 }

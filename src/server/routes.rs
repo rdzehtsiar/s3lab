@@ -20,6 +20,7 @@ use crate::storage::{
 };
 use crate::trace::{
     AuthDecision, AuthDecisionTrace, AuthRejectionReason, CanonicalRequestBuiltTrace,
+    PayloadVerificationOutcome, PayloadVerificationPartialReason, PayloadVerificationTrace,
     RequestReceivedTrace, ResponseSentTrace, RouteRejectedTrace, RouteRejectionReason,
     RouteResolvedTrace, SigV4ParseRejection, SigV4ParsedTrace, StorageMutation,
     StorageMutationOutcome, StorageMutationTrace, TraceCredentialScope, TraceEvent,
@@ -1044,10 +1045,14 @@ async fn put_object_route_response(
             return Ok(*response);
         }
     }
-    if let Err(response) =
-        validate_signed_put_object_payload_hash(&headers, &body.bytes, &resource, request_id)
-    {
-        return Ok(*response);
+    match validate_signed_put_object_payload_hash(&headers, &body.bytes, &resource, request_id) {
+        Ok(Some(outcome)) => {
+            state.record_trace(TraceEvent::PayloadVerification(
+                PayloadVerificationTrace::new(request_id.as_str(), outcome),
+            ));
+        }
+        Ok(None) => {}
+        Err(response) => return Ok(*response),
     }
 
     let result = state.storage().put_object(PutObjectRequest {
@@ -2038,9 +2043,9 @@ fn validate_signed_put_object_payload_hash(
     bytes: &[u8],
     resource: &str,
     request_id: &S3RequestId,
-) -> RouteResponseResult<()> {
+) -> RouteResponseResult<Option<PayloadVerificationOutcome>> {
     if !headers.contains_key(AUTHORIZATION) {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(expected) = headers
@@ -2048,7 +2053,7 @@ fn validate_signed_put_object_payload_hash(
         .and_then(|value| value.to_str().ok())
     else {
         return if bytes.is_empty() {
-            Ok(())
+            Ok(None)
         } else {
             Err(Box::new(s3_error_response(
                 S3Error::with_message(
@@ -2061,13 +2066,36 @@ fn validate_signed_put_object_payload_hash(
             )))
         };
     };
-    if !is_literal_sha256_payload_hash(expected) {
-        return Ok(());
-    }
 
+    match payload_hash_policy(expected) {
+        PayloadHashPolicy::LiteralSha256 => validate_literal_payload_hash(expected, bytes, resource, request_id).map(Some),
+        PayloadHashPolicy::UnsignedPayload => Ok(Some(PayloadVerificationOutcome::Partial(
+            PayloadVerificationPartialReason::UnsignedPayloadMarker,
+        ))),
+        PayloadHashPolicy::StreamingPayload => Ok(Some(PayloadVerificationOutcome::Partial(
+            PayloadVerificationPartialReason::StreamingPayloadMarker,
+        ))),
+        PayloadHashPolicy::Unsupported => Err(Box::new(s3_error_response(
+            S3Error::with_message(
+                S3ErrorCode::XAmzContentSHA256Mismatch,
+                "Signed PUT object requests must use a literal SHA-256 x-amz-content-sha256 value, UNSIGNED-PAYLOAD, or a STREAMING-* payload marker.",
+                resource,
+                request_id.clone(),
+            ),
+            false,
+        ))),
+    }
+}
+
+fn validate_literal_payload_hash(
+    expected: &str,
+    bytes: &[u8],
+    resource: &str,
+    request_id: &S3RequestId,
+) -> RouteResponseResult<PayloadVerificationOutcome> {
     let actual = sha256_lower_hex(bytes);
     if expected.eq_ignore_ascii_case(&actual) {
-        Ok(())
+        Ok(PayloadVerificationOutcome::Full)
     } else {
         Err(Box::new(s3_error_response(
             S3Error::with_message(
@@ -2081,11 +2109,28 @@ fn validate_signed_put_object_payload_hash(
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PayloadHashPolicy {
+    LiteralSha256,
+    UnsignedPayload,
+    StreamingPayload,
+    Unsupported,
+}
+
+fn payload_hash_policy(value: &str) -> PayloadHashPolicy {
+    if is_literal_sha256_payload_hash(value) {
+        PayloadHashPolicy::LiteralSha256
+    } else if value == UNSIGNED_PAYLOAD {
+        PayloadHashPolicy::UnsignedPayload
+    } else if value.starts_with(STREAMING_PAYLOAD_PREFIX) {
+        PayloadHashPolicy::StreamingPayload
+    } else {
+        PayloadHashPolicy::Unsupported
+    }
+}
+
 fn is_literal_sha256_payload_hash(value: &str) -> bool {
-    value != UNSIGNED_PAYLOAD
-        && !value.starts_with(STREAMING_PAYLOAD_PREFIX)
-        && value.len() == 64
-        && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+    value.len() == 64 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
 fn sha256_lower_hex(bytes: &[u8]) -> String {
