@@ -33,7 +33,11 @@ Do not rely on S3Lab for production workloads. Do not assume general S3 compatib
 
 The current local endpoint has narrow contract coverage for path-style bucket and object workflows: create, list, head, get, put, and delete operations for local buckets and objects. Unsigned requests remain accepted for local debugging. SigV4 header-auth requests using `Authorization: AWS4-HMAC-SHA256 ...` are validated against the static local credentials `s3lab` / `s3lab-secret`.
 
-For signed `PUT` object requests, S3Lab checks literal `x-amz-content-sha256` body hashes when present. `UNSIGNED-PAYLOAD` and AWS streaming payload markers are accepted as partial payload validation and traced as partial. Presigned URL authentication, configurable credentials, strict authentication mode, trace persistence/API/UI, and full streaming chunk-signature validation are not implemented yet.
+For signed `PUT` object requests, S3Lab checks literal `x-amz-content-sha256` body hashes when present. `UNSIGNED-PAYLOAD` and AWS streaming payload markers are accepted as partial payload validation and traced as partial.
+
+Milestone 3 adds narrow presigned URL support for path-style object `GET` and `PUT` requests against the offline local endpoint. S3Lab validates query-string SigV4 parameters, static local credentials `s3lab` / `s3lab-secret`, and expiration. No cloud account is required. See [Milestone 3 Smoke Tests](./docs/milestone3-smoke-tests.md) for local presigned URL recipes.
+
+Current limitations include no virtual-host style routing, no session-token presigned URLs, no configurable credentials, no strict authentication mode, no multipart uploads, no trace persistence/API/UI, and no full streaming chunk-signature validation. These limitations should not be read as a broad S3 compatibility claim.
 
 ## Intended Users
 

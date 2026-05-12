@@ -20,7 +20,8 @@ This is not a general compatibility claim. Milestone 2 smoke evidence only cover
 - `UNSIGNED-PAYLOAD` and AWS `STREAMING-*` payload markers are accepted as partial payload validation and traced as partial.
 - Path-style localhost routing is supported, for example `http://127.0.0.1:9000/s3lab-smoke-bucket/object.txt`.
 - S3Lab uses conservative DNS-style bucket validation for local safety and practical SDK/CLI workflows, not complete AWS parity. Tests currently cover rejection of names that are too short, contain uppercase letters, underscores, adjacent dots, dot-hyphen or hyphen-dot pairs, IP-address-like names, slashes, or the modeled AWS reserved prefixes and suffixes.
-- Virtual-host style routing, presigned URL authentication, configurable credentials, strict authentication mode, multipart uploads, trace persistence/API/UI, and full streaming chunk-signature validation are deferred.
+- Virtual-host style routing, configurable credentials, strict authentication mode, multipart uploads, trace persistence/API/UI, and full streaming chunk-signature validation are deferred.
+- Presigned URL authentication was outside milestone 2 coverage. Current milestone 3 presigned URL smoke recipes are documented in [Milestone 3 Smoke Tests](./milestone3-smoke-tests.md).
 - S3Lab preserves valid `x-amz-meta-*` object metadata, normalizes metadata keys to lowercase, returns metadata on `GET` and `HEAD`, and rejects invalid, non-UTF8, or duplicate normalized metadata.
 
 ## Start S3Lab
@@ -314,4 +315,4 @@ These recipes exercise only this local milestone 2 path:
 - delete the object
 - delete the bucket
 
-It does not prove broad AWS S3 compatibility. It does not cover virtual-host style addressing, presigned URL authentication, configurable credentials, strict authentication mode, multipart uploads, bucket policies, ACLs, object tags, encryption headers, range reads, trace persistence/API/UI, full streaming chunk-signature validation, or production storage behavior.
+It does not prove broad AWS S3 compatibility. It does not cover virtual-host style addressing, configurable credentials, strict authentication mode, multipart uploads, bucket policies, ACLs, object tags, encryption headers, range reads, trace persistence/API/UI, full streaming chunk-signature validation, or production storage behavior. Presigned URL authentication is covered separately by the milestone 3 smoke recipes.
