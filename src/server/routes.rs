@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::PathBuf;
+use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 const REQUEST_ID_HEADER: &str = "x-amz-request-id";
 const USER_METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
@@ -83,6 +84,7 @@ const RESPONSE_CONTENT_TYPE_QUERY: &str = "response-content-type";
 const RESPONSE_EXPIRES_QUERY: &str = "response-expires";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const STREAMING_PAYLOAD_PREFIX: &str = "STREAMING-";
+const MAX_PRESIGNED_EXPIRES_SECONDS: u32 = 604_800;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RouteScope {
@@ -417,6 +419,16 @@ fn query_auth_rejection_response(
         ));
     }
 
+    if let Some(response) = presigned_expiration_rejection_response(
+        state,
+        &authorization,
+        &resource,
+        is_head,
+        request_id,
+    ) {
+        return Some(response);
+    }
+
     let header_values = match sigv4_header_pairs(headers, &resource, is_head, request_id) {
         Ok(headers) => headers,
         Err(response) => {
@@ -494,6 +506,106 @@ fn query_auth_rejection_response(
             ))
         }
     }
+}
+
+fn presigned_expiration_rejection_response(
+    state: &ServerState,
+    authorization: &SigV4QueryAuthorization,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Option<Response<Body>> {
+    let expires_seconds = authorization.expires_seconds();
+    if !(1..=MAX_PRESIGNED_EXPIRES_SECONDS).contains(&expires_seconds) {
+        state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+            request_id.as_str(),
+            AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+        )));
+        return Some(auth_error_response(
+            S3ErrorCode::AuthorizationHeaderMalformed,
+            "Use an X-Amz-Expires value from 1 through 604800 seconds.",
+            resource,
+            is_head,
+            request_id,
+        ));
+    }
+
+    let request_time = match parse_presigned_request_datetime(authorization.request_datetime()) {
+        Ok(request_time) => request_time,
+        Err(()) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+            )));
+            return Some(auth_error_response(
+                S3ErrorCode::AuthorizationHeaderMalformed,
+                "Use a real UTC X-Amz-Date value in YYYYMMDDTHHMMSSZ form.",
+                resource,
+                is_head,
+                request_id,
+            ));
+        }
+    };
+    let Some(expires_at) = request_time.checked_add(Duration::seconds(expires_seconds.into()))
+    else {
+        state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+            request_id.as_str(),
+            AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+        )));
+        return Some(auth_error_response(
+            S3ErrorCode::AuthorizationHeaderMalformed,
+            "Use an X-Amz-Date and X-Amz-Expires combination that stays within supported UTC time.",
+            resource,
+            is_head,
+            request_id,
+        ));
+    };
+
+    if state.auth_now_utc() > expires_at {
+        state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+            request_id.as_str(),
+            AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+        )));
+        return Some(auth_error_response(
+            S3ErrorCode::AccessDenied,
+            "The presigned URL has expired; generate a new URL with a later X-Amz-Date or X-Amz-Expires value.",
+            resource,
+            is_head,
+            request_id,
+        ));
+    }
+
+    None
+}
+
+fn parse_presigned_request_datetime(value: &str) -> Result<OffsetDateTime, ()> {
+    if value.len() != 16
+        || value.as_bytes()[8] != b'T'
+        || value.as_bytes()[15] != b'Z'
+        || !value[..8].bytes().all(|byte| byte.is_ascii_digit())
+        || !value[9..15].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(());
+    }
+
+    let year = parse_decimal_i32(&value[0..4])?;
+    let month = Month::try_from(parse_decimal_u8(&value[4..6])?).map_err(|_| ())?;
+    let day = parse_decimal_u8(&value[6..8])?;
+    let hour = parse_decimal_u8(&value[9..11])?;
+    let minute = parse_decimal_u8(&value[11..13])?;
+    let second = parse_decimal_u8(&value[13..15])?;
+    let date = Date::from_calendar_date(year, month, day).map_err(|_| ())?;
+    let time = Time::from_hms(hour, minute, second).map_err(|_| ())?;
+
+    Ok(PrimitiveDateTime::new(date, time).assume_utc())
+}
+
+fn parse_decimal_i32(value: &str) -> Result<i32, ()> {
+    value.parse::<i32>().map_err(|_| ())
+}
+
+fn parse_decimal_u8(value: &str) -> Result<u8, ()> {
+    value.parse::<u8>().map_err(|_| ())
 }
 
 fn authorization_header<'a>(

@@ -5,16 +5,22 @@ use crate::storage::Storage;
 use crate::trace::{NoopTraceSink, TraceEvent, TraceSink};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use time::OffsetDateTime;
 
 #[derive(Clone)]
 pub struct ServerState {
     storage: Arc<dyn Storage + Send + Sync>,
     request_id_generator: Arc<dyn RequestIdGenerator>,
     trace_sink: Arc<dyn TraceSink>,
+    auth_clock: Arc<dyn AuthClock>,
 }
 
 pub trait RequestIdGenerator: Send + Sync {
     fn next_request_id(&self) -> S3RequestId;
+}
+
+pub trait AuthClock: Send + Sync {
+    fn now_utc(&self) -> OffsetDateTime;
 }
 
 #[derive(Debug, Default)]
@@ -25,6 +31,14 @@ pub struct SequentialRequestIdGenerator {
 #[derive(Debug)]
 pub struct FixedRequestIdGenerator {
     request_id: S3RequestId,
+}
+
+#[derive(Debug, Default)]
+pub struct SystemAuthClock;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct FixedAuthClock {
+    timestamp: OffsetDateTime,
 }
 
 impl ServerState {
@@ -59,7 +73,13 @@ impl ServerState {
             storage: Arc::new(storage),
             request_id_generator: Arc::new(request_id_generator),
             trace_sink: Arc::new(trace_sink),
+            auth_clock: Arc::new(SystemAuthClock),
         }
+    }
+
+    pub fn with_auth_clock(mut self, auth_clock: impl AuthClock + 'static) -> Self {
+        self.auth_clock = Arc::new(auth_clock);
+        self
     }
 
     pub fn with_fixed_request_id(
@@ -79,6 +99,10 @@ impl ServerState {
 
     pub fn record_trace(&self, event: TraceEvent) {
         self.trace_sink.record(event);
+    }
+
+    pub fn auth_now_utc(&self) -> OffsetDateTime {
+        self.auth_clock.now_utc()
     }
 }
 
@@ -110,13 +134,32 @@ impl RequestIdGenerator for FixedRequestIdGenerator {
     }
 }
 
+impl AuthClock for SystemAuthClock {
+    fn now_utc(&self) -> OffsetDateTime {
+        OffsetDateTime::now_utc()
+    }
+}
+
+impl FixedAuthClock {
+    pub fn new(timestamp: OffsetDateTime) -> Self {
+        Self { timestamp }
+    }
+}
+
+impl AuthClock for FixedAuthClock {
+    fn now_utc(&self) -> OffsetDateTime {
+        self.timestamp
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RequestIdGenerator, SequentialRequestIdGenerator, ServerState};
+    use super::{FixedAuthClock, RequestIdGenerator, SequentialRequestIdGenerator, ServerState};
     use crate::storage::fs::FilesystemStorage;
     use crate::trace::{
         RecordingTraceSink, RequestReceivedTrace, RouteResolvedTrace, TraceEvent, TraceS3Operation,
     };
+    use time::{Date, Month, PrimitiveDateTime, Time};
 
     #[test]
     fn from_storage_wraps_filesystem_backed_state() {
@@ -187,5 +230,19 @@ mod tests {
             generator.next_request_id().as_str(),
             "s3lab-0000000000000002"
         );
+    }
+
+    #[test]
+    fn auth_clock_can_be_injected_for_deterministic_validation() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let timestamp = PrimitiveDateTime::new(
+            Date::from_calendar_date(2026, Month::May, 12).expect("valid test date"),
+            Time::from_hms(1, 2, 30).expect("valid test time"),
+        )
+        .assume_utc();
+        let state = ServerState::from_storage(FilesystemStorage::new(temp_dir.path()))
+            .with_auth_clock(FixedAuthClock::new(timestamp));
+
+        assert_eq!(state.auth_now_utc(), timestamp);
     }
 }

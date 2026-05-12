@@ -10,11 +10,12 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use s3lab::s3::error::STATIC_REQUEST_ID;
 use s3lab::server::serve_listener_until;
-use s3lab::server::state::ServerState;
+use s3lab::server::state::{FixedAuthClock, ServerState};
 use s3lab::storage::fs::FilesystemStorage;
 use s3lab::storage::Storage;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use time::{Date, Month, PrimitiveDateTime, Time};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -149,4 +150,13 @@ pub async fn response_text(response: Response<Incoming>) -> TestResult<String> {
 
 pub fn test_server_state(storage: impl Storage + Send + Sync + 'static) -> ServerState {
     ServerState::with_fixed_request_id(storage, STATIC_REQUEST_ID)
+        .with_auth_clock(FixedAuthClock::new(fixed_auth_time()))
+}
+
+fn fixed_auth_time() -> time::OffsetDateTime {
+    PrimitiveDateTime::new(
+        Date::from_calendar_date(2026, Month::May, 12).expect("valid test auth date"),
+        Time::from_hms(1, 2, 30).expect("valid test auth time"),
+    )
+    .assume_utc()
 }

@@ -15,7 +15,7 @@ use s3lab::s3::sigv4::{
 };
 use s3lab::server::router;
 use s3lab::server::routes::{resolve_operation, PHASE1_MAX_PUT_OBJECT_BODY_BYTES};
-use s3lab::server::state::{FixedRequestIdGenerator, ServerState};
+use s3lab::server::state::{FixedAuthClock, FixedRequestIdGenerator, ServerState};
 use s3lab::storage::fs::{FilesystemStorage, StorageClock};
 use s3lab::storage::{
     BucketSummary, ListObjectsOptions, ObjectListing, PutObjectRequest, Storage, StorageError,
@@ -919,6 +919,118 @@ async fn unsupported_presigned_access_key_and_session_token_fail_without_storage
 }
 
 #[tokio::test]
+async fn expired_presigned_query_auth_is_rejected_without_storage_call() {
+    for method in [Method::GET, Method::PUT] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let state =
+            test_server_state(storage).with_auth_clock(FixedAuthClock::new(auth_time_utc(1, 3, 4)));
+        let app = router(state);
+        let uri = presigned_object_uri(method.clone(), "/bucket/object.txt", "s3lab", &[]);
+
+        let response = app
+            .oneshot(request_with_headers(
+                method,
+                &uri,
+                &[("host", "localhost")],
+                Body::from("body should not reach storage"),
+            ))
+            .await
+            .expect("expired presigned auth response");
+
+        assert_s3_error_xml_with_message(
+            response,
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "The presigned URL has expired; generate a new URL with a later X-Amz-Date or X-Amz-Expires value.",
+            "/bucket/object.txt",
+        )
+        .await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn presigned_query_auth_rejects_invalid_real_request_date_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let uri = presigned_object_uri_with_auth_values(
+        Method::GET,
+        "/bucket/object.txt",
+        "s3lab",
+        &[],
+        None,
+        PresignedAuthValues {
+            request_datetime: "20260231T010203Z",
+            credential_date: "20260231",
+            expires_seconds: "60",
+        },
+    );
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::GET,
+            &uri,
+            &[("host", "localhost")],
+            Body::empty(),
+        ))
+        .await
+        .expect("invalid date presigned auth response");
+
+    assert_s3_error_xml_with_message(
+        response,
+        StatusCode::BAD_REQUEST,
+        "AuthorizationHeaderMalformed",
+        "Use a real UTC X-Amz-Date value in YYYYMMDDTHHMMSSZ form.",
+        "/bucket/object.txt",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn presigned_query_auth_rejects_out_of_range_expires_without_storage_call() {
+    for expires_seconds in ["0", "604801"] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(test_server_state(storage));
+        let uri = presigned_object_uri_with_auth_values(
+            Method::GET,
+            "/bucket/object.txt",
+            "s3lab",
+            &[],
+            None,
+            PresignedAuthValues {
+                request_datetime: "20260512T010203Z",
+                credential_date: "20260512",
+                expires_seconds,
+            },
+        );
+
+        let response = app
+            .oneshot(request_with_headers(
+                Method::GET,
+                &uri,
+                &[("host", "localhost")],
+                Body::empty(),
+            ))
+            .await
+            .expect("out-of-range expires presigned auth response");
+
+        assert_s3_error_xml_with_message(
+            response,
+            StatusCode::BAD_REQUEST,
+            "AuthorizationHeaderMalformed",
+            "Use an X-Amz-Expires value from 1 through 604800 seconds.",
+            "/bucket/object.txt",
+        )
+        .await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
 async fn accepted_presigned_request_trace_records_path_only_and_redacts_query_auth() {
     let storage = RecordingStorage::default();
     let sink = TestTraceSink::default();
@@ -927,7 +1039,8 @@ async fn accepted_presigned_request_trace_records_path_only_and_redacts_query_au
         storage,
         FixedRequestIdGenerator::new(STATIC_REQUEST_ID),
         sink,
-    );
+    )
+    .with_auth_clock(fixed_auth_clock());
     let app = router(state);
     let uri = presigned_object_uri(
         Method::GET,
@@ -3547,16 +3660,50 @@ fn presigned_object_uri_with_optional_payload_hash(
     extra_query: &[(&str, &str)],
     payload_hash: Option<&str>,
 ) -> String {
-    let request_datetime = "20260512T010203Z";
-    let credential_scope = "20260512/us-east-1/s3/aws4_request";
+    presigned_object_uri_with_auth_values(
+        method,
+        path,
+        access_key,
+        extra_query,
+        payload_hash,
+        PresignedAuthValues {
+            request_datetime: "20260512T010203Z",
+            credential_date: "20260512",
+            expires_seconds: "60",
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PresignedAuthValues<'a> {
+    request_datetime: &'a str,
+    credential_date: &'a str,
+    expires_seconds: &'a str,
+}
+
+fn presigned_object_uri_with_auth_values(
+    method: Method,
+    path: &str,
+    access_key: &str,
+    extra_query: &[(&str, &str)],
+    payload_hash: Option<&str>,
+    auth_values: PresignedAuthValues<'_>,
+) -> String {
+    let credential_scope = format!("{}/us-east-1/s3/aws4_request", auth_values.credential_date);
     let mut query = vec![
         ("X-Amz-Algorithm".to_owned(), "AWS4-HMAC-SHA256".to_owned()),
         (
             "X-Amz-Credential".to_owned(),
             format!("{access_key}/{credential_scope}"),
         ),
-        ("X-Amz-Date".to_owned(), request_datetime.to_owned()),
-        ("X-Amz-Expires".to_owned(), "60".to_owned()),
+        (
+            "X-Amz-Date".to_owned(),
+            auth_values.request_datetime.to_owned(),
+        ),
+        (
+            "X-Amz-Expires".to_owned(),
+            auth_values.expires_seconds.to_owned(),
+        ),
         ("X-Amz-SignedHeaders".to_owned(), "host".to_owned()),
     ];
     query.extend(
@@ -3586,13 +3733,13 @@ fn presigned_object_uri_with_optional_payload_hash(
     )
     .expect("canonical presigned request");
     let string_to_sign = build_string_to_sign(
-        request_datetime,
+        auth_values.request_datetime,
         authorization.credential().scope(),
         &canonical_request,
     );
     let signature = sigv4_signature(
         "s3lab-secret",
-        "20260512",
+        auth_values.credential_date,
         "us-east-1",
         "s3",
         &string_to_sign,
@@ -4129,6 +4276,18 @@ impl StorageClock for FixedClock {
     fn now_utc(&self) -> OffsetDateTime {
         self.0
     }
+}
+
+fn fixed_auth_clock() -> FixedAuthClock {
+    FixedAuthClock::new(auth_time_utc(1, 2, 30))
+}
+
+fn auth_time_utc(hour: u8, minute: u8, second: u8) -> OffsetDateTime {
+    PrimitiveDateTime::new(
+        Date::from_calendar_date(2026, Month::May, 12).expect("valid test auth date"),
+        Time::from_hms(hour, minute, second).expect("valid test auth time"),
+    )
+    .assume_utc()
 }
 
 fn fixed_last_modified() -> OffsetDateTime {
