@@ -5,10 +5,19 @@ use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
 
 const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
+const QUERY_ALGORITHM_PARAM: &str = "X-Amz-Algorithm";
+const QUERY_CREDENTIAL_PARAM: &str = "X-Amz-Credential";
+const QUERY_DATE_PARAM: &str = "X-Amz-Date";
+const QUERY_EXPIRES_PARAM: &str = "X-Amz-Expires";
+const QUERY_SIGNED_HEADERS_PARAM: &str = "X-Amz-SignedHeaders";
+const QUERY_SIGNATURE_PARAM: &str = "X-Amz-Signature";
+const QUERY_CONTENT_SHA256_PARAM: &str = "X-Amz-Content-Sha256";
+const QUERY_SECURITY_TOKEN_PARAM: &str = "X-Amz-Security-Token";
 const CREDENTIAL_PARAM: &str = "Credential";
 const SIGNED_HEADERS_PARAM: &str = "SignedHeaders";
 const SIGNATURE_PARAM: &str = "Signature";
 const CREDENTIAL_SCOPE_TERMINATOR: &str = "aws4_request";
+pub const SIGV4_UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const SIGNATURE_HEX_LENGTH: usize = 64;
 const HMAC_SHA256_BLOCK_SIZE: usize = 64;
 
@@ -58,6 +67,87 @@ impl SigV4Authorization {
     }
 }
 
+/// Parsed AWS Signature Version 4 presigned query authorization parameters.
+///
+/// This parser validates the query-auth shape and safe structural fields. It
+/// does not enforce expiration time because that requires a caller-supplied
+/// clock policy.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SigV4QueryAuthorization {
+    algorithm: SigV4Algorithm,
+    credential: SigV4Credential,
+    request_datetime: String,
+    expires_seconds: u32,
+    signed_headers: Vec<SignedHeaderName>,
+    signature: String,
+    content_sha256: Option<String>,
+}
+
+impl Debug for SigV4QueryAuthorization {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SigV4QueryAuthorization")
+            .field("algorithm", &self.algorithm)
+            .field("credential", &self.credential)
+            .field(
+                "request_datetime",
+                &RedactedText::new(&self.request_datetime),
+            )
+            .field("expires_seconds", &self.expires_seconds)
+            .field("signed_headers", &self.signed_headers)
+            .field("signature", &RedactedText::new(&self.signature))
+            .field(
+                "content_sha256",
+                &self.content_sha256.as_deref().map(RedactedText::new),
+            )
+            .finish()
+    }
+}
+
+impl SigV4QueryAuthorization {
+    /// The SigV4 algorithm declared by `X-Amz-Algorithm`.
+    pub fn algorithm(&self) -> SigV4Algorithm {
+        self.algorithm
+    }
+
+    /// The parsed credential and credential scope.
+    pub fn credential(&self) -> &SigV4Credential {
+        &self.credential
+    }
+
+    /// Request timestamp from `X-Amz-Date`.
+    pub fn request_datetime(&self) -> &str {
+        &self.request_datetime
+    }
+
+    /// Expiration duration from `X-Amz-Expires`.
+    pub fn expires_seconds(&self) -> u32 {
+        self.expires_seconds
+    }
+
+    /// Canonical signed header names in the order supplied by the client.
+    pub fn signed_headers(&self) -> &[SignedHeaderName] {
+        &self.signed_headers
+    }
+
+    /// The 64-character hexadecimal signature string.
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+
+    /// Payload hash used for canonical request construction.
+    pub fn payload_hash(&self) -> &str {
+        self.content_sha256
+            .as_deref()
+            .unwrap_or(SIGV4_UNSIGNED_PAYLOAD)
+    }
+
+    /// Optional payload hash supplied by `X-Amz-Content-Sha256`.
+    pub fn content_sha256(&self) -> Option<&str> {
+        self.content_sha256.as_deref()
+    }
+}
+
 /// Supported SigV4 authorization algorithm.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SigV4Algorithm {
@@ -73,10 +163,20 @@ impl SigV4Algorithm {
 }
 
 /// SigV4 credential identity and scope.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SigV4Credential {
     access_key_id: String,
     scope: SigV4CredentialScope,
+}
+
+impl Debug for SigV4Credential {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SigV4Credential")
+            .field("access_key_id", &RedactedText::new(&self.access_key_id))
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 impl SigV4Credential {
@@ -141,6 +241,34 @@ impl SigV4AuthorizationParameter {
             Self::Credential => CREDENTIAL_PARAM,
             Self::SignedHeaders => SIGNED_HEADERS_PARAM,
             Self::Signature => SIGNATURE_PARAM,
+        }
+    }
+}
+
+/// SigV4 presigned-query parameters interpreted by the query-auth parser.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SigV4QueryParameter {
+    Algorithm,
+    Credential,
+    Date,
+    Expires,
+    SignedHeaders,
+    Signature,
+    ContentSha256,
+    SecurityToken,
+}
+
+impl SigV4QueryParameter {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Algorithm => QUERY_ALGORITHM_PARAM,
+            Self::Credential => QUERY_CREDENTIAL_PARAM,
+            Self::Date => QUERY_DATE_PARAM,
+            Self::Expires => QUERY_EXPIRES_PARAM,
+            Self::SignedHeaders => QUERY_SIGNED_HEADERS_PARAM,
+            Self::Signature => QUERY_SIGNATURE_PARAM,
+            Self::ContentSha256 => QUERY_CONTENT_SHA256_PARAM,
+            Self::SecurityToken => QUERY_SECURITY_TOKEN_PARAM,
         }
     }
 }
@@ -220,6 +348,89 @@ impl SigV4ParseDiagnostic {
 }
 
 impl Display for SigV4ParseDiagnostic {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+/// Typed diagnostics for rejected SigV4 presigned query authorization.
+///
+/// Diagnostic messages intentionally describe what to fix without echoing
+/// credential values, signatures, session tokens, or other caller-supplied
+/// secrets.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum SigV4QueryParseDiagnostic {
+    MissingParameter { parameter: SigV4QueryParameter },
+    DuplicateParameter { parameter: SigV4QueryParameter },
+    UnsupportedAlgorithm,
+    UnsupportedSessionToken,
+    InvalidCredentialScope,
+    EmptyAccessKey,
+    InvalidCredentialDate,
+    EmptyRegion,
+    EmptyService,
+    InvalidCredentialScopeTerminator,
+    InvalidRequestDate,
+    InvalidExpires,
+    EmptySignedHeaders,
+    InvalidSignedHeaderName,
+    DuplicateSignedHeader,
+    UnsortedSignedHeaders,
+    InvalidSignatureLength,
+    InvalidSignatureHex,
+    InvalidContentSha256,
+}
+
+impl SigV4QueryParseDiagnostic {
+    /// Safe actionable text suitable for logs, tests, and future diagnostics.
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::MissingParameter { .. } => {
+                "Include the required X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders, and X-Amz-Signature query parameters."
+            }
+            Self::DuplicateParameter { .. } => {
+                "Include each SigV4 presigned query parameter only once."
+            }
+            Self::UnsupportedAlgorithm => "Use AWS4-HMAC-SHA256 as X-Amz-Algorithm.",
+            Self::UnsupportedSessionToken => {
+                "Session-token presigned URLs are not supported; omit X-Amz-Security-Token."
+            }
+            Self::InvalidCredentialScope => {
+                "Use an X-Amz-Credential scope with access key, date, region, service, and aws4_request parts."
+            }
+            Self::EmptyAccessKey => "Include a nonempty access key id in X-Amz-Credential.",
+            Self::InvalidCredentialDate => {
+                "Use an eight-digit YYYYMMDD date in the X-Amz-Credential scope."
+            }
+            Self::EmptyRegion => "Include a nonempty region in the X-Amz-Credential scope.",
+            Self::EmptyService => "Include a nonempty service in the X-Amz-Credential scope.",
+            Self::InvalidCredentialScopeTerminator => {
+                "End the X-Amz-Credential scope with aws4_request."
+            }
+            Self::InvalidRequestDate => "Use an X-Amz-Date value in YYYYMMDDTHHMMSSZ form.",
+            Self::InvalidExpires => "Use decimal seconds in X-Amz-Expires.",
+            Self::EmptySignedHeaders => {
+                "Include at least one lower-case name in X-Amz-SignedHeaders."
+            }
+            Self::InvalidSignedHeaderName => {
+                "Use lower-case signed header names separated by semicolons in X-Amz-SignedHeaders."
+            }
+            Self::DuplicateSignedHeader => "List each signed header name only once.",
+            Self::UnsortedSignedHeaders => "List signed header names in ascending order.",
+            Self::InvalidSignatureLength => {
+                "Use a 64-character hexadecimal X-Amz-Signature value."
+            }
+            Self::InvalidSignatureHex => {
+                "Use only hexadecimal characters in X-Amz-Signature."
+            }
+            Self::InvalidContentSha256 => {
+                "Use UNSIGNED-PAYLOAD or a 64-character hexadecimal SHA-256 value in X-Amz-Content-Sha256."
+            }
+        }
+    }
+}
+
+impl Display for SigV4QueryParseDiagnostic {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.message())
     }
@@ -329,6 +540,27 @@ impl Debug for SigV4VerificationRequest<'_> {
     }
 }
 
+/// Borrowed request components needed for presigned query SigV4 verification.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct SigV4QueryVerificationRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: &'a [(&'a str, &'a str)],
+    pub headers: &'a [(&'a str, &'a str)],
+}
+
+impl Debug for SigV4QueryVerificationRequest<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SigV4QueryVerificationRequest")
+            .field("method", &RedactedText::new(self.method))
+            .field("path", &RedactedText::new(self.path))
+            .field("query", &RedactedPairs::new(self.query))
+            .field("headers", &RedactedPairs::new(self.headers))
+            .finish()
+    }
+}
+
 /// Build a deterministic SigV4 canonical request.
 ///
 /// Header names are matched case-insensitively against the supplied signed
@@ -431,6 +663,143 @@ pub fn verify_signature(
     })
 }
 
+/// Verify parsed SigV4 presigned query authorization against request components.
+///
+/// The canonical request excludes `X-Amz-Signature` from the canonical query as
+/// required by SigV4 presigned URL verification.
+pub fn verify_query_signature(
+    authorization: &SigV4QueryAuthorization,
+    secret_access_key: &str,
+    request: SigV4QueryVerificationRequest<'_>,
+) -> Result<SigV4Verification, SigV4VerificationDiagnostic> {
+    let query_without_signature = request
+        .query
+        .iter()
+        .copied()
+        .filter(|(name, _)| *name != QUERY_SIGNATURE_PARAM)
+        .collect::<Vec<_>>();
+    let canonical_request = build_canonical_request(
+        request.method,
+        request.path,
+        &query_without_signature,
+        request.headers,
+        authorization.signed_headers(),
+        authorization.payload_hash(),
+    )?;
+    let string_to_sign = build_string_to_sign(
+        authorization.request_datetime(),
+        authorization.credential().scope(),
+        &canonical_request,
+    );
+    let scope = authorization.credential().scope();
+    let signing_key = derive_signing_key(
+        secret_access_key,
+        scope.date(),
+        scope.region(),
+        scope.service(),
+    );
+    let expected_signature = signature_hex(&signing_key, &string_to_sign);
+
+    if !signatures_match(&expected_signature, authorization.signature()) {
+        return Err(SigV4VerificationDiagnostic::SignatureMismatch);
+    }
+
+    Ok(SigV4Verification {
+        canonical_request,
+        string_to_sign,
+    })
+}
+
+/// Parse AWS SigV4 presigned URL query parameters.
+///
+/// Query names and values must be decoded by the caller before parsing. Unknown
+/// non-SigV4 query parameters are preserved for canonicalization by
+/// `verify_query_signature` and ignored by this parser.
+pub fn parse_query_authorization(
+    query: &[(&str, &str)],
+) -> Result<SigV4QueryAuthorization, SigV4QueryParseDiagnostic> {
+    let mut algorithm = None;
+    let mut credential = None;
+    let mut request_datetime = None;
+    let mut expires = None;
+    let mut signed_headers = None;
+    let mut signature = None;
+    let mut content_sha256 = None;
+
+    for (name, value) in query {
+        match *name {
+            QUERY_ALGORITHM_PARAM => {
+                set_query_once(&mut algorithm, value, SigV4QueryParameter::Algorithm)?
+            }
+            QUERY_CREDENTIAL_PARAM => {
+                set_query_once(&mut credential, value, SigV4QueryParameter::Credential)?
+            }
+            QUERY_DATE_PARAM => {
+                set_query_once(&mut request_datetime, value, SigV4QueryParameter::Date)?
+            }
+            QUERY_EXPIRES_PARAM => {
+                set_query_once(&mut expires, value, SigV4QueryParameter::Expires)?
+            }
+            QUERY_SIGNED_HEADERS_PARAM => set_query_once(
+                &mut signed_headers,
+                value,
+                SigV4QueryParameter::SignedHeaders,
+            )?,
+            QUERY_SIGNATURE_PARAM => {
+                set_query_once(&mut signature, value, SigV4QueryParameter::Signature)?
+            }
+            QUERY_CONTENT_SHA256_PARAM => set_query_once(
+                &mut content_sha256,
+                value,
+                SigV4QueryParameter::ContentSha256,
+            )?,
+            QUERY_SECURITY_TOKEN_PARAM => {
+                return Err(SigV4QueryParseDiagnostic::UnsupportedSessionToken);
+            }
+            _ => {}
+        }
+    }
+
+    let algorithm = require_query_parameter(algorithm, SigV4QueryParameter::Algorithm)?;
+    if algorithm != SIGV4_ALGORITHM {
+        return Err(SigV4QueryParseDiagnostic::UnsupportedAlgorithm);
+    }
+
+    let credential = parse_credential(require_query_parameter(
+        credential,
+        SigV4QueryParameter::Credential,
+    )?)
+    .map_err(query_diagnostic_from_header_diagnostic)?;
+    let request_datetime = require_query_parameter(request_datetime, SigV4QueryParameter::Date)?;
+    if !is_valid_request_datetime(request_datetime) {
+        return Err(SigV4QueryParseDiagnostic::InvalidRequestDate);
+    }
+    let expires_seconds = parse_query_expires(require_query_parameter(
+        expires,
+        SigV4QueryParameter::Expires,
+    )?)?;
+    let signed_headers = parse_signed_headers(require_query_parameter(
+        signed_headers,
+        SigV4QueryParameter::SignedHeaders,
+    )?)
+    .map_err(query_diagnostic_from_header_diagnostic)?;
+    let signature = parse_signature(require_query_parameter(
+        signature,
+        SigV4QueryParameter::Signature,
+    )?)
+    .map_err(query_diagnostic_from_header_diagnostic)?;
+
+    Ok(SigV4QueryAuthorization {
+        algorithm: SigV4Algorithm::Aws4HmacSha256,
+        credential,
+        request_datetime: request_datetime.to_owned(),
+        expires_seconds,
+        signed_headers,
+        signature,
+        content_sha256: content_sha256.map(parse_query_content_sha256).transpose()?,
+    })
+}
+
 /// Parse an AWS SigV4 `Authorization` header value.
 ///
 /// The accepted form is:
@@ -515,6 +884,89 @@ fn set_once<'a>(
     Ok(())
 }
 
+fn set_query_once<'a>(
+    target: &mut Option<&'a str>,
+    value: &'a str,
+    parameter: SigV4QueryParameter,
+) -> Result<(), SigV4QueryParseDiagnostic> {
+    if target.is_some() {
+        return Err(SigV4QueryParseDiagnostic::DuplicateParameter { parameter });
+    }
+
+    *target = Some(value);
+    Ok(())
+}
+
+fn require_query_parameter(
+    value: Option<&str>,
+    parameter: SigV4QueryParameter,
+) -> Result<&str, SigV4QueryParseDiagnostic> {
+    value.ok_or(SigV4QueryParseDiagnostic::MissingParameter { parameter })
+}
+
+fn parse_query_expires(value: &str) -> Result<u32, SigV4QueryParseDiagnostic> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SigV4QueryParseDiagnostic::InvalidExpires);
+    }
+
+    value
+        .parse::<u32>()
+        .map_err(|_| SigV4QueryParseDiagnostic::InvalidExpires)
+}
+
+fn parse_query_content_sha256(value: &str) -> Result<String, SigV4QueryParseDiagnostic> {
+    if value == SIGV4_UNSIGNED_PAYLOAD || is_literal_sha256(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(SigV4QueryParseDiagnostic::InvalidContentSha256)
+    }
+}
+
+fn is_literal_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn query_diagnostic_from_header_diagnostic(
+    diagnostic: SigV4ParseDiagnostic,
+) -> SigV4QueryParseDiagnostic {
+    match diagnostic {
+        SigV4ParseDiagnostic::InvalidCredentialScope => {
+            SigV4QueryParseDiagnostic::InvalidCredentialScope
+        }
+        SigV4ParseDiagnostic::EmptyAccessKey => SigV4QueryParseDiagnostic::EmptyAccessKey,
+        SigV4ParseDiagnostic::InvalidCredentialDate => {
+            SigV4QueryParseDiagnostic::InvalidCredentialDate
+        }
+        SigV4ParseDiagnostic::EmptyRegion => SigV4QueryParseDiagnostic::EmptyRegion,
+        SigV4ParseDiagnostic::EmptyService => SigV4QueryParseDiagnostic::EmptyService,
+        SigV4ParseDiagnostic::InvalidCredentialScopeTerminator => {
+            SigV4QueryParseDiagnostic::InvalidCredentialScopeTerminator
+        }
+        SigV4ParseDiagnostic::EmptySignedHeaders => SigV4QueryParseDiagnostic::EmptySignedHeaders,
+        SigV4ParseDiagnostic::InvalidSignedHeaderName => {
+            SigV4QueryParseDiagnostic::InvalidSignedHeaderName
+        }
+        SigV4ParseDiagnostic::DuplicateSignedHeader => {
+            SigV4QueryParseDiagnostic::DuplicateSignedHeader
+        }
+        SigV4ParseDiagnostic::UnsortedSignedHeaders => {
+            SigV4QueryParseDiagnostic::UnsortedSignedHeaders
+        }
+        SigV4ParseDiagnostic::InvalidSignatureLength => {
+            SigV4QueryParseDiagnostic::InvalidSignatureLength
+        }
+        SigV4ParseDiagnostic::InvalidSignatureHex => SigV4QueryParseDiagnostic::InvalidSignatureHex,
+        SigV4ParseDiagnostic::MalformedAuthorizationHeader
+        | SigV4ParseDiagnostic::UnsupportedAlgorithm
+        | SigV4ParseDiagnostic::MalformedParameter
+        | SigV4ParseDiagnostic::UnknownParameter
+        | SigV4ParseDiagnostic::MissingParameter { .. }
+        | SigV4ParseDiagnostic::DuplicateParameter { .. } => {
+            unreachable!("query parsing does not use Authorization header diagnostics")
+        }
+    }
+}
+
 fn parse_credential(value: &str) -> Result<SigV4Credential, SigV4ParseDiagnostic> {
     let parts = value.split('/').collect::<Vec<_>>();
     let [access_key_id, date, region, service, terminal] = parts.as_slice() else {
@@ -595,6 +1047,14 @@ fn parse_signature(value: &str) -> Result<String, SigV4ParseDiagnostic> {
 
 fn is_valid_scope_date(value: &str) -> bool {
     value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_valid_request_datetime(value: &str) -> bool {
+    value.len() == 16
+        && value.as_bytes()[8] == b'T'
+        && value.as_bytes()[15] == b'Z'
+        && value[..8].bytes().all(|byte| byte.is_ascii_digit())
+        && value[9..15].bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn is_valid_signed_header_name(value: &str) -> bool {
@@ -825,14 +1285,17 @@ fn nibble_to_upper_hex(nibble: u8) -> char {
 mod tests {
     use super::{
         build_canonical_request, build_string_to_sign, derive_signing_key,
-        parse_authorization_header, verify_signature, SigV4Algorithm, SigV4AuthorizationParameter,
-        SigV4ParseDiagnostic, SigV4VerificationDiagnostic, SigV4VerificationRequest,
-        SignedHeaderName,
+        parse_authorization_header, parse_query_authorization, signature_hex,
+        verify_query_signature, verify_signature, SigV4Algorithm, SigV4AuthorizationParameter,
+        SigV4ParseDiagnostic, SigV4QueryParameter, SigV4QueryParseDiagnostic,
+        SigV4QueryVerificationRequest, SigV4VerificationDiagnostic, SigV4VerificationRequest,
+        SignedHeaderName, SIGV4_UNSIGNED_PAYLOAD,
     };
 
     const VALID_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260512/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789ABCDEF";
     const EMPTY_PAYLOAD_SHA256: &str =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const TEST_SECRET_ACCESS_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
 
     #[test]
     fn parses_valid_authorization_header() {
@@ -1022,6 +1485,7 @@ mod tests {
         assert!(debug.contains("signature"));
         assert!(debug.contains("[redacted; 64 bytes]"));
         assert!(!debug.contains(authorization.signature()));
+        assert!(!debug.contains(authorization.credential().access_key_id()));
     }
 
     #[test]
@@ -1267,9 +1731,246 @@ mod tests {
             .contains("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"));
     }
 
+    #[test]
+    fn parses_and_verifies_valid_presigned_query_authorization() {
+        let query = valid_presigned_query(None);
+        let query_refs = query_refs(&query);
+        let authorization =
+            parse_query_authorization(&query_refs).expect("valid presigned query authorization");
+
+        assert_eq!(authorization.algorithm(), SigV4Algorithm::Aws4HmacSha256);
+        assert_eq!(authorization.credential().access_key_id(), "AKIDEXAMPLE");
+        assert_eq!(authorization.credential().scope().date(), "20130524");
+        assert_eq!(authorization.credential().scope().region(), "us-east-1");
+        assert_eq!(authorization.credential().scope().service(), "s3");
+        assert_eq!(authorization.request_datetime(), "20130524T000000Z");
+        assert_eq!(authorization.expires_seconds(), 86400);
+        assert_eq!(authorization.content_sha256(), None);
+        assert_eq!(authorization.payload_hash(), SIGV4_UNSIGNED_PAYLOAD);
+        assert_eq!(
+            authorization
+                .signed_headers()
+                .iter()
+                .map(|header| header.as_str())
+                .collect::<Vec<_>>(),
+            ["host"]
+        );
+
+        verify_query_signature(
+            &authorization,
+            TEST_SECRET_ACCESS_KEY,
+            SigV4QueryVerificationRequest {
+                method: "GET",
+                path: "/example-bucket/object.txt",
+                query: &query_refs,
+                headers: &[("host", "examplebucket.s3.amazonaws.com")],
+            },
+        )
+        .expect("presigned query signature should verify");
+    }
+
+    #[test]
+    fn rejects_presigned_query_missing_required_parameter() {
+        let query = [
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+            (
+                "X-Amz-Credential",
+                "AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request",
+            ),
+            ("X-Amz-Date", "20130524T000000Z"),
+            ("X-Amz-SignedHeaders", "host"),
+            (
+                "X-Amz-Signature",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ];
+
+        assert_query_parse_error(
+            &query,
+            SigV4QueryParseDiagnostic::MissingParameter {
+                parameter: SigV4QueryParameter::Expires,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_presigned_query_duplicate_parameter() {
+        let query = [
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+            (
+                "X-Amz-Credential",
+                "AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request",
+            ),
+            ("X-Amz-Date", "20130524T000000Z"),
+            ("X-Amz-Expires", "86400"),
+            ("X-Amz-SignedHeaders", "host"),
+            (
+                "X-Amz-Signature",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ];
+
+        assert_query_parse_error(
+            &query,
+            SigV4QueryParseDiagnostic::DuplicateParameter {
+                parameter: SigV4QueryParameter::Algorithm,
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_presigned_query_bad_algorithm() {
+        assert_query_parse_error(
+            &presigned_query_with_overrides(&[("X-Amz-Algorithm", "AWS4-HMAC-SHA1")]),
+            SigV4QueryParseDiagnostic::UnsupportedAlgorithm,
+        );
+    }
+
+    #[test]
+    fn rejects_presigned_query_bad_signature() {
+        assert_query_parse_error(
+            &presigned_query_with_overrides(&[("X-Amz-Signature", "not-hex")]),
+            SigV4QueryParseDiagnostic::InvalidSignatureLength,
+        );
+    }
+
+    #[test]
+    fn rejects_presigned_query_bad_credential() {
+        assert_query_parse_error(
+            &presigned_query_with_overrides(&[("X-Amz-Credential", "AKIDEXAMPLE/20130524/s3")]),
+            SigV4QueryParseDiagnostic::InvalidCredentialScope,
+        );
+    }
+
+    #[test]
+    fn rejects_presigned_query_bad_signed_headers() {
+        assert_query_parse_error(
+            &presigned_query_with_overrides(&[("X-Amz-SignedHeaders", "Host")]),
+            SigV4QueryParseDiagnostic::InvalidSignedHeaderName,
+        );
+    }
+
+    #[test]
+    fn rejects_presigned_query_session_token() {
+        let query = presigned_query_with_overrides(&[("X-Amz-Security-Token", "session-token")]);
+
+        assert_query_parse_error(&query, SigV4QueryParseDiagnostic::UnsupportedSessionToken);
+    }
+
+    #[test]
+    fn presigned_canonical_query_excludes_signature() {
+        let query = valid_presigned_query(None);
+        let query_refs = query_refs(&query);
+        let authorization =
+            parse_query_authorization(&query_refs).expect("valid presigned query authorization");
+        let verification = verify_query_signature(
+            &authorization,
+            TEST_SECRET_ACCESS_KEY,
+            SigV4QueryVerificationRequest {
+                method: "GET",
+                path: "/example-bucket/object.txt",
+                query: &query_refs,
+                headers: &[("host", "examplebucket.s3.amazonaws.com")],
+            },
+        )
+        .expect("presigned query signature should verify");
+
+        assert_eq!(
+            verification.canonical_request(),
+            "GET\n\
+             /example-bucket/object.txt\n\
+             X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&response-content-type=text%2Fplain\n\
+             host:examplebucket.s3.amazonaws.com\n\
+             \n\
+             host\n\
+             UNSIGNED-PAYLOAD"
+        );
+        assert!(!verification.canonical_request().contains("X-Amz-Signature"));
+    }
+
+    #[test]
+    fn presigned_query_defaults_payload_hash_to_unsigned_payload() {
+        let query = valid_presigned_query(None);
+        let query_refs = query_refs(&query);
+        let authorization =
+            parse_query_authorization(&query_refs).expect("valid presigned query authorization");
+
+        assert_eq!(authorization.payload_hash(), SIGV4_UNSIGNED_PAYLOAD);
+        assert!(verify_query_signature(
+            &authorization,
+            TEST_SECRET_ACCESS_KEY,
+            SigV4QueryVerificationRequest {
+                method: "GET",
+                path: "/example-bucket/object.txt",
+                query: &query_refs,
+                headers: &[("host", "examplebucket.s3.amazonaws.com")],
+            },
+        )
+        .expect("presigned query signature should verify")
+        .canonical_request()
+        .ends_with(SIGV4_UNSIGNED_PAYLOAD));
+    }
+
+    #[test]
+    fn presigned_query_uses_explicit_content_sha256() {
+        let query = valid_presigned_query(Some(EMPTY_PAYLOAD_SHA256));
+        let query_refs = query_refs(&query);
+        let authorization =
+            parse_query_authorization(&query_refs).expect("valid presigned query authorization");
+
+        assert_eq!(authorization.content_sha256(), Some(EMPTY_PAYLOAD_SHA256));
+        assert_eq!(authorization.payload_hash(), EMPTY_PAYLOAD_SHA256);
+        assert!(verify_query_signature(
+            &authorization,
+            TEST_SECRET_ACCESS_KEY,
+            SigV4QueryVerificationRequest {
+                method: "GET",
+                path: "/example-bucket/object.txt",
+                query: &query_refs,
+                headers: &[("host", "examplebucket.s3.amazonaws.com")],
+            },
+        )
+        .expect("presigned query signature should verify")
+        .canonical_request()
+        .ends_with(EMPTY_PAYLOAD_SHA256));
+    }
+
+    #[test]
+    fn presigned_query_authorization_debug_redacts_credentials_signature_and_payload_hash() {
+        let query = valid_presigned_query(Some(EMPTY_PAYLOAD_SHA256));
+        let query_refs = query_refs(&query);
+        let authorization =
+            parse_query_authorization(&query_refs).expect("valid presigned query authorization");
+        let debug = format!("{authorization:?}");
+
+        assert!(debug.contains("SigV4QueryAuthorization"));
+        assert!(debug.contains("credential"));
+        assert!(debug.contains("signature"));
+        assert!(debug.contains("content_sha256"));
+        assert!(!debug.contains(authorization.credential().access_key_id()));
+        assert!(!debug.contains(authorization.signature()));
+        assert!(!debug.contains(EMPTY_PAYLOAD_SHA256));
+    }
+
+    #[test]
+    fn rejects_presigned_query_invalid_content_sha256() {
+        assert_query_parse_error(
+            &presigned_query_with_overrides(&[("X-Amz-Content-Sha256", "not-a-sha256")]),
+            SigV4QueryParseDiagnostic::InvalidContentSha256,
+        );
+    }
+
     fn assert_parse_error(header: &str, expected: SigV4ParseDiagnostic) {
         assert_eq!(
             parse_authorization_header(header).expect_err("header should fail"),
+            expected
+        );
+    }
+
+    fn assert_query_parse_error(query: &[(&str, &str)], expected: SigV4QueryParseDiagnostic) {
+        assert_eq!(
+            parse_query_authorization(query).expect_err("query should fail"),
             expected
         );
     }
@@ -1279,5 +1980,90 @@ mod tests {
             .iter()
             .map(|name| SignedHeaderName((*name).to_owned()))
             .collect()
+    }
+
+    fn valid_presigned_query(content_sha256: Option<&str>) -> Vec<(String, String)> {
+        let mut query = unsigned_presigned_query(content_sha256);
+        let query_refs = query_refs(&query);
+        let payload_hash = content_sha256.unwrap_or(SIGV4_UNSIGNED_PAYLOAD);
+        let signature = presigned_signature(&query_refs, payload_hash);
+        query.push(("X-Amz-Signature".to_owned(), signature));
+        query
+    }
+
+    fn unsigned_presigned_query(content_sha256: Option<&str>) -> Vec<(String, String)> {
+        let mut query = vec![
+            ("X-Amz-Algorithm".to_owned(), "AWS4-HMAC-SHA256".to_owned()),
+            (
+                "X-Amz-Credential".to_owned(),
+                "AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request".to_owned(),
+            ),
+            ("X-Amz-Date".to_owned(), "20130524T000000Z".to_owned()),
+            ("X-Amz-Expires".to_owned(), "86400".to_owned()),
+            ("X-Amz-SignedHeaders".to_owned(), "host".to_owned()),
+            ("response-content-type".to_owned(), "text/plain".to_owned()),
+        ];
+
+        if let Some(content_sha256) = content_sha256 {
+            query.push(("X-Amz-Content-Sha256".to_owned(), content_sha256.to_owned()));
+        }
+
+        query
+    }
+
+    fn presigned_query_with_overrides<'a>(
+        overrides: &'a [(&'a str, &'a str)],
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut query = [
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+            (
+                "X-Amz-Credential",
+                "AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request",
+            ),
+            ("X-Amz-Date", "20130524T000000Z"),
+            ("X-Amz-Expires", "86400"),
+            ("X-Amz-SignedHeaders", "host"),
+            (
+                "X-Amz-Signature",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ]
+        .to_vec();
+
+        for (override_name, override_value) in overrides {
+            if let Some((_, value)) = query.iter_mut().find(|(name, _)| name == override_name) {
+                *value = override_value;
+            } else {
+                query.push((override_name, override_value));
+            }
+        }
+
+        query
+    }
+
+    fn query_refs(query: &[(String, String)]) -> Vec<(&str, &str)> {
+        query
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect()
+    }
+
+    fn presigned_signature(query: &[(&str, &str)], payload_hash: &str) -> String {
+        let canonical_request = build_canonical_request(
+            "GET",
+            "/example-bucket/object.txt",
+            query,
+            &[("host", "examplebucket.s3.amazonaws.com")],
+            &signed_headers(&["host"]),
+            payload_hash,
+        )
+        .expect("canonical request");
+        let signing_key = derive_signing_key(TEST_SECRET_ACCESS_KEY, "20130524", "us-east-1", "s3");
+        let credential = super::parse_credential("AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request")
+            .expect("test credential");
+        let string_to_sign =
+            build_string_to_sign("20130524T000000Z", credential.scope(), &canonical_request);
+
+        signature_hex(&signing_key, &string_to_sign)
     }
 }
