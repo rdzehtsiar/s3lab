@@ -6,9 +6,10 @@ use crate::s3::object::{is_valid_s3_object_key, is_valid_s3_object_key_prefix, O
 use crate::s3::operation::{ListObjectsEncoding, S3Operation};
 use crate::s3::sigv4::{
     build_canonical_request, parse_authorization_header, parse_query_authorization,
-    verify_query_signature, verify_signature, SigV4Authorization, SigV4ParseDiagnostic,
-    SigV4QueryAuthorization, SigV4QueryParseDiagnostic, SigV4QueryVerificationRequest,
-    SigV4VerificationDiagnostic, SigV4VerificationRequest, SignedHeaderName,
+    verify_query_signature, verify_signature, SigV4Authorization, SigV4CredentialScope,
+    SigV4ParseDiagnostic, SigV4QueryAuthorization, SigV4QueryParseDiagnostic,
+    SigV4QueryVerificationRequest, SigV4VerificationDiagnostic, SigV4VerificationRequest,
+    SignedHeaderName,
 };
 use crate::s3::time::http_date;
 use crate::s3::xml::{
@@ -916,7 +917,7 @@ fn record_sigv4_parsed(
     record_accepted_sigv4_parsed(
         state,
         request_id,
-        TraceCredentialScope::new(scope.date(), scope.region(), scope.service()),
+        trace_credential_scope(scope),
         authorization
             .signed_headers()
             .iter()
@@ -933,7 +934,7 @@ fn record_sigv4_query_parsed(
     record_accepted_sigv4_parsed(
         state,
         request_id,
-        TraceCredentialScope::new(scope.date(), scope.region(), scope.service()),
+        trace_credential_scope(scope),
         authorization
             .signed_headers()
             .iter()
@@ -952,6 +953,10 @@ fn record_accepted_sigv4_parsed<'a>(
         scope,
         signed_headers,
     )));
+}
+
+fn trace_credential_scope(scope: &SigV4CredentialScope) -> TraceCredentialScope {
+    TraceCredentialScope::new(scope.date(), scope.region(), scope.service())
 }
 
 fn sigv4_parse_rejection(diagnostic: &SigV4ParseDiagnostic) -> SigV4ParseRejection {

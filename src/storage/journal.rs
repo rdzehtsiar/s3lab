@@ -333,39 +333,11 @@ mod tests {
             JournalRecord::commit(2, JournalMutation::bucket_create(&bucket)),
             JournalRecord::begin(
                 3,
-                JournalMutation::object_put(JournalObjectPut {
-                    bucket: bucket.as_str().to_owned(),
-                    key: key.as_str().to_owned(),
-                    content_length: 11,
-                    content_sha256:
-                        "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff".to_owned(),
-                    etag: "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"".to_owned(),
-                    content_type: Some("text/plain".to_owned()),
-                    last_modified_unix_seconds: 1_778_400_000,
-                    last_modified_nanoseconds: 123,
-                    user_metadata: BTreeMap::from([
-                        ("a-key".to_owned(), "first".to_owned()),
-                        ("z-key".to_owned(), "last".to_owned()),
-                    ]),
-                }),
+                JournalMutation::object_put(sample_object_put(&bucket, &key)),
             ),
             JournalRecord::commit(
                 4,
-                JournalMutation::object_put(JournalObjectPut {
-                    bucket: bucket.as_str().to_owned(),
-                    key: key.as_str().to_owned(),
-                    content_length: 11,
-                    content_sha256:
-                        "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff".to_owned(),
-                    etag: "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"".to_owned(),
-                    content_type: Some("text/plain".to_owned()),
-                    last_modified_unix_seconds: 1_778_400_000,
-                    last_modified_nanoseconds: 123,
-                    user_metadata: BTreeMap::from([
-                        ("a-key".to_owned(), "first".to_owned()),
-                        ("z-key".to_owned(), "last".to_owned()),
-                    ]),
-                }),
+                JournalMutation::object_put(sample_object_put(&bucket, &key)),
             ),
             JournalRecord::begin(5, JournalMutation::object_delete(&bucket, &key)),
             JournalRecord::commit(6, JournalMutation::object_delete(&bucket, &key)),
@@ -378,6 +350,24 @@ mod tests {
         }
 
         assert_eq!(journal.read_records().expect("read records"), records);
+    }
+
+    fn sample_object_put(bucket: &BucketName, key: &ObjectKey) -> JournalObjectPut {
+        JournalObjectPut {
+            bucket: bucket.as_str().to_owned(),
+            key: key.as_str().to_owned(),
+            content_length: 11,
+            content_sha256: "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff"
+                .to_owned(),
+            etag: "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"".to_owned(),
+            content_type: Some("text/plain".to_owned()),
+            last_modified_unix_seconds: 1_778_400_000,
+            last_modified_nanoseconds: 123,
+            user_metadata: BTreeMap::from([
+                ("a-key".to_owned(), "first".to_owned()),
+                ("z-key".to_owned(), "last".to_owned()),
+            ]),
+        }
     }
 
     #[test]

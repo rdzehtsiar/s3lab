@@ -703,7 +703,7 @@ fn restore_snapshot_path_backup(
 
 fn rename_staged_snapshot_path(from: &Path, to: &Path) -> Result<(), StorageError> {
     #[cfg(test)]
-    if FAIL_NEXT_STAGED_RESTORE_RENAME.with(|fail| fail.replace(false)) {
+    if FAIL_NEXT_STAGED_RESTORE_RENAME.replace(false) {
         return Err(StorageError::Io {
             path: to.to_path_buf(),
             source: io::Error::other("forced staged restore rename failure"),
@@ -2256,7 +2256,7 @@ fn fail_next_new_object_state_write_for_test() {
 
 #[cfg(test)]
 fn fail_next_staged_restore_rename_for_test() {
-    FAIL_NEXT_STAGED_RESTORE_RENAME.with(|fail| fail.set(true));
+    FAIL_NEXT_STAGED_RESTORE_RENAME.set(true);
 }
 
 fn write_object_files_atomically(
