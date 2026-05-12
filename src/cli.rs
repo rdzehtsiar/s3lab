@@ -6,6 +6,7 @@ use crate::config::{
 };
 use crate::server::state::ServerState;
 use crate::storage::fs::FilesystemStorage;
+use crate::trace::InMemoryTraceStore;
 use clap::{Parser, Subcommand};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -308,7 +309,9 @@ where
         let _ = shutdown_tx.send(true);
     });
 
-    let state = ServerState::from_storage(FilesystemStorage::new(config.data_dir));
+    let trace_store = InMemoryTraceStore::default();
+    let state =
+        ServerState::with_trace_sink(FilesystemStorage::new(config.data_dir), trace_store.clone());
     let mut s3_shutdown_rx = shutdown_rx.clone();
     let s3_shutdown = async move {
         let _ = s3_shutdown_rx.changed().await;
@@ -320,7 +323,11 @@ where
 
     tokio::try_join!(
         crate::server::serve_listener_until(listener, state, s3_shutdown),
-        crate::server::serve_inspector_listener_until(inspector_listener, inspector_shutdown)
+        crate::server::serve_inspector_listener_until(
+            inspector_listener,
+            trace_store,
+            inspector_shutdown
+        )
     )?;
 
     if let Ok(error) = shutdown_error_rx.await {

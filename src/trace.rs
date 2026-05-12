@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::encoding::hex_encode;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+pub const DEFAULT_TRACE_STORE_REQUEST_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum TraceEvent {
     RequestReceived(RequestReceivedTrace),
     RouteResolved(RouteResolvedTrace),
@@ -23,6 +28,18 @@ pub trait TraceSink: Send + Sync {
     fn record(&self, event: TraceEvent);
 }
 
+#[derive(Debug, Clone)]
+pub struct InMemoryTraceStore {
+    inner: Arc<Mutex<TraceStoreInner>>,
+    max_requests: usize,
+}
+
+#[derive(Debug, Default)]
+struct TraceStoreInner {
+    request_order: VecDeque<String>,
+    events: VecDeque<TraceEvent>,
+}
+
 #[derive(Debug, Default)]
 pub struct NoopTraceSink;
 
@@ -30,7 +47,162 @@ impl TraceSink for NoopTraceSink {
     fn record(&self, _event: TraceEvent) {}
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct RequestTraceSummary {
+    pub request_id: String,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub operation: Option<TraceS3Operation>,
+    pub status_code: Option<u16>,
+    pub event_count: usize,
+}
+
+impl InMemoryTraceStore {
+    pub fn new(max_requests: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TraceStoreInner::default())),
+            max_requests,
+        }
+    }
+
+    pub fn request_summaries(&self) -> Vec<RequestTraceSummary> {
+        let inner = self.inner.lock().expect("trace store lock");
+        let mut summaries = BTreeMap::<String, RequestTraceSummary>::new();
+
+        for event in &inner.events {
+            let request_id = event.request_id().to_owned();
+            let summary =
+                summaries
+                    .entry(request_id.clone())
+                    .or_insert_with(|| RequestTraceSummary {
+                        request_id,
+                        method: None,
+                        path: None,
+                        operation: None,
+                        status_code: None,
+                        event_count: 0,
+                    });
+
+            summary.event_count += 1;
+            if summary.method.is_none() {
+                summary.method = event.method().map(str::to_owned);
+            }
+            if summary.path.is_none() {
+                summary.path = event.path().map(str::to_owned);
+            }
+            if summary.operation.is_none() {
+                summary.operation = event.operation();
+            }
+            if let TraceEvent::ResponseSent(trace) = event {
+                summary.status_code = Some(trace.status_code);
+            }
+        }
+
+        summaries.into_values().collect()
+    }
+
+    pub fn request_events(&self, request_id: &str) -> Option<Vec<TraceEvent>> {
+        let inner = self.inner.lock().expect("trace store lock");
+        let events = inner
+            .events
+            .iter()
+            .filter(|event| event.request_id() == request_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        (!events.is_empty()).then_some(events)
+    }
+}
+
+impl Default for InMemoryTraceStore {
+    fn default() -> Self {
+        Self::new(DEFAULT_TRACE_STORE_REQUEST_CAPACITY)
+    }
+}
+
+impl TraceSink for InMemoryTraceStore {
+    fn record(&self, event: TraceEvent) {
+        if self.max_requests == 0 {
+            return;
+        }
+
+        let request_id = event.request_id().to_owned();
+        let mut inner = self.inner.lock().expect("trace store lock");
+
+        if !inner.request_order.iter().any(|known| known == &request_id) {
+            inner.request_order.push_back(request_id);
+            while inner.request_order.len() > self.max_requests {
+                if let Some(evicted_request_id) = inner.request_order.pop_front() {
+                    inner
+                        .events
+                        .retain(|event| event.request_id() != evicted_request_id);
+                }
+            }
+        }
+
+        inner.events.push_back(event);
+    }
+}
+
+impl TraceEvent {
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::RequestReceived(trace) => &trace.request_id,
+            Self::RouteResolved(trace) => &trace.request_id,
+            Self::RouteRejected(trace) => &trace.request_id,
+            Self::SigV4Parsed(trace) => &trace.request_id,
+            Self::CanonicalRequestBuilt(trace) => &trace.request_id,
+            Self::AuthDecision(trace) => &trace.request_id,
+            Self::PayloadVerification(trace) => &trace.request_id,
+            Self::StorageMutation(trace) => &trace.request_id,
+            Self::ResponseSent(trace) => &trace.request_id,
+        }
+    }
+
+    fn method(&self) -> Option<&str> {
+        match self {
+            Self::RequestReceived(trace) => Some(&trace.method),
+            Self::RouteResolved(trace) => Some(&trace.method),
+            Self::RouteRejected(trace) => Some(&trace.method),
+            Self::SigV4Parsed(_)
+            | Self::CanonicalRequestBuilt(_)
+            | Self::AuthDecision(_)
+            | Self::PayloadVerification(_)
+            | Self::StorageMutation(_)
+            | Self::ResponseSent(_) => None,
+        }
+    }
+
+    fn path(&self) -> Option<&str> {
+        match self {
+            Self::RequestReceived(trace) => Some(&trace.path),
+            Self::RouteResolved(trace) => Some(&trace.path),
+            Self::RouteRejected(trace) => Some(&trace.path),
+            Self::SigV4Parsed(_)
+            | Self::CanonicalRequestBuilt(_)
+            | Self::AuthDecision(_)
+            | Self::PayloadVerification(_)
+            | Self::StorageMutation(_)
+            | Self::ResponseSent(_) => None,
+        }
+    }
+
+    fn operation(&self) -> Option<TraceS3Operation> {
+        match self {
+            Self::RouteResolved(trace) => Some(trace.operation),
+            Self::RequestReceived(_)
+            | Self::RouteRejected(_)
+            | Self::SigV4Parsed(_)
+            | Self::CanonicalRequestBuilt(_)
+            | Self::AuthDecision(_)
+            | Self::PayloadVerification(_)
+            | Self::StorageMutation(_)
+            | Self::ResponseSent(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct RequestReceivedTrace {
     pub request_id: String,
     pub method: String,
@@ -55,7 +227,7 @@ impl RequestReceivedTrace {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct RouteResolvedTrace {
     pub request_id: String,
     pub method: String,
@@ -80,7 +252,7 @@ impl RouteResolvedTrace {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct RouteRejectedTrace {
     pub request_id: String,
     pub method: String,
@@ -105,7 +277,7 @@ impl RouteRejectedTrace {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct SigV4ParsedTrace {
     pub request_id: String,
     pub outcome: SigV4ParseOutcome,
@@ -137,7 +309,7 @@ impl SigV4ParsedTrace {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct CanonicalRequestBuiltTrace {
     pub request_id: String,
     pub signed_headers: Vec<String>,
@@ -158,7 +330,7 @@ impl CanonicalRequestBuiltTrace {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct AuthDecisionTrace {
     pub request_id: String,
     pub decision: AuthDecision,
@@ -173,7 +345,7 @@ impl AuthDecisionTrace {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct PayloadVerificationTrace {
     pub request_id: String,
     pub outcome: PayloadVerificationOutcome,
@@ -188,7 +360,7 @@ impl PayloadVerificationTrace {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct StorageMutationTrace {
     pub request_id: String,
     pub mutation: StorageMutation,
@@ -215,7 +387,7 @@ impl StorageMutationTrace {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct ResponseSentTrace {
     pub request_id: String,
     pub status_code: u16,
@@ -236,7 +408,8 @@ impl ResponseSentTrace {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TraceS3Operation {
     ListBuckets,
     CreateBucket,
@@ -254,7 +427,8 @@ pub enum TraceS3Operation {
     ListObjectsV2,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RouteRejectionReason {
     InvalidPath,
     InvalidQuery,
@@ -263,13 +437,14 @@ pub enum RouteRejectionReason {
     MethodNotAllowed,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SigV4ParseOutcome {
     Accepted,
     Rejected { reason: SigV4ParseRejection },
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct TraceCredentialScope {
     pub date: String,
     pub region: String,
@@ -290,7 +465,8 @@ impl TraceCredentialScope {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SigV4ParseRejection {
     MissingAuthorization,
     MalformedAuthorization,
@@ -300,7 +476,8 @@ pub enum SigV4ParseRejection {
     InvalidSignature,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuthDecision {
     Accepted,
     UnsignedAccepted,
@@ -308,19 +485,22 @@ pub enum AuthDecision {
     NotConfigured,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PayloadVerificationOutcome {
     Full,
     Partial(PayloadVerificationPartialReason),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PayloadVerificationPartialReason {
     UnsignedPayloadMarker,
     StreamingPayloadMarker,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuthRejectionReason {
     MissingAuthorization,
     InvalidAuthorization,
@@ -330,7 +510,8 @@ pub enum AuthRejectionReason {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StorageMutation {
     CreateBucket,
     DeleteBucket,
@@ -342,7 +523,8 @@ pub enum StorageMutation {
     AbortMultipartUpload,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StorageMutationOutcome {
     Applied,
     Rejected { error_code: String },
@@ -392,11 +574,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthDecision, CanonicalRequestBuiltTrace, PayloadVerificationOutcome,
+        AuthDecision, CanonicalRequestBuiltTrace, InMemoryTraceStore, PayloadVerificationOutcome,
         PayloadVerificationPartialReason, PayloadVerificationTrace, RequestReceivedTrace,
-        RouteRejectedTrace, RouteRejectionReason, RouteResolvedTrace, SigV4ParsedTrace,
-        StorageMutation, StorageMutationOutcome, StorageMutationTrace, TraceCredentialScope,
-        TraceS3Operation,
+        ResponseSentTrace, RouteRejectedTrace, RouteRejectionReason, RouteResolvedTrace,
+        SigV4ParsedTrace, StorageMutation, StorageMutationOutcome, StorageMutationTrace,
+        TraceCredentialScope, TraceEvent, TraceS3Operation, TraceSink,
     };
 
     #[test]
@@ -540,5 +722,85 @@ mod tests {
         assert!(!debug.contains("upload-secret-token"));
         assert!(!debug.contains("part-secret-body"));
         assert!(!debug.contains("Signature="));
+    }
+
+    #[test]
+    fn in_memory_trace_store_groups_summaries_in_stable_request_id_order() {
+        let store = InMemoryTraceStore::new(4);
+        store.record(TraceEvent::RequestReceived(RequestReceivedTrace::new(
+            "s3lab-0000000000000002",
+            "PUT",
+            "/bucket/object?X-Amz-Signature=secret",
+            ["authorization", "host"],
+        )));
+        store.record(TraceEvent::ResponseSent(ResponseSentTrace::new(
+            "s3lab-0000000000000002",
+            200,
+            None::<String>,
+        )));
+        store.record(TraceEvent::RequestReceived(RequestReceivedTrace::new(
+            "s3lab-0000000000000001",
+            "GET",
+            "/",
+            ["host"],
+        )));
+        store.record(TraceEvent::RouteResolved(RouteResolvedTrace::new(
+            "s3lab-0000000000000001",
+            "GET",
+            "/",
+            TraceS3Operation::ListBuckets,
+        )));
+
+        let summaries = store.request_summaries();
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["s3lab-0000000000000001", "s3lab-0000000000000002"]
+        );
+        assert_eq!(summaries[0].operation, Some(TraceS3Operation::ListBuckets));
+        assert_eq!(summaries[0].event_count, 2);
+        assert_eq!(summaries[1].path.as_deref(), Some("/bucket/object"));
+        assert_eq!(summaries[1].status_code, Some(200));
+    }
+
+    #[test]
+    fn in_memory_trace_store_bounds_complete_request_groups() {
+        let store = InMemoryTraceStore::new(2);
+        store.record(TraceEvent::RequestReceived(RequestReceivedTrace::new(
+            "s3lab-0000000000000001",
+            "GET",
+            "/first",
+            ["host"],
+        )));
+        store.record(TraceEvent::ResponseSent(ResponseSentTrace::new(
+            "s3lab-0000000000000001",
+            404,
+            Some("NoSuchKey"),
+        )));
+        store.record(TraceEvent::RequestReceived(RequestReceivedTrace::new(
+            "s3lab-0000000000000002",
+            "GET",
+            "/second",
+            ["host"],
+        )));
+        store.record(TraceEvent::RequestReceived(RequestReceivedTrace::new(
+            "s3lab-0000000000000003",
+            "GET",
+            "/third",
+            ["host"],
+        )));
+
+        assert!(store.request_events("s3lab-0000000000000001").is_none());
+        assert_eq!(
+            store
+                .request_summaries()
+                .iter()
+                .map(|summary| summary.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["s3lab-0000000000000002", "s3lab-0000000000000003"]
+        );
     }
 }

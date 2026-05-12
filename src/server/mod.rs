@@ -4,7 +4,11 @@ pub mod routes;
 pub mod state;
 
 use crate::config::{ConfigError, RuntimeConfig};
+use crate::trace::InMemoryTraceStore;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::routing::get;
+use axum::Json;
 use axum::Router;
 use routes::handle_request;
 use state::ServerState;
@@ -36,10 +40,13 @@ pub fn router(state: ServerState) -> Router {
     Router::new().fallback(handle_request).with_state(state)
 }
 
-pub fn inspector_router() -> Router {
+pub fn inspector_router(trace_store: InMemoryTraceStore) -> Router {
     Router::new()
         .route("/", get(inspector_root))
         .route("/health", get(inspector_health))
+        .route("/api/requests", get(inspector_requests))
+        .route("/api/requests/{request_id}", get(inspector_request_events))
+        .with_state(trace_store)
 }
 
 async fn inspector_root() -> &'static str {
@@ -48,6 +55,29 @@ async fn inspector_root() -> &'static str {
 
 async fn inspector_health() -> &'static str {
     "ok\n"
+}
+
+async fn inspector_requests(
+    State(trace_store): State<InMemoryTraceStore>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "requests": trace_store.request_summaries(),
+    }))
+}
+
+async fn inspector_request_events(
+    State(trace_store): State<InMemoryTraceStore>,
+    Path(request_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    trace_store
+        .request_events(&request_id)
+        .map(|events| {
+            Json(serde_json::json!({
+                "request_id": request_id,
+                "events": events,
+            }))
+        })
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 pub async fn bind_listener(config: &RuntimeConfig) -> Result<TcpListener, ServerError> {
@@ -99,12 +129,13 @@ where
 
 pub async fn serve_inspector_listener_until<F>(
     listener: TcpListener,
+    trace_store: InMemoryTraceStore,
     shutdown: F,
 ) -> Result<(), ServerError>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, inspector_router())
+    axum::serve(listener, inspector_router(trace_store))
         .with_graceful_shutdown(shutdown)
         .await
         .map_err(|source| ServerError::Run { source })
@@ -150,8 +181,13 @@ mod tests {
         bind_inspector_listener, bind_listener, inspector_router, listener_endpoint, ServerError,
     };
     use crate::config::{ConfigError, RuntimeConfig, DEFAULT_DATA_DIR};
+    use crate::server::router;
+    use crate::server::state::{FixedRequestIdGenerator, ServerState};
+    use crate::storage::fs::FilesystemStorage;
+    use crate::trace::InMemoryTraceStore;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use serde_json::Value;
     use std::error::Error;
     use std::io;
     use tokio::net::TcpListener;
@@ -186,7 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspector_router_serves_minimal_health_response() {
-        let response = inspector_router()
+        let response = inspector_router(InMemoryTraceStore::default())
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -197,6 +233,64 @@ mod tests {
             .expect("health response");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn inspector_router_serves_trace_json_after_s3_request() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let trace_store = InMemoryTraceStore::new(8);
+        let state = ServerState::with_request_id_generator_and_trace_sink(
+            FilesystemStorage::new(temp_dir.path()),
+            FixedRequestIdGenerator::new("s3lab-0000000000000001"),
+            trace_store.clone(),
+        );
+
+        let create_bucket = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/bucket-a")
+                    .body(Body::empty())
+                    .expect("create bucket request"),
+            )
+            .await
+            .expect("create bucket response");
+        assert_eq!(create_bucket.status(), StatusCode::OK);
+
+        let requests_response = inspector_router(trace_store.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/requests")
+                    .body(Body::empty())
+                    .expect("requests request"),
+            )
+            .await
+            .expect("requests response");
+        assert_eq!(requests_response.status(), StatusCode::OK);
+        let requests_body = response_json(requests_response).await;
+        assert_eq!(
+            requests_body["requests"][0]["request_id"],
+            "s3lab-0000000000000001"
+        );
+        assert_eq!(requests_body["requests"][0]["method"], "PUT");
+        assert_eq!(requests_body["requests"][0]["path"], "/bucket-a");
+        assert_eq!(requests_body["requests"][0]["status_code"], 200);
+
+        let events_response = inspector_router(trace_store)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/requests/s3lab-0000000000000001")
+                    .body(Body::empty())
+                    .expect("request events request"),
+            )
+            .await
+            .expect("events response");
+        assert_eq!(events_response.status(), StatusCode::OK);
+        let events_body = response_json(events_response).await;
+        assert_eq!(events_body["request_id"], "s3lab-0000000000000001");
+        assert_eq!(events_body["events"][0]["type"], "request_received");
+        assert!(!events_body.to_string().contains("Authorization:"));
+        assert!(!events_body.to_string().contains("Signature="));
     }
 
     #[tokio::test]
@@ -272,5 +366,13 @@ mod tests {
 
     fn io_error(kind: io::ErrorKind, message: &'static str) -> io::Error {
         io::Error::new(kind, message)
+    }
+
+    async fn response_json(response: axum::http::Response<Body>) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+
+        serde_json::from_slice(&bytes).expect("valid json")
     }
 }
