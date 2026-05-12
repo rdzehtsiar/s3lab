@@ -13,13 +13,18 @@ use crate::s3::sigv4::{
 };
 use crate::s3::time::http_date;
 use crate::s3::xml::{
-    error_response_xml, list_buckets_response_xml, list_objects_v2_response_xml, ListBucketXml,
-    ListBucketsXml, ListObjectXml, ListObjectsV2Xml, ListObjectsV2XmlEntry, XML_CONTENT_TYPE,
+    complete_multipart_upload_response_xml, error_response_xml,
+    initiate_multipart_upload_response_xml, list_buckets_response_xml,
+    list_objects_v2_response_xml, list_parts_response_xml, CompleteMultipartUploadXml,
+    InitiateMultipartUploadXml, ListBucketXml, ListBucketsXml, ListObjectXml, ListObjectsV2Xml,
+    ListObjectsV2XmlEntry, ListPartXml, ListPartsXml, XML_CONTENT_TYPE,
 };
 use crate::server::state::ServerState;
 use crate::storage::{
-    BucketSummary, ListObjectsOptions, ObjectListing, ObjectListingEntry, PutObjectRequest,
-    StorageError, StoredObject, StoredObjectMetadata,
+    BucketSummary, CompleteMultipartUploadRequest, CompletedMultipartPart,
+    CreateMultipartUploadRequest, ListObjectsOptions, MultipartUploadPartListing, ObjectListing,
+    ObjectListingEntry, PutObjectRequest, StorageError, StoredObject, StoredObjectMetadata,
+    UploadPartRequest,
 };
 use crate::trace::{
     AuthDecision, AuthDecisionTrace, AuthRejectionReason, CanonicalRequestBuiltTrace,
@@ -38,6 +43,9 @@ use axum::http::HeaderName;
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri};
 use http_body_util::LengthLimitError;
 use percent_encoding::percent_decode_str;
+use quick_xml::escape::unescape;
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -1419,13 +1427,51 @@ async fn execute_storage_operation(
         S3Operation::DeleteObject { bucket, key } => {
             delete_object_response(&state, bucket, key, request_id)
         }
-        S3Operation::CreateMultipartUpload { bucket, key }
-        | S3Operation::UploadPart { bucket, key, .. }
-        | S3Operation::ListParts { bucket, key, .. }
-        | S3Operation::CompleteMultipartUpload { bucket, key, .. }
-        | S3Operation::AbortMultipartUpload { bucket, key, .. } => Ok(
-            multipart_not_implemented_response(bucket, key, is_head, request_id),
-        ),
+        S3Operation::CreateMultipartUpload { bucket, key } => {
+            create_multipart_upload_response(&state, &headers, bucket, key, is_head, request_id)
+        }
+        S3Operation::UploadPart {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+        } => {
+            upload_part_route_response(
+                state,
+                headers,
+                body,
+                UploadPartRouteRequest {
+                    bucket,
+                    key,
+                    upload_id,
+                    part_number,
+                    presigned_payload_hash,
+                },
+                is_head,
+                request_id,
+            )
+            .await
+        }
+        S3Operation::ListParts {
+            bucket,
+            key,
+            upload_id,
+        } => list_parts_route_response(&state, bucket, key, upload_id, request_id),
+        S3Operation::CompleteMultipartUpload {
+            bucket,
+            key,
+            upload_id,
+        } => {
+            complete_multipart_upload_route_response(
+                &state, body, bucket, key, upload_id, is_head, request_id,
+            )
+            .await
+        }
+        S3Operation::AbortMultipartUpload {
+            bucket,
+            key,
+            upload_id,
+        } => abort_multipart_upload_response(&state, bucket, key, upload_id, request_id),
         S3Operation::ListObjectsV2 {
             bucket,
             prefix,
@@ -1446,19 +1492,6 @@ async fn execute_storage_operation(
             request_id,
         ),
     }
-}
-
-fn multipart_not_implemented_response(
-    bucket: BucketName,
-    key: ObjectKey,
-    is_head: bool,
-    request_id: &S3RequestId,
-) -> Response<Body> {
-    route_error_response(
-        RouteRejection::new(S3ErrorCode::NotImplemented, object_resource(&bucket, &key)),
-        is_head,
-        request_id,
-    )
 }
 
 fn list_buckets_response(
@@ -1692,6 +1725,221 @@ fn delete_object_response(
     match result {
         Ok(()) | Err(StorageError::NoSuchKey { .. }) => Ok(no_content_response(request_id)),
         Err(error) => Err((error, object_resource(&bucket, &key))),
+    }
+}
+
+fn create_multipart_upload_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    bucket: BucketName,
+    key: ObjectKey,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    let resource = object_resource(&bucket, &key);
+    let content_type = match extract_content_type(headers, &resource) {
+        Ok(content_type) => content_type,
+        Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
+    };
+    let user_metadata = match extract_user_metadata(headers, &resource) {
+        Ok(user_metadata) => user_metadata,
+        Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
+    };
+
+    match state
+        .storage()
+        .create_multipart_upload(CreateMultipartUploadRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            content_type,
+            user_metadata,
+        }) {
+        Ok(upload) => Ok(xml_response(
+            initiate_multipart_upload_response_xml(&InitiateMultipartUploadXml {
+                bucket: upload.bucket.as_str().to_owned(),
+                key: upload.key.as_str().to_owned(),
+                upload_id: upload.upload_id,
+            }),
+            request_id,
+        )),
+        Err(error) => Ok(multipart_storage_error_response(
+            error, resource, is_head, request_id,
+        )),
+    }
+}
+
+async fn upload_part_route_response(
+    state: ServerState,
+    headers: HeaderMap,
+    body: Body,
+    route_request: UploadPartRouteRequest,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    let resource = object_resource(&route_request.bucket, &route_request.key);
+    if let Some(header_name) = unsupported_put_object_header(&headers) {
+        log_put_object_rejection(
+            &headers,
+            &resource,
+            request_id,
+            "unsupported header",
+            &header_name,
+        );
+        return Ok(route_error_response(
+            RouteRejection::new(S3ErrorCode::NotImplemented, resource),
+            is_head,
+            request_id,
+        ));
+    }
+    let checksum = match extract_put_object_checksum(&headers, &resource) {
+        Ok(checksum) => checksum,
+        Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
+    };
+    let body_encoding = match extract_put_object_body_encoding(&headers, &resource) {
+        Ok(body_encoding) => body_encoding,
+        Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
+    };
+    let bytes = match read_put_object_body(body, &resource, is_head, request_id).await {
+        Ok(bytes) => bytes,
+        Err(response) => return Ok(response),
+    };
+    let body = match decode_put_object_body(
+        body_encoding,
+        bytes.as_ref(),
+        checksum,
+        &headers,
+        &resource,
+        request_id,
+    ) {
+        Ok(body) => body,
+        Err(response) => return Ok(*response),
+    };
+    for checksum in &body.checksums {
+        if let Err(response) =
+            validate_put_object_checksum(checksum, &body.bytes, &resource, request_id)
+        {
+            return Ok(*response);
+        }
+    }
+    match validate_signed_put_object_payload_hash(
+        &headers,
+        route_request.presigned_payload_hash,
+        &body.bytes,
+        &resource,
+        request_id,
+    ) {
+        Ok(Some(outcome)) => {
+            state.record_trace(TraceEvent::PayloadVerification(
+                PayloadVerificationTrace::new(request_id.as_str(), outcome),
+            ));
+        }
+        Ok(None) => {}
+        Err(response) => return Ok(*response),
+    }
+
+    match state.storage().upload_part(UploadPartRequest {
+        bucket: route_request.bucket.clone(),
+        key: route_request.key.clone(),
+        upload_id: route_request.upload_id,
+        part_number: route_request.part_number,
+        bytes: body.bytes,
+    }) {
+        Ok(part) => Ok(upload_part_response(part.etag, request_id)),
+        Err(error) => Ok(multipart_storage_error_response(
+            error, resource, is_head, request_id,
+        )),
+    }
+}
+
+fn list_parts_route_response(
+    state: &ServerState,
+    bucket: BucketName,
+    key: ObjectKey,
+    upload_id: String,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    let resource = object_resource(&bucket, &key);
+    match state.storage().list_parts(&bucket, &key, &upload_id) {
+        Ok(listing) => Ok(xml_response(
+            list_parts_response_xml(&list_parts_xml(listing)),
+            request_id,
+        )),
+        Err(error) => Ok(multipart_storage_error_response(
+            error, resource, false, request_id,
+        )),
+    }
+}
+
+async fn complete_multipart_upload_route_response(
+    state: &ServerState,
+    body: Body,
+    bucket: BucketName,
+    key: ObjectKey,
+    upload_id: String,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    let resource = object_resource(&bucket, &key);
+    let bytes = match read_put_object_body(body, &resource, is_head, request_id).await {
+        Ok(bytes) => bytes,
+        Err(response) => return Ok(response),
+    };
+    let completed_parts = match parse_complete_multipart_upload_xml(&bytes, &resource, request_id) {
+        Ok(parts) => parts,
+        Err(response) => return Ok(*response),
+    };
+    let listing = match state.storage().list_parts(&bucket, &key, &upload_id) {
+        Ok(listing) => listing,
+        Err(error) => {
+            return Ok(multipart_storage_error_response(
+                error, resource, is_head, request_id,
+            ));
+        }
+    };
+    if let Err(response) =
+        validate_completed_parts_against_listing(&completed_parts, &listing, &resource, request_id)
+    {
+        return Ok(*response);
+    }
+
+    match state
+        .storage()
+        .complete_multipart_upload(CompleteMultipartUploadRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id,
+            parts: completed_parts,
+        }) {
+        Ok(metadata) => Ok(xml_response(
+            complete_multipart_upload_response_xml(&CompleteMultipartUploadXml {
+                bucket: metadata.bucket.as_str().to_owned(),
+                key: metadata.key.as_str().to_owned(),
+                etag: metadata.etag,
+            }),
+            request_id,
+        )),
+        Err(error) => Ok(multipart_storage_error_response(
+            error, resource, is_head, request_id,
+        )),
+    }
+}
+
+fn abort_multipart_upload_response(
+    state: &ServerState,
+    bucket: BucketName,
+    key: ObjectKey,
+    upload_id: String,
+    request_id: &S3RequestId,
+) -> Result<Response<Body>, (StorageError, String)> {
+    let resource = object_resource(&bucket, &key);
+    match state
+        .storage()
+        .abort_multipart_upload(&bucket, &key, &upload_id)
+    {
+        Ok(()) => Ok(no_content_response(request_id)),
+        Err(error) => Ok(multipart_storage_error_response(
+            error, resource, false, request_id,
+        )),
     }
 }
 
@@ -2066,6 +2314,18 @@ fn storage_error_response(
     )
 }
 
+fn multipart_storage_error_response(
+    error: StorageError,
+    resource: impl Into<String>,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Response<Body> {
+    s3_error_response(
+        s3_error_from_multipart_storage_error(error, resource, request_id.clone()),
+        is_head,
+    )
+}
+
 fn s3_error_from_storage_error(
     error: StorageError,
     resource: impl Into<String>,
@@ -2081,6 +2341,33 @@ fn s3_error_from_storage_error(
         }
         _ => S3Error::new(code, resource, request_id),
     }
+}
+
+fn s3_error_from_multipart_storage_error(
+    error: StorageError,
+    resource: impl Into<String>,
+    request_id: S3RequestId,
+) -> S3Error {
+    let resource = resource.into();
+    let StorageError::InvalidArgument { message } = &error else {
+        return s3_error_from_storage_error(error, resource, request_id);
+    };
+
+    if message.contains("multipart upload does not exist")
+        || message.contains("invalid multipart upload ID")
+    {
+        return S3Error::new(S3ErrorCode::NoSuchUpload, resource, request_id);
+    }
+    if message.contains("completed multipart parts must be sorted") {
+        return S3Error::with_message(S3ErrorCode::InvalidPartOrder, message, resource, request_id);
+    }
+    if message.contains("completed multipart part")
+        || message.contains("complete multipart upload requires")
+    {
+        return S3Error::with_message(S3ErrorCode::InvalidPart, message, resource, request_id);
+    }
+
+    s3_error_from_storage_error(error, resource, request_id)
 }
 
 fn s3_error_code_from_storage_error(error: &StorageError) -> S3ErrorCode {
@@ -2139,12 +2426,41 @@ fn xml_response(xml: String, request_id: &S3RequestId) -> Response<Body> {
     with_request_id(response, request_id)
 }
 
+fn upload_part_response(etag: String, request_id: &S3RequestId) -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(&etag)
+            .expect("storage-generated ETag must be a valid HTTP header value"),
+    );
+    with_request_id(response, request_id)
+}
+
 fn list_buckets_xml(buckets: Vec<BucketSummary>) -> ListBucketsXml {
     ListBucketsXml {
         buckets: buckets
             .into_iter()
             .map(|bucket| ListBucketXml {
                 name: bucket.name.as_str().to_owned(),
+            })
+            .collect(),
+    }
+}
+
+fn list_parts_xml(listing: MultipartUploadPartListing) -> ListPartsXml {
+    ListPartsXml {
+        bucket: listing.upload.bucket.as_str().to_owned(),
+        key: listing.upload.key.as_str().to_owned(),
+        upload_id: listing.upload.upload_id,
+        initiated: listing.upload.initiated,
+        parts: listing
+            .parts
+            .into_iter()
+            .map(|part| ListPartXml {
+                part_number: part.part_number,
+                etag: part.etag,
+                content_length: part.content_length,
+                last_modified: part.last_modified,
             })
             .collect(),
     }
@@ -2618,6 +2934,285 @@ fn invalid_argument_response(
     )
 }
 
+fn multipart_error_response(
+    code: S3ErrorCode,
+    message: impl Into<String>,
+    resource: &str,
+    request_id: &S3RequestId,
+) -> Response<Body> {
+    s3_error_response(
+        S3Error::with_message(code, message, resource, request_id.clone()),
+        false,
+    )
+}
+
+fn parse_complete_multipart_upload_xml(
+    bytes: &[u8],
+    resource: &str,
+    request_id: &S3RequestId,
+) -> RouteResponseResult<Vec<CompletedMultipartPart>> {
+    let xml = std::str::from_utf8(bytes).map_err(|_| {
+        Box::new(invalid_argument_response(
+            "CompleteMultipartUpload XML must be valid UTF-8.",
+            resource,
+            request_id,
+        ))
+    })?;
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut parts = Vec::new();
+    let mut in_part = false;
+    let mut current_field: Option<CompleteMultipartUploadField> = None;
+    let mut part_number: Option<u32> = None;
+    let mut etag: Option<String> = None;
+    let mut root_seen = false;
+    let mut root_closed = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let qname = element.name();
+                let name = element_name(qname.as_ref());
+                if !root_seen {
+                    if name != Some("CompleteMultipartUpload") {
+                        return Err(Box::new(invalid_argument_response(
+                            "CompleteMultipartUpload XML must use a CompleteMultipartUpload root element.",
+                            resource,
+                            request_id,
+                        )));
+                    }
+                    root_seen = true;
+                    continue;
+                }
+                if root_closed {
+                    return Err(Box::new(invalid_argument_response(
+                        "CompleteMultipartUpload XML has content after the root element.",
+                        resource,
+                        request_id,
+                    )));
+                }
+                match name {
+                    Some("Part") => {
+                        in_part = true;
+                        current_field = None;
+                        part_number = None;
+                        etag = None;
+                    }
+                    Some("PartNumber") if in_part => {
+                        current_field = Some(CompleteMultipartUploadField::PartNumber);
+                    }
+                    Some("ETag") if in_part => {
+                        current_field = Some(CompleteMultipartUploadField::Etag);
+                    }
+                    _ => {
+                        current_field = None;
+                    }
+                }
+            }
+            Ok(Event::Empty(element)) => {
+                let qname = element.name();
+                match element_name(qname.as_ref()) {
+                    Some("CompleteMultipartUpload") if !root_seen => {
+                        root_seen = true;
+                        root_closed = true;
+                    }
+                    _ => {
+                        current_field = None;
+                    }
+                }
+            }
+            Ok(Event::Text(text)) => {
+                if !root_seen || root_closed {
+                    return Err(Box::new(invalid_argument_response(
+                        "CompleteMultipartUpload XML text must be inside the root element.",
+                        resource,
+                        request_id,
+                    )));
+                }
+                let Some(field) = current_field else {
+                    continue;
+                };
+                let value = text
+                    .decode()
+                    .ok()
+                    .and_then(|decoded| {
+                        unescape(decoded.as_ref())
+                            .ok()
+                            .map(|text| text.into_owned())
+                    })
+                    .ok_or_else(|| {
+                        Box::new(invalid_argument_response(
+                            "CompleteMultipartUpload XML contains malformed text.",
+                            resource,
+                            request_id,
+                        ))
+                    })?;
+                match field {
+                    CompleteMultipartUploadField::PartNumber => {
+                        part_number = Some(parse_completed_xml_part_number(
+                            value.trim(),
+                            resource,
+                            request_id,
+                        )?);
+                    }
+                    CompleteMultipartUploadField::Etag => {
+                        etag = Some(value.trim().to_owned());
+                    }
+                }
+            }
+            Ok(Event::End(element)) => {
+                let qname = element.name();
+                match element_name(qname.as_ref()) {
+                    Some("CompleteMultipartUpload") => {
+                        root_closed = true;
+                        current_field = None;
+                    }
+                    Some("Part") if in_part => {
+                        let Some(part_number) = part_number else {
+                            return Err(Box::new(invalid_argument_response(
+                                "CompleteMultipartUpload Part is missing PartNumber.",
+                                resource,
+                                request_id,
+                            )));
+                        };
+                        let Some(etag) = etag.take() else {
+                            return Err(Box::new(invalid_argument_response(
+                                "CompleteMultipartUpload Part is missing ETag.",
+                                resource,
+                                request_id,
+                            )));
+                        };
+                        parts.push(CompletedMultipartPart { part_number, etag });
+                        in_part = false;
+                        current_field = None;
+                    }
+                    Some("PartNumber" | "ETag") => {
+                        current_field = None;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => {
+                return Err(Box::new(invalid_argument_response(
+                    "CompleteMultipartUpload XML is malformed.",
+                    resource,
+                    request_id,
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    if !root_seen || !root_closed {
+        return Err(Box::new(invalid_argument_response(
+            "CompleteMultipartUpload XML is missing the CompleteMultipartUpload root element.",
+            resource,
+            request_id,
+        )));
+    }
+
+    if parts.is_empty() {
+        return Err(Box::new(multipart_error_response(
+            S3ErrorCode::InvalidPart,
+            "CompleteMultipartUpload requires at least one Part.",
+            resource,
+            request_id,
+        )));
+    }
+
+    Ok(parts)
+}
+
+fn parse_completed_xml_part_number(
+    value: &str,
+    resource: &str,
+    request_id: &S3RequestId,
+) -> RouteResponseResult<u32> {
+    let part_number = value.parse::<u32>().map_err(|_| {
+        Box::new(invalid_argument_response(
+            "CompleteMultipartUpload PartNumber must be an integer.",
+            resource,
+            request_id,
+        ))
+    })?;
+    if (1..=10_000).contains(&part_number) {
+        Ok(part_number)
+    } else {
+        Err(Box::new(invalid_argument_response(
+            "CompleteMultipartUpload PartNumber must be between 1 and 10000.",
+            resource,
+            request_id,
+        )))
+    }
+}
+
+fn validate_completed_parts_against_listing(
+    completed_parts: &[CompletedMultipartPart],
+    listing: &MultipartUploadPartListing,
+    resource: &str,
+    request_id: &S3RequestId,
+) -> RouteResponseResult<()> {
+    let mut previous = None;
+    for part in completed_parts {
+        if previous.is_some_and(|previous| part.part_number <= previous) {
+            return Err(Box::new(multipart_error_response(
+                S3ErrorCode::InvalidPartOrder,
+                "Completed multipart parts must be sorted by ascending part number.",
+                resource,
+                request_id,
+            )));
+        }
+        previous = Some(part.part_number);
+    }
+
+    let uploaded_parts = listing
+        .parts
+        .iter()
+        .map(|part| (part.part_number, part.etag.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    for part in completed_parts {
+        match uploaded_parts.get(&part.part_number) {
+            Some(etag) if *etag == part.etag => {}
+            Some(_) => {
+                return Err(Box::new(multipart_error_response(
+                    S3ErrorCode::InvalidPart,
+                    format!(
+                        "Completed multipart part {} ETag does not match uploaded part.",
+                        part.part_number
+                    ),
+                    resource,
+                    request_id,
+                )));
+            }
+            None => {
+                return Err(Box::new(multipart_error_response(
+                    S3ErrorCode::InvalidPart,
+                    format!(
+                        "Completed multipart part {} was not uploaded.",
+                        part.part_number
+                    ),
+                    resource,
+                    request_id,
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CompleteMultipartUploadField {
+    PartNumber,
+    Etag,
+}
+
+fn element_name(bytes: &[u8]) -> Option<&str> {
+    std::str::from_utf8(bytes).ok()
+}
+
 fn validate_put_object_checksum(
     checksum: &PutObjectChecksum,
     bytes: &[u8],
@@ -2844,6 +3439,15 @@ struct ListObjectsV2RouteRequest {
 struct PutObjectRouteRequest {
     bucket: BucketName,
     key: ObjectKey,
+    presigned_payload_hash: RouteResponseResult<Option<String>>,
+}
+
+#[derive(Debug)]
+struct UploadPartRouteRequest {
+    bucket: BucketName,
+    key: ObjectKey,
+    upload_id: String,
+    part_number: u32,
     presigned_payload_hash: RouteResponseResult<Option<String>>,
 }
 

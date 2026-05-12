@@ -18,8 +18,10 @@ use s3lab::server::routes::{resolve_operation, PHASE1_MAX_PUT_OBJECT_BODY_BYTES}
 use s3lab::server::state::{FixedAuthClock, FixedRequestIdGenerator, ServerState};
 use s3lab::storage::fs::{FilesystemStorage, StorageClock};
 use s3lab::storage::{
-    BucketSummary, ListObjectsOptions, ObjectListing, PutObjectRequest, Storage, StorageError,
-    StoredObject, StoredObjectMetadata,
+    BucketSummary, CompleteMultipartUploadRequest, CompletedMultipartPart,
+    CreateMultipartUploadRequest, ListObjectsOptions, MultipartUpload, MultipartUploadPartListing,
+    ObjectListing, PutObjectRequest, Storage, StorageError, StoredObject, StoredObjectMetadata,
+    StoredPart, UploadPartRequest,
 };
 use s3lab::trace::{
     AuthDecision, AuthDecisionTrace, CanonicalRequestBuiltTrace, PayloadVerificationOutcome,
@@ -752,32 +754,183 @@ async fn unsupported_subresources_return_501_without_storage_call() {
 }
 
 #[tokio::test]
-async fn multipart_routes_return_501_without_storage_call_until_handlers_exist() {
-    for (method, uri) in [
-        (Method::POST, "/bucket/key?uploads"),
-        (Method::PUT, "/bucket/key?partNumber=1&uploadId=upload-abc"),
-        (Method::GET, "/bucket/key?uploadId=upload-abc"),
-        (Method::POST, "/bucket/key?uploadId=upload-abc"),
-        (Method::DELETE, "/bucket/key?uploadId=upload-abc"),
+async fn multipart_routes_call_storage_and_return_s3_shaped_success_responses() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let last_upload_part = Arc::clone(&storage.last_upload_part);
+    let last_complete_parts = Arc::clone(&storage.last_complete_parts);
+    let app = router(test_server_state(storage));
+
+    let create = app
+        .clone()
+        .oneshot(request_with_headers(
+            Method::POST,
+            "/bucket/key?uploads",
+            &[("content-type", "application/octet-stream")],
+            Body::empty(),
+        ))
+        .await
+        .expect("create multipart response");
+    assert_eq!(create.status(), StatusCode::OK);
+    assert_success_request_id(&create);
+    let create_body = String::from_utf8(body_bytes(create).await.to_vec()).expect("xml body");
+    assert_eq!(
+        create_body,
+        format!(
+            "{}<InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>key</Key><UploadId>upload-abc</UploadId></InitiateMultipartUploadResult>",
+            xml_declaration()
+        )
+    );
+
+    let body = b"part-one".to_vec();
+    let upload_part = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/bucket/key?partNumber=1&uploadId=upload-abc",
+            Body::from(body.clone()),
+        ))
+        .await
+        .expect("upload part response");
+    assert_eq!(upload_part.status(), StatusCode::OK);
+    assert_success_request_id(&upload_part);
+    assert_eq!(
+        upload_part
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok()),
+        Some("\"part-one-etag\"")
+    );
+    assert_eq!(
+        last_upload_part
+            .lock()
+            .expect("last upload part lock")
+            .as_ref()
+            .map(|request| (request.part_number, request.bytes.clone())),
+        Some((1, body))
+    );
+
+    let list_parts = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/bucket/key?uploadId=upload-abc",
+            Body::empty(),
+        ))
+        .await
+        .expect("list parts response");
+    assert_eq!(list_parts.status(), StatusCode::OK);
+    assert_success_request_id(&list_parts);
+    let list_body = String::from_utf8(body_bytes(list_parts).await.to_vec()).expect("xml body");
+    assert!(list_body.contains("<ListPartsResult>"));
+    assert!(list_body.contains("<Bucket>bucket</Bucket>"));
+    assert!(list_body.contains("<Key>key</Key>"));
+    assert!(list_body.contains("<UploadId>upload-abc</UploadId>"));
+    assert!(list_body.contains("<PartNumber>1</PartNumber>"));
+    assert!(list_body.contains("<ETag>&quot;part-one-etag&quot;</ETag>"));
+
+    let complete = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/bucket/key?uploadId=upload-abc",
+            Body::from(complete_multipart_xml(&[(1, "\"part-one-etag\"")])),
+        ))
+        .await
+        .expect("complete multipart response");
+    assert_eq!(complete.status(), StatusCode::OK);
+    assert_success_request_id(&complete);
+    let complete_body = String::from_utf8(body_bytes(complete).await.to_vec()).expect("xml body");
+    assert_eq!(
+        complete_body,
+        format!(
+            "{}<CompleteMultipartUploadResult><Location>/bucket/key</Location><Bucket>bucket</Bucket><Key>key</Key><ETag>&quot;complete-etag&quot;</ETag></CompleteMultipartUploadResult>",
+            xml_declaration()
+        )
+    );
+    assert_eq!(
+        last_complete_parts
+            .lock()
+            .expect("last complete parts lock")
+            .clone(),
+        Some(vec![CompletedMultipartPart {
+            part_number: 1,
+            etag: "\"part-one-etag\"".to_owned(),
+        }])
+    );
+
+    let abort = app
+        .oneshot(request(
+            Method::DELETE,
+            "/bucket/key?uploadId=upload-abc",
+            Body::empty(),
+        ))
+        .await
+        .expect("abort multipart response");
+    assert_eq!(abort.status(), StatusCode::NO_CONTENT);
+    assert_success_request_id(&abort);
+
+    assert_eq!(
+        calls.lock().expect("calls lock").as_slice(),
+        &[
+            "create_multipart_upload",
+            "upload_part",
+            "list_parts",
+            "list_parts",
+            "complete_multipart_upload",
+            "abort_multipart_upload",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn complete_multipart_upload_rejects_invalid_part_order_and_etag_before_completion() {
+    for (body, code) in [
+        (
+            complete_multipart_xml(&[(2, "\"part-two-etag\""), (1, "\"part-one-etag\"")]),
+            "InvalidPartOrder",
+        ),
+        (complete_multipart_xml(&[(1, "\"wrong\"")]), "InvalidPart"),
+        (complete_multipart_xml(&[(3, "\"missing\"")]), "InvalidPart"),
     ] {
         let storage = RecordingStorage::default();
         let calls = Arc::clone(&storage.calls);
         let app = router(test_server_state(storage));
 
         let response = app
-            .oneshot(request(method, uri, Body::empty()))
+            .oneshot(request(
+                Method::POST,
+                "/bucket/key?uploadId=upload-abc",
+                Body::from(body),
+            ))
             .await
-            .expect("multipart route response");
+            .expect("complete multipart rejection");
 
-        assert_s3_error_xml(
-            response,
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            path_only(uri),
-        )
-        .await;
-        assert_no_storage_calls(&calls);
+        assert_s3_error_xml(response, StatusCode::BAD_REQUEST, code, "/bucket/key").await;
+        assert_eq!(
+            calls.lock().expect("calls lock").as_slice(),
+            &["list_parts"]
+        );
     }
+}
+
+#[tokio::test]
+async fn complete_multipart_upload_rejects_malformed_xml_before_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/bucket/key?uploadId=upload-abc",
+            Body::from("<CompleteMultipartUpload><Part><ETag>\"etag\"</ETag></Part>"),
+        ))
+        .await
+        .expect("complete multipart malformed xml rejection");
+
+    assert_invalid_argument_xml(response, "/bucket/key").await;
+    assert_no_storage_calls(&calls);
 }
 
 #[tokio::test]
@@ -4403,6 +4556,17 @@ fn xml_declaration() -> &'static str {
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
 }
 
+fn complete_multipart_xml(parts: &[(u32, &str)]) -> String {
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (part_number, etag) in parts {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{part_number}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml
+}
+
 fn assert_object_metadata_headers(
     response: &axum::http::Response<Body>,
     content_length: &str,
@@ -4566,6 +4730,11 @@ struct RecordingStorage {
     calls: Arc<Mutex<Vec<&'static str>>>,
     metadata: StoredObjectMetadata,
     last_put_user_metadata: Arc<Mutex<Option<BTreeMap<String, String>>>>,
+    multipart_upload: MultipartUpload,
+    multipart_parts: Vec<StoredPart>,
+    last_multipart_user_metadata: Arc<Mutex<Option<BTreeMap<String, String>>>>,
+    last_upload_part: Arc<Mutex<Option<UploadPartRequest>>>,
+    last_complete_parts: Arc<Mutex<Option<Vec<CompletedMultipartPart>>>>,
 }
 
 impl RecordingStorage {
@@ -4655,6 +4824,74 @@ impl Storage for RecordingStorage {
         self.record("delete_object");
         Ok(())
     }
+
+    fn create_multipart_upload(
+        &self,
+        request: CreateMultipartUploadRequest,
+    ) -> Result<MultipartUpload, StorageError> {
+        self.record("create_multipart_upload");
+        *self
+            .last_multipart_user_metadata
+            .lock()
+            .expect("last multipart metadata lock") = Some(request.user_metadata);
+        Ok(MultipartUpload {
+            bucket: request.bucket,
+            key: request.key,
+            upload_id: self.multipart_upload.upload_id.clone(),
+            initiated: self.multipart_upload.initiated,
+            content_type: request.content_type,
+            user_metadata: self.multipart_upload.user_metadata.clone(),
+        })
+    }
+
+    fn upload_part(&self, request: UploadPartRequest) -> Result<StoredPart, StorageError> {
+        self.record("upload_part");
+        *self.last_upload_part.lock().expect("last upload part lock") = Some(request);
+        Ok(self.multipart_parts[0].clone())
+    }
+
+    fn list_parts(
+        &self,
+        _bucket: &BucketName,
+        _key: &ObjectKey,
+        _upload_id: &str,
+    ) -> Result<MultipartUploadPartListing, StorageError> {
+        self.record("list_parts");
+        Ok(MultipartUploadPartListing {
+            upload: self.multipart_upload.clone(),
+            parts: self.multipart_parts.clone(),
+        })
+    }
+
+    fn complete_multipart_upload(
+        &self,
+        request: CompleteMultipartUploadRequest,
+    ) -> Result<StoredObjectMetadata, StorageError> {
+        self.record("complete_multipart_upload");
+        *self
+            .last_complete_parts
+            .lock()
+            .expect("last complete parts lock") = Some(request.parts);
+        Ok(StoredObjectMetadata {
+            bucket: request.bucket,
+            key: request.key,
+            etag: "\"complete-etag\"".to_owned(),
+            content_length: 8,
+            content_type: Some("application/octet-stream".to_owned()),
+            last_modified: fixed_last_modified(),
+            user_metadata: BTreeMap::new(),
+        })
+    }
+
+    fn abort_multipart_upload(
+        &self,
+        _bucket: &BucketName,
+        _key: &ObjectKey,
+        _upload_id: &str,
+    ) -> Result<(), StorageError> {
+        self.record("abort_multipart_upload");
+        Ok(())
+    }
 }
 
 fn metadata(bucket: &str, key: &str, content_length: u64) -> StoredObjectMetadata {
@@ -4684,6 +4921,31 @@ impl Default for RecordingStorage {
             calls: Arc::default(),
             metadata: metadata("bucket", "key", 0),
             last_put_user_metadata: Arc::default(),
+            multipart_upload: MultipartUpload {
+                bucket: BucketName::new("bucket"),
+                key: ObjectKey::new("key"),
+                upload_id: "upload-abc".to_owned(),
+                initiated: fixed_last_modified(),
+                content_type: Some("application/octet-stream".to_owned()),
+                user_metadata: BTreeMap::new(),
+            },
+            multipart_parts: vec![
+                StoredPart {
+                    part_number: 1,
+                    etag: "\"part-one-etag\"".to_owned(),
+                    content_length: 8,
+                    last_modified: fixed_last_modified(),
+                },
+                StoredPart {
+                    part_number: 2,
+                    etag: "\"part-two-etag\"".to_owned(),
+                    content_length: 8,
+                    last_modified: fixed_last_modified(),
+                },
+            ],
+            last_multipart_user_metadata: Arc::default(),
+            last_upload_part: Arc::default(),
+            last_complete_parts: Arc::default(),
         }
     }
 }

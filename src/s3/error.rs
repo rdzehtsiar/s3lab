@@ -14,9 +14,12 @@ pub enum S3ErrorCode {
     InternalError,
     InvalidArgument,
     InvalidBucketName,
+    InvalidPart,
+    InvalidPartOrder,
     MethodNotAllowed,
     NoSuchBucket,
     NoSuchKey,
+    NoSuchUpload,
     NotImplemented,
     SignatureDoesNotMatch,
     XAmzContentSHA256Mismatch,
@@ -35,9 +38,12 @@ impl S3ErrorCode {
             Self::InternalError => "InternalError",
             Self::InvalidArgument => "InvalidArgument",
             Self::InvalidBucketName => "InvalidBucketName",
+            Self::InvalidPart => "InvalidPart",
+            Self::InvalidPartOrder => "InvalidPartOrder",
             Self::MethodNotAllowed => "MethodNotAllowed",
             Self::NoSuchBucket => "NoSuchBucket",
             Self::NoSuchKey => "NoSuchKey",
+            Self::NoSuchUpload => "NoSuchUpload",
             Self::NotImplemented => "NotImplemented",
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
             Self::XAmzContentSHA256Mismatch => "XAmzContentSHA256Mismatch",
@@ -61,7 +67,16 @@ impl S3ErrorCode {
             }
             Self::InvalidBucketName => "The specified bucket is not valid.",
             Self::InvalidArgument => "Invalid argument.",
+            Self::InvalidPart => {
+                "One or more of the specified parts could not be found or did not match the uploaded part."
+            }
+            Self::InvalidPartOrder => {
+                "The list of parts was not in ascending order. Parts must be ordered by part number."
+            }
             Self::MethodNotAllowed => "The specified method is not allowed against this resource.",
+            Self::NoSuchUpload => {
+                "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been completed or aborted."
+            }
             Self::NotImplemented => {
                 "A header you provided implies functionality that is not implemented."
             }
@@ -83,8 +98,12 @@ impl S3ErrorCode {
             Self::NoSuchBucket | Self::NoSuchKey => 404,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => 409,
             Self::EntityTooLarge => 400,
-            Self::InvalidBucketName | Self::InvalidArgument => 400,
+            Self::InvalidBucketName
+            | Self::InvalidArgument
+            | Self::InvalidPart
+            | Self::InvalidPartOrder => 400,
             Self::MethodNotAllowed => 405,
+            Self::NoSuchUpload => 404,
             Self::NotImplemented => 501,
             Self::XAmzContentSHA256Mismatch => 400,
             Self::InternalError => 500,
@@ -178,14 +197,17 @@ mod tests {
                 S3ErrorCode::InternalError,
                 S3ErrorCode::InvalidArgument,
                 S3ErrorCode::InvalidBucketName,
+                S3ErrorCode::InvalidPart,
+                S3ErrorCode::InvalidPartOrder,
                 S3ErrorCode::MethodNotAllowed,
                 S3ErrorCode::NoSuchBucket,
                 S3ErrorCode::NoSuchKey,
+                S3ErrorCode::NoSuchUpload,
                 S3ErrorCode::SignatureDoesNotMatch,
                 S3ErrorCode::XAmzContentSHA256Mismatch,
             ]
             .len(),
-            15
+            18
         );
     }
 
@@ -208,7 +230,10 @@ mod tests {
             (S3ErrorCode::InvalidAccessKeyId, 403),
             (S3ErrorCode::InvalidBucketName, 400),
             (S3ErrorCode::InvalidArgument, 400),
+            (S3ErrorCode::InvalidPart, 400),
+            (S3ErrorCode::InvalidPartOrder, 400),
             (S3ErrorCode::MethodNotAllowed, 405),
+            (S3ErrorCode::NoSuchUpload, 404),
             (S3ErrorCode::NotImplemented, 501),
             (S3ErrorCode::SignatureDoesNotMatch, 403),
             (S3ErrorCode::XAmzContentSHA256Mismatch, 400),

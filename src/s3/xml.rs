@@ -41,6 +41,37 @@ pub struct ListObjectXml {
     pub last_modified: OffsetDateTime,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct InitiateMultipartUploadXml {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ListPartsXml {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: OffsetDateTime,
+    pub parts: Vec<ListPartXml>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ListPartXml {
+    pub part_number: u32,
+    pub etag: String,
+    pub content_length: u64,
+    pub last_modified: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompleteMultipartUploadXml {
+    pub bucket: String,
+    pub key: String,
+    pub etag: String,
+}
+
 pub fn error_response_xml(error: &S3Error) -> String {
     let mut writer = Writer::new(Vec::new());
 
@@ -56,6 +87,92 @@ pub fn error_response_xml(error: &S3Error) -> String {
 
     writer
         .write_event(Event::End(BytesEnd::new("Error")))
+        .expect("writing XML end element to memory cannot fail");
+
+    String::from_utf8(writer.into_inner()).expect("quick-xml writes valid UTF-8")
+}
+
+pub fn initiate_multipart_upload_response_xml(upload: &InitiateMultipartUploadXml) -> String {
+    let mut writer = Writer::new(Vec::new());
+
+    write_xml_declaration(&mut writer);
+    writer
+        .write_event(Event::Start(BytesStart::new(
+            "InitiateMultipartUploadResult",
+        )))
+        .expect("writing XML start element to memory cannot fail");
+    write_text_element(&mut writer, "Bucket", upload.bucket.as_str());
+    write_text_element(&mut writer, "Key", upload.key.as_str());
+    write_text_element(&mut writer, "UploadId", upload.upload_id.as_str());
+    writer
+        .write_event(Event::End(BytesEnd::new("InitiateMultipartUploadResult")))
+        .expect("writing XML end element to memory cannot fail");
+
+    String::from_utf8(writer.into_inner()).expect("quick-xml writes valid UTF-8")
+}
+
+pub fn list_parts_response_xml(listing: &ListPartsXml) -> String {
+    let mut writer = Writer::new(Vec::new());
+
+    write_xml_declaration(&mut writer);
+    writer
+        .write_event(Event::Start(BytesStart::new("ListPartsResult")))
+        .expect("writing XML start element to memory cannot fail");
+    write_text_element(&mut writer, "Bucket", listing.bucket.as_str());
+    write_text_element(&mut writer, "Key", listing.key.as_str());
+    write_text_element(&mut writer, "UploadId", listing.upload_id.as_str());
+    write_text_element(
+        &mut writer,
+        "Initiated",
+        &s3_xml_timestamp(listing.initiated),
+    );
+    write_text_element(&mut writer, "PartNumberMarker", "0");
+    write_text_element(&mut writer, "MaxParts", "10000");
+    write_text_element(&mut writer, "IsTruncated", "false");
+
+    for part in &listing.parts {
+        writer
+            .write_event(Event::Start(BytesStart::new("Part")))
+            .expect("writing XML start element to memory cannot fail");
+        write_text_element(&mut writer, "PartNumber", &part.part_number.to_string());
+        write_text_element(
+            &mut writer,
+            "LastModified",
+            &s3_xml_timestamp(part.last_modified),
+        );
+        write_text_element(&mut writer, "ETag", part.etag.as_str());
+        write_text_element(&mut writer, "Size", &part.content_length.to_string());
+        writer
+            .write_event(Event::End(BytesEnd::new("Part")))
+            .expect("writing XML end element to memory cannot fail");
+    }
+
+    writer
+        .write_event(Event::End(BytesEnd::new("ListPartsResult")))
+        .expect("writing XML end element to memory cannot fail");
+
+    String::from_utf8(writer.into_inner()).expect("quick-xml writes valid UTF-8")
+}
+
+pub fn complete_multipart_upload_response_xml(result: &CompleteMultipartUploadXml) -> String {
+    let mut writer = Writer::new(Vec::new());
+
+    write_xml_declaration(&mut writer);
+    writer
+        .write_event(Event::Start(BytesStart::new(
+            "CompleteMultipartUploadResult",
+        )))
+        .expect("writing XML start element to memory cannot fail");
+    write_text_element(
+        &mut writer,
+        "Location",
+        &format!("/{}/{}", result.bucket, result.key),
+    );
+    write_text_element(&mut writer, "Bucket", result.bucket.as_str());
+    write_text_element(&mut writer, "Key", result.key.as_str());
+    write_text_element(&mut writer, "ETag", result.etag.as_str());
+    writer
+        .write_event(Event::End(BytesEnd::new("CompleteMultipartUploadResult")))
         .expect("writing XML end element to memory cannot fail");
 
     String::from_utf8(writer.into_inner()).expect("quick-xml writes valid UTF-8")

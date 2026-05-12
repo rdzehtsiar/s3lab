@@ -2,8 +2,11 @@
 
 use s3lab::s3::error::{S3Error, S3ErrorCode, S3RequestId, STATIC_REQUEST_ID};
 use s3lab::s3::xml::{
-    error_response_xml, list_buckets_response_xml, list_objects_v2_response_xml, ListBucketXml,
-    ListBucketsXml, ListObjectXml, ListObjectsV2Xml, ListObjectsV2XmlEntry,
+    complete_multipart_upload_response_xml, error_response_xml,
+    initiate_multipart_upload_response_xml, list_buckets_response_xml,
+    list_objects_v2_response_xml, list_parts_response_xml, CompleteMultipartUploadXml,
+    InitiateMultipartUploadXml, ListBucketXml, ListBucketsXml, ListObjectXml, ListObjectsV2Xml,
+    ListObjectsV2XmlEntry, ListPartXml, ListPartsXml,
 };
 use time::OffsetDateTime;
 
@@ -148,6 +151,55 @@ fn list_objects_v2_xml_writes_delimiter_common_prefixes_and_key_count() {
 }
 
 #[test]
+fn initiate_multipart_upload_xml_has_s3_shape_and_escapes_fields() {
+    let upload = InitiateMultipartUploadXml {
+        bucket: "bucket".to_owned(),
+        key: "large&file.bin".to_owned(),
+        upload_id: "upload-1<2>".to_owned(),
+    };
+
+    assert_eq!(
+        initiate_multipart_upload_response_xml(&upload),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>large&amp;file.bin</Key><UploadId>upload-1&lt;2&gt;</UploadId></InitiateMultipartUploadResult>"
+    );
+}
+
+#[test]
+fn list_parts_xml_preserves_part_order_and_metadata() {
+    let listing = ListPartsXml {
+        bucket: "bucket".to_owned(),
+        key: "large.bin".to_owned(),
+        upload_id: "upload-1".to_owned(),
+        initiated: OffsetDateTime::UNIX_EPOCH,
+        parts: vec![ListPartXml {
+            part_number: 2,
+            etag: "\"etag&2\"".to_owned(),
+            content_length: 42,
+            last_modified: OffsetDateTime::UNIX_EPOCH,
+        }],
+    };
+
+    assert_eq!(
+        list_parts_response_xml(&listing),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListPartsResult><Bucket>bucket</Bucket><Key>large.bin</Key><UploadId>upload-1</UploadId><Initiated>1970-01-01T00:00:00.000Z</Initiated><PartNumberMarker>0</PartNumberMarker><MaxParts>10000</MaxParts><IsTruncated>false</IsTruncated><Part><PartNumber>2</PartNumber><LastModified>1970-01-01T00:00:00.000Z</LastModified><ETag>&quot;etag&amp;2&quot;</ETag><Size>42</Size></Part></ListPartsResult>"
+    );
+}
+
+#[test]
+fn complete_multipart_upload_xml_returns_object_identity() {
+    let result = CompleteMultipartUploadXml {
+        bucket: "bucket".to_owned(),
+        key: "large.bin".to_owned(),
+        etag: "\"multipart-etag\"".to_owned(),
+    };
+
+    assert_eq!(
+        complete_multipart_upload_response_xml(&result),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CompleteMultipartUploadResult><Location>/bucket/large.bin</Location><Bucket>bucket</Bucket><Key>large.bin</Key><ETag>&quot;multipart-etag&quot;</ETag></CompleteMultipartUploadResult>"
+    );
+}
+
+#[test]
 fn selected_error_codes_have_s3_default_messages() {
     let cases = [
         (S3ErrorCode::NoSuchKey, "The specified key does not exist."),
@@ -162,6 +214,10 @@ fn selected_error_codes_have_s3_default_messages() {
         (
             S3ErrorCode::MethodNotAllowed,
             "The specified method is not allowed against this resource.",
+        ),
+        (
+            S3ErrorCode::NoSuchUpload,
+            "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been completed or aborted.",
         ),
     ];
 
