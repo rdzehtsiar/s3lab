@@ -218,6 +218,19 @@ pub enum JournalMutation {
     },
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct JournalObjectPut {
+    pub bucket: String,
+    pub key: String,
+    pub content_length: u64,
+    pub content_sha256: String,
+    pub etag: String,
+    pub content_type: Option<String>,
+    pub last_modified_unix_seconds: i64,
+    pub last_modified_nanoseconds: u32,
+    pub user_metadata: BTreeMap<String, String>,
+}
+
 impl JournalMutation {
     pub fn bucket_create(bucket: &BucketName) -> Self {
         Self::BucketCreate {
@@ -231,27 +244,17 @@ impl JournalMutation {
         }
     }
 
-    pub fn object_put(
-        bucket: &BucketName,
-        key: &ObjectKey,
-        content_length: u64,
-        content_sha256: impl Into<String>,
-        etag: impl Into<String>,
-        content_type: Option<String>,
-        last_modified_unix_seconds: i64,
-        last_modified_nanoseconds: u32,
-        user_metadata: BTreeMap<String, String>,
-    ) -> Self {
+    pub fn object_put(fields: JournalObjectPut) -> Self {
         Self::ObjectPut {
-            bucket: bucket.as_str().to_owned(),
-            key: key.as_str().to_owned(),
-            content_length,
-            content_sha256: content_sha256.into(),
-            etag: etag.into(),
-            content_type,
-            last_modified_unix_seconds,
-            last_modified_nanoseconds,
-            user_metadata,
+            bucket: fields.bucket,
+            key: fields.key,
+            content_length: fields.content_length,
+            content_sha256: fields.content_sha256,
+            etag: fields.etag,
+            content_type: fields.content_type,
+            last_modified_unix_seconds: fields.last_modified_unix_seconds,
+            last_modified_nanoseconds: fields.last_modified_nanoseconds,
+            user_metadata: fields.user_metadata,
         }
     }
 
@@ -298,7 +301,8 @@ fn corrupt_journal(path: &Path, message: impl Into<String>) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Journal, JournalMutation, JournalPhase, JournalRecord, EVENTS_DIR, JOURNAL_FILE_NAME,
+        Journal, JournalMutation, JournalObjectPut, JournalPhase, JournalRecord, EVENTS_DIR,
+        JOURNAL_FILE_NAME,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::object::ObjectKey;
@@ -329,37 +333,39 @@ mod tests {
             JournalRecord::commit(2, JournalMutation::bucket_create(&bucket)),
             JournalRecord::begin(
                 3,
-                JournalMutation::object_put(
-                    &bucket,
-                    &key,
-                    11,
-                    "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff",
-                    "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"",
-                    Some("text/plain".to_owned()),
-                    1_778_400_000,
-                    123,
-                    BTreeMap::from([
+                JournalMutation::object_put(JournalObjectPut {
+                    bucket: bucket.as_str().to_owned(),
+                    key: key.as_str().to_owned(),
+                    content_length: 11,
+                    content_sha256:
+                        "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff".to_owned(),
+                    etag: "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"".to_owned(),
+                    content_type: Some("text/plain".to_owned()),
+                    last_modified_unix_seconds: 1_778_400_000,
+                    last_modified_nanoseconds: 123,
+                    user_metadata: BTreeMap::from([
                         ("a-key".to_owned(), "first".to_owned()),
                         ("z-key".to_owned(), "last".to_owned()),
                     ]),
-                ),
+                }),
             ),
             JournalRecord::commit(
                 4,
-                JournalMutation::object_put(
-                    &bucket,
-                    &key,
-                    11,
-                    "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff",
-                    "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"",
-                    Some("text/plain".to_owned()),
-                    1_778_400_000,
-                    123,
-                    BTreeMap::from([
+                JournalMutation::object_put(JournalObjectPut {
+                    bucket: bucket.as_str().to_owned(),
+                    key: key.as_str().to_owned(),
+                    content_length: 11,
+                    content_sha256:
+                        "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff".to_owned(),
+                    etag: "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"".to_owned(),
+                    content_type: Some("text/plain".to_owned()),
+                    last_modified_unix_seconds: 1_778_400_000,
+                    last_modified_nanoseconds: 123,
+                    user_metadata: BTreeMap::from([
                         ("a-key".to_owned(), "first".to_owned()),
                         ("z-key".to_owned(), "last".to_owned()),
                     ]),
-                ),
+                }),
             ),
             JournalRecord::begin(5, JournalMutation::object_delete(&bucket, &key)),
             JournalRecord::commit(6, JournalMutation::object_delete(&bucket, &key)),

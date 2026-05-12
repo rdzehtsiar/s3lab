@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::journal::{
-    Journal, JournalMutation, JournalPhase, JournalRecord, EVENTS_DIR, JOURNAL_FILE_NAME,
+    Journal, JournalMutation, JournalObjectPut, JournalPhase, JournalRecord, EVENTS_DIR,
+    JOURNAL_FILE_NAME,
 };
 use super::key::{encode_bucket_name, encode_object_key, EncodedObjectKey};
 use super::{
@@ -145,9 +146,7 @@ impl<C> FilesystemStorage<C> {
             return Err(error);
         }
 
-        if let Err(error) = self.replace_current_state_with_staged_snapshot(staged_paths) {
-            return Err(error);
-        }
+        self.replace_current_state_with_staged_snapshot(staged_paths)?;
 
         remove_storage_path_if_exists(&self.dirty_marker_path())
     }
@@ -298,17 +297,17 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         let record = ObjectMetadataRecord::from_metadata(&metadata);
         let content_sha256 = sha256_for_bytes(&request.bytes);
         self.store_blob(&content_sha256, &request.bytes)?;
-        let mutation = JournalMutation::object_put(
-            &request.bucket,
-            &request.key,
-            metadata.content_length,
+        let mutation = JournalMutation::object_put(JournalObjectPut {
+            bucket: request.bucket.as_str().to_owned(),
+            key: request.key.as_str().to_owned(),
+            content_length: metadata.content_length,
             content_sha256,
-            metadata.etag.clone(),
-            metadata.content_type.clone(),
-            metadata.last_modified.unix_timestamp(),
-            metadata.last_modified.nanosecond(),
-            metadata.user_metadata.clone(),
-        );
+            etag: metadata.etag.clone(),
+            content_type: metadata.content_type.clone(),
+            last_modified_unix_seconds: metadata.last_modified.unix_timestamp(),
+            last_modified_nanoseconds: metadata.last_modified.nanosecond(),
+            user_metadata: metadata.user_metadata.clone(),
+        });
 
         self.commit_and_apply_mutation(mutation, || {
             let write_result = match object_state {
@@ -625,12 +624,8 @@ impl<C> FilesystemStorage<C> {
                     let current_restore = restore_snapshot_path_backup(&staged_path.target, backup);
                     let previous_restore = restore_snapshot_backups(backups);
                     cleanup_staged_snapshot_paths(&staged_paths);
-                    if let Err(rollback_error) = current_restore {
-                        return Err(rollback_error);
-                    }
-                    if let Err(rollback_error) = previous_restore {
-                        return Err(rollback_error);
-                    }
+                    current_restore?;
+                    previous_restore?;
                     return Err(error);
                 }
             }
@@ -2867,7 +2862,9 @@ mod tests {
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::object::ObjectKey;
-    use crate::storage::journal::{Journal, JournalMutation, JournalPhase, JournalRecord};
+    use crate::storage::journal::{
+        Journal, JournalMutation, JournalObjectPut, JournalPhase, JournalRecord,
+    };
     use crate::storage::key::encode_object_key;
     use crate::storage::{PutObjectRequest, Storage};
     use std::collections::BTreeMap;
@@ -3401,17 +3398,17 @@ mod tests {
         journal
             .append(&JournalRecord::begin(
                 next_sequence,
-                JournalMutation::object_put(
-                    bucket,
-                    key,
-                    bytes.len() as u64,
-                    sha256_for_bytes(bytes),
-                    super::etag_for_bytes(bytes),
-                    Some(crate::storage::DEFAULT_OBJECT_CONTENT_TYPE.to_owned()),
-                    fixed_time().unix_timestamp(),
-                    fixed_time().nanosecond(),
-                    BTreeMap::new(),
-                ),
+                JournalMutation::object_put(JournalObjectPut {
+                    bucket: bucket.as_str().to_owned(),
+                    key: key.as_str().to_owned(),
+                    content_length: bytes.len() as u64,
+                    content_sha256: sha256_for_bytes(bytes),
+                    etag: super::etag_for_bytes(bytes),
+                    content_type: Some(crate::storage::DEFAULT_OBJECT_CONTENT_TYPE.to_owned()),
+                    last_modified_unix_seconds: fixed_time().unix_timestamp(),
+                    last_modified_nanoseconds: fixed_time().nanosecond(),
+                    user_metadata: BTreeMap::new(),
+                }),
             ))
             .expect("append begin-only object put");
     }
