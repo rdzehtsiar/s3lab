@@ -312,6 +312,7 @@ where
     let trace_store = InMemoryTraceStore::default();
     let state =
         ServerState::with_trace_sink(FilesystemStorage::new(config.data_dir), trace_store.clone());
+    let inspector_state = state.clone();
     let mut s3_shutdown_rx = shutdown_rx.clone();
     let s3_shutdown = async move {
         let _ = s3_shutdown_rx.changed().await;
@@ -325,6 +326,7 @@ where
         crate::server::serve_listener_until(listener, state, s3_shutdown),
         crate::server::serve_inspector_listener_until(
             inspector_listener,
+            inspector_state,
             trace_store,
             inspector_shutdown
         )

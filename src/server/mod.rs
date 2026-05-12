@@ -4,6 +4,10 @@ pub mod routes;
 pub mod state;
 
 use crate::config::{ConfigError, RuntimeConfig};
+use crate::s3::bucket::{is_valid_s3_bucket_name, BucketName};
+use crate::storage::{
+    ListObjectsOptions, MultipartUploadListing, StorageError, StoredObjectMetadata, StoredPart,
+};
 use crate::trace::InMemoryTraceStore;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -15,9 +19,17 @@ use state::ServerState;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::net::TcpListener;
 
 pub const PHASE1_SERVER_SCOPE: &str = "path-style-local-s3";
+
+#[derive(Clone)]
+pub struct InspectorState {
+    server_state: ServerState,
+    trace_store: InMemoryTraceStore,
+}
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -40,13 +52,23 @@ pub fn router(state: ServerState) -> Router {
     Router::new().fallback(handle_request).with_state(state)
 }
 
-pub fn inspector_router(trace_store: InMemoryTraceStore) -> Router {
+pub fn inspector_router(server_state: ServerState, trace_store: InMemoryTraceStore) -> Router {
     Router::new()
         .route("/", get(inspector_root))
         .route("/health", get(inspector_health))
         .route("/api/requests", get(inspector_requests))
         .route("/api/requests/{request_id}", get(inspector_request_events))
-        .with_state(trace_store)
+        .route("/api/buckets", get(inspector_buckets))
+        .route(
+            "/api/buckets/{bucket}/objects",
+            get(inspector_bucket_objects),
+        )
+        .route("/api/multipart-uploads", get(inspector_multipart_uploads))
+        .route("/api/snapshots", get(inspector_snapshots))
+        .with_state(InspectorState {
+            server_state,
+            trace_store,
+        })
 }
 
 async fn inspector_root() -> &'static str {
@@ -57,19 +79,18 @@ async fn inspector_health() -> &'static str {
     "ok\n"
 }
 
-async fn inspector_requests(
-    State(trace_store): State<InMemoryTraceStore>,
-) -> Json<serde_json::Value> {
+async fn inspector_requests(State(state): State<InspectorState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "requests": trace_store.request_summaries(),
+        "requests": state.trace_store.request_summaries(),
     }))
 }
 
 async fn inspector_request_events(
-    State(trace_store): State<InMemoryTraceStore>,
+    State(state): State<InspectorState>,
     Path(request_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    trace_store
+    state
+        .trace_store
         .request_events(&request_id)
         .map(|events| {
             Json(serde_json::json!({
@@ -78,6 +99,144 @@ async fn inspector_request_events(
             }))
         })
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn inspector_buckets(
+    State(state): State<InspectorState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let buckets = state
+        .server_state
+        .storage()
+        .list_buckets()
+        .map_err(inspector_storage_status)?;
+
+    Ok(Json(serde_json::json!({
+        "buckets": buckets
+            .into_iter()
+            .map(|bucket| serde_json::json!({ "name": bucket.name.as_str() }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+async fn inspector_bucket_objects(
+    State(state): State<InspectorState>,
+    Path(bucket): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !is_valid_s3_bucket_name(&bucket) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let bucket = BucketName::new(bucket);
+    let listing = state
+        .server_state
+        .storage()
+        .list_objects(
+            &bucket,
+            ListObjectsOptions {
+                max_keys: usize::MAX,
+                ..ListObjectsOptions::default()
+            },
+        )
+        .map_err(inspector_storage_status)?;
+
+    Ok(Json(serde_json::json!({
+        "bucket": bucket.as_str(),
+        "objects": listing
+            .objects
+            .iter()
+            .map(object_json)
+            .collect::<Result<Vec<_>, _>>()?,
+    })))
+}
+
+async fn inspector_multipart_uploads(
+    State(state): State<InspectorState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let uploads = state
+        .server_state
+        .storage()
+        .list_multipart_uploads()
+        .map_err(inspector_storage_status)?;
+
+    Ok(Json(serde_json::json!({
+        "multipart_uploads": uploads
+            .iter()
+            .map(multipart_upload_json)
+            .collect::<Result<Vec<_>, _>>()?,
+    })))
+}
+
+async fn inspector_snapshots(
+    State(state): State<InspectorState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let snapshots = state
+        .server_state
+        .storage()
+        .list_snapshots()
+        .map_err(inspector_storage_status)?;
+
+    Ok(Json(serde_json::json!({
+        "snapshots": snapshots
+            .into_iter()
+            .map(|snapshot| serde_json::json!({ "name": snapshot.name }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+fn object_json(object: &StoredObjectMetadata) -> Result<serde_json::Value, StatusCode> {
+    Ok(serde_json::json!({
+        "key": object.key.as_str(),
+        "etag": object.etag.as_str(),
+        "content_length": object.content_length,
+        "content_type": object.content_type.as_deref(),
+        "last_modified": rfc3339(object.last_modified)?,
+    }))
+}
+
+fn multipart_upload_json(upload: &MultipartUploadListing) -> Result<serde_json::Value, StatusCode> {
+    Ok(serde_json::json!({
+        "bucket": upload.upload.bucket.as_str(),
+        "key": upload.upload.key.as_str(),
+        "upload_id": upload.upload.upload_id.as_str(),
+        "initiated": rfc3339(upload.upload.initiated)?,
+        "content_type": upload.upload.content_type.as_deref(),
+        "part_count": upload.parts.len(),
+        "parts": upload
+            .parts
+            .iter()
+            .map(part_json)
+            .collect::<Result<Vec<_>, _>>()?,
+    }))
+}
+
+fn part_json(part: &StoredPart) -> Result<serde_json::Value, StatusCode> {
+    Ok(serde_json::json!({
+        "part_number": part.part_number,
+        "etag": part.etag.as_str(),
+        "content_length": part.content_length,
+        "last_modified": rfc3339(part.last_modified)?,
+    }))
+}
+
+fn rfc3339(timestamp: OffsetDateTime) -> Result<String, StatusCode> {
+    timestamp
+        .format(&Rfc3339)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn inspector_storage_status(error: StorageError) -> StatusCode {
+    match error {
+        StorageError::NoSuchBucket { .. } => StatusCode::NOT_FOUND,
+        StorageError::InvalidBucketName { .. } | StorageError::InvalidArgument { .. } => {
+            StatusCode::BAD_REQUEST
+        }
+        StorageError::BucketAlreadyExists { .. }
+        | StorageError::BucketNotEmpty { .. }
+        | StorageError::NoSuchKey { .. }
+        | StorageError::InvalidObjectKey { .. }
+        | StorageError::CorruptState { .. }
+        | StorageError::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 pub async fn bind_listener(config: &RuntimeConfig) -> Result<TcpListener, ServerError> {
@@ -129,13 +288,14 @@ where
 
 pub async fn serve_inspector_listener_until<F>(
     listener: TcpListener,
+    state: ServerState,
     trace_store: InMemoryTraceStore,
     shutdown: F,
 ) -> Result<(), ServerError>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, inspector_router(trace_store))
+    axum::serve(listener, inspector_router(state, trace_store))
         .with_graceful_shutdown(shutdown)
         .await
         .map_err(|source| ServerError::Run { source })
@@ -183,13 +343,18 @@ mod tests {
     use crate::config::{ConfigError, RuntimeConfig, DEFAULT_DATA_DIR};
     use crate::server::router;
     use crate::server::state::{FixedRequestIdGenerator, ServerState};
-    use crate::storage::fs::FilesystemStorage;
+    use crate::storage::fs::{FilesystemStorage, StorageClock};
+    use crate::storage::{
+        CreateMultipartUploadRequest, PutObjectRequest, Storage, UploadPartRequest,
+    };
     use crate::trace::InMemoryTraceStore;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use serde_json::Value;
+    use std::collections::BTreeMap;
     use std::error::Error;
     use std::io;
+    use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
@@ -222,7 +387,10 @@ mod tests {
 
     #[tokio::test]
     async fn inspector_router_serves_minimal_health_response() {
-        let response = inspector_router(InMemoryTraceStore::default())
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let state = ServerState::from_storage(FilesystemStorage::new(temp_dir.path()));
+
+        let response = inspector_router(state, InMemoryTraceStore::default())
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -245,7 +413,7 @@ mod tests {
             trace_store.clone(),
         );
 
-        let create_bucket = router(state)
+        let create_bucket = router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("PUT")
@@ -257,7 +425,7 @@ mod tests {
             .expect("create bucket response");
         assert_eq!(create_bucket.status(), StatusCode::OK);
 
-        let requests_response = inspector_router(trace_store.clone())
+        let requests_response = inspector_router(state.clone(), trace_store.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/requests")
@@ -276,7 +444,7 @@ mod tests {
         assert_eq!(requests_body["requests"][0]["path"], "/bucket-a");
         assert_eq!(requests_body["requests"][0]["status_code"], 200);
 
-        let events_response = inspector_router(trace_store)
+        let events_response = inspector_router(state, trace_store)
             .oneshot(
                 Request::builder()
                     .uri("/api/requests/s3lab-0000000000000001")
@@ -291,6 +459,154 @@ mod tests {
         assert_eq!(events_body["events"][0]["type"], "request_received");
         assert!(!events_body.to_string().contains("Authorization:"));
         assert!(!events_body.to_string().contains("Signature="));
+    }
+
+    #[tokio::test]
+    async fn inspector_router_serves_sorted_storage_state_without_payloads_or_paths() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let storage =
+            FilesystemStorage::with_clock(temp_dir.path().to_path_buf(), FixedStorageClock);
+        let bucket_a = crate::s3::bucket::BucketName::new("bucket-a");
+        let bucket_b = crate::s3::bucket::BucketName::new("bucket-b");
+        storage.create_bucket(&bucket_b).expect("create bucket b");
+        storage.create_bucket(&bucket_a).expect("create bucket a");
+        storage
+            .put_object(PutObjectRequest {
+                bucket: bucket_a.clone(),
+                key: crate::s3::object::ObjectKey::new("z-object.txt"),
+                bytes: b"secret body".to_vec(),
+                content_type: Some("text/plain".to_owned()),
+                user_metadata: BTreeMap::from([("secret".to_owned(), "private".to_owned())]),
+            })
+            .expect("put z object");
+        storage
+            .put_object(PutObjectRequest {
+                bucket: bucket_a.clone(),
+                key: crate::s3::object::ObjectKey::new("a-object.txt"),
+                bytes: b"body".to_vec(),
+                content_type: None,
+                user_metadata: BTreeMap::new(),
+            })
+            .expect("put a object");
+        let upload = storage
+            .create_multipart_upload(CreateMultipartUploadRequest {
+                bucket: bucket_b.clone(),
+                key: crate::s3::object::ObjectKey::new("large.bin"),
+                content_type: None,
+                user_metadata: BTreeMap::from([("secret".to_owned(), "private".to_owned())]),
+            })
+            .expect("create multipart upload");
+        storage
+            .upload_part(UploadPartRequest {
+                bucket: bucket_b,
+                key: crate::s3::object::ObjectKey::new("large.bin"),
+                upload_id: upload.upload_id,
+                part_number: 1,
+                bytes: b"part body".to_vec(),
+            })
+            .expect("upload part");
+        storage
+            .save_snapshot("z-snapshot")
+            .expect("save z snapshot");
+        storage
+            .save_snapshot("a-snapshot")
+            .expect("save a snapshot");
+
+        let state = ServerState::from_storage(storage);
+        let app = inspector_router(state, InMemoryTraceStore::default());
+
+        let buckets = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/buckets")
+                        .body(Body::empty())
+                        .expect("buckets request"),
+                )
+                .await
+                .expect("buckets response"),
+        )
+        .await;
+        assert_eq!(buckets["buckets"][0]["name"], "bucket-a");
+        assert_eq!(buckets["buckets"][1]["name"], "bucket-b");
+
+        let objects = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/buckets/bucket-a/objects")
+                        .body(Body::empty())
+                        .expect("objects request"),
+                )
+                .await
+                .expect("objects response"),
+        )
+        .await;
+        assert_eq!(objects["objects"][0]["key"], "a-object.txt");
+        assert_eq!(objects["objects"][1]["key"], "z-object.txt");
+        assert_eq!(objects["objects"][1]["content_length"], 11);
+        assert_eq!(
+            objects["objects"][1]["last_modified"],
+            "2026-05-10T12:34:56Z"
+        );
+
+        let uploads = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/multipart-uploads")
+                        .body(Body::empty())
+                        .expect("uploads request"),
+                )
+                .await
+                .expect("uploads response"),
+        )
+        .await;
+        assert_eq!(uploads["multipart_uploads"][0]["bucket"], "bucket-b");
+        assert_eq!(uploads["multipart_uploads"][0]["key"], "large.bin");
+        assert_eq!(uploads["multipart_uploads"][0]["part_count"], 1);
+        assert_eq!(
+            uploads["multipart_uploads"][0]["parts"][0]["content_length"],
+            9
+        );
+
+        let snapshots = response_json(
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/snapshots")
+                    .body(Body::empty())
+                    .expect("snapshots request"),
+            )
+            .await
+            .expect("snapshots response"),
+        )
+        .await;
+        assert_eq!(snapshots["snapshots"][0]["name"], "a-snapshot");
+        assert_eq!(snapshots["snapshots"][1]["name"], "z-snapshot");
+
+        let combined = format!("{buckets}{objects}{uploads}{snapshots}");
+        assert!(!combined.contains("secret body"));
+        assert!(!combined.contains("part body"));
+        assert!(!combined.contains("private"));
+        assert!(!combined.contains(temp_dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn inspector_bucket_objects_reports_missing_bucket_as_not_found() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let state = ServerState::from_storage(FilesystemStorage::new(temp_dir.path()));
+
+        let response = inspector_router(state, InMemoryTraceStore::default())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/buckets/missing-bucket/objects")
+                    .body(Body::empty())
+                    .expect("objects request"),
+            )
+            .await
+            .expect("objects response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -366,6 +682,19 @@ mod tests {
 
     fn io_error(kind: io::ErrorKind, message: &'static str) -> io::Error {
         io::Error::new(kind, message)
+    }
+
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    struct FixedStorageClock;
+
+    impl StorageClock for FixedStorageClock {
+        fn now_utc(&self) -> OffsetDateTime {
+            PrimitiveDateTime::new(
+                Date::from_calendar_date(2026, Month::May, 10).expect("valid test date"),
+                Time::from_hms(12, 34, 56).expect("valid test time"),
+            )
+            .assume_utc()
+        }
     }
 
     async fn response_json(response: axum::http::Response<Body>) -> Value {

@@ -19,9 +19,9 @@ use s3lab::server::state::{FixedAuthClock, FixedRequestIdGenerator, ServerState}
 use s3lab::storage::fs::{FilesystemStorage, StorageClock};
 use s3lab::storage::{
     BucketSummary, CompleteMultipartUploadRequest, CompletedMultipartPart,
-    CreateMultipartUploadRequest, ListObjectsOptions, MultipartUpload, MultipartUploadPartListing,
-    ObjectListing, PutObjectRequest, Storage, StorageError, StoredObject, StoredObjectMetadata,
-    StoredPart, UploadPartRequest,
+    CreateMultipartUploadRequest, ListObjectsOptions, MultipartUpload, MultipartUploadListing,
+    MultipartUploadPartListing, ObjectListing, PutObjectRequest, SnapshotSummary, Storage,
+    StorageError, StoredObject, StoredObjectMetadata, StoredPart, UploadPartRequest,
 };
 use s3lab::trace::{
     AuthDecision, AuthDecisionTrace, CanonicalRequestBuiltTrace, PayloadVerificationOutcome,
@@ -4908,6 +4908,19 @@ impl Storage for RecordingStorage {
             is_truncated: false,
             next_continuation_token: None,
         })
+    }
+
+    fn list_multipart_uploads(&self) -> Result<Vec<MultipartUploadListing>, StorageError> {
+        self.record("list_multipart_uploads");
+        Ok(vec![MultipartUploadListing {
+            upload: self.multipart_upload.clone(),
+            parts: self.multipart_parts.clone(),
+        }])
+    }
+
+    fn list_snapshots(&self) -> Result<Vec<SnapshotSummary>, StorageError> {
+        self.record("list_snapshots");
+        Ok(Vec::new())
     }
 
     fn delete_object(&self, _bucket: &BucketName, _key: &ObjectKey) -> Result<(), StorageError> {

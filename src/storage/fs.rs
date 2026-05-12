@@ -8,10 +8,10 @@ use super::journal::{
 use super::key::{encode_bucket_name, encode_object_key, EncodedObjectKey};
 use super::{
     BucketSummary, CompleteMultipartUploadRequest, CompletedMultipartPart,
-    CreateMultipartUploadRequest, ListObjectsOptions, MultipartUpload, MultipartUploadPartListing,
-    ObjectListing, ObjectListingEntry, PutObjectRequest, Storage, StorageError, StoredObject,
-    StoredObjectMetadata, StoredPart, UploadPartRequest, DEFAULT_OBJECT_CONTENT_TYPE,
-    STORAGE_ROOT_DIR,
+    CreateMultipartUploadRequest, ListObjectsOptions, MultipartUpload, MultipartUploadListing,
+    MultipartUploadPartListing, ObjectListing, ObjectListingEntry, PutObjectRequest,
+    SnapshotSummary, Storage, StorageError, StoredObject, StoredObjectMetadata, StoredPart,
+    UploadPartRequest, DEFAULT_OBJECT_CONTENT_TYPE, STORAGE_ROOT_DIR,
 };
 use crate::s3::bucket::{is_valid_s3_bucket_name, BucketName};
 use crate::s3::object::{is_valid_s3_object_key_prefix, ObjectKey};
@@ -210,44 +210,7 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
 
     fn list_buckets(&self) -> Result<Vec<BucketSummary>, StorageError> {
         let _guard = lock_storage(&self.root, "list_buckets")?;
-        self.recover_if_dirty()?;
-        let bucket_root = self.bucket_root();
-        if !path_exists(&bucket_root)? {
-            return Ok(Vec::new());
-        }
-
-        let mut buckets = Vec::new();
-        for entry in sorted_directory_entries(&bucket_root)? {
-            if is_hidden_storage_entry(&entry) {
-                continue;
-            }
-
-            let entry_path = entry.path();
-            let Some(entry_metadata) = storage_path_metadata(&entry_path)? else {
-                continue;
-            };
-            if !entry_metadata.is_dir() {
-                continue;
-            }
-
-            let metadata_path = entry_path.join(BUCKET_METADATA_FILE);
-            if !path_exists(&metadata_path)? {
-                return Err(corrupt_state(metadata_path, "missing bucket metadata"));
-            }
-
-            let record: BucketRecord = read_json(&metadata_path)?;
-            validate_listed_bucket_record(&entry_path, &metadata_path, &record)?;
-            require_storage_directory(
-                &entry_path.join(OBJECTS_DIR),
-                "missing bucket objects directory",
-            )?;
-            buckets.push(BucketSummary {
-                name: BucketName::new(record.bucket),
-            });
-        }
-
-        buckets.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(buckets)
+        self.list_buckets_unlocked()
     }
 
     fn bucket_exists(&self, bucket: &BucketName) -> Result<bool, StorageError> {
@@ -478,6 +441,104 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
             is_truncated: next_continuation_token.is_some(),
             next_continuation_token,
         })
+    }
+
+    fn list_multipart_uploads(&self) -> Result<Vec<MultipartUploadListing>, StorageError> {
+        let _guard = lock_storage(&self.root, "list_multipart_uploads")?;
+        self.recover_if_dirty()?;
+
+        let mut uploads = Vec::new();
+        for bucket in self.list_buckets_unlocked()? {
+            let multipart_dir = self.multipart_uploads_dir(&bucket.name);
+            if !path_exists(&multipart_dir)? {
+                continue;
+            }
+            require_storage_directory(&multipart_dir, "missing multipart uploads directory")?;
+
+            for shard_entry in sorted_directory_entries(&multipart_dir)? {
+                let Some(shard_path) = visible_storage_directory_path(
+                    &shard_entry,
+                    "visible multipart upload shard path exists but is not a directory",
+                )?
+                else {
+                    continue;
+                };
+                let shard_name = storage_file_name(&shard_path, "multipart upload shard path")?;
+
+                for upload_entry in sorted_directory_entries(&shard_path)? {
+                    let Some(upload_path) = visible_storage_directory_path(
+                        &upload_entry,
+                        "visible multipart upload path exists but is not a directory",
+                    )?
+                    else {
+                        continue;
+                    };
+
+                    multipart_upload_path_state(&upload_path)?;
+                    let metadata_path = upload_path.join(MULTIPART_UPLOAD_METADATA_FILE);
+                    let upload = multipart_upload_from_path(&metadata_path)?;
+                    if upload.bucket != bucket.name {
+                        return Err(corrupt_state(
+                            metadata_path,
+                            "multipart upload metadata does not match bucket path",
+                        ));
+                    }
+                    let encoded_key = encode_object_key(&upload.key)?;
+                    if encoded_key.shard() != shard_name {
+                        return Err(corrupt_state(
+                            metadata_path,
+                            "multipart upload metadata does not match shard path",
+                        ));
+                    }
+
+                    let parts = self.read_multipart_parts(&upload)?;
+                    uploads.push(MultipartUploadListing { upload, parts });
+                }
+            }
+        }
+
+        uploads.sort_by(|left, right| {
+            left.upload
+                .bucket
+                .cmp(&right.upload.bucket)
+                .then_with(|| left.upload.key.cmp(&right.upload.key))
+                .then_with(|| left.upload.upload_id.cmp(&right.upload.upload_id))
+        });
+        Ok(uploads)
+    }
+
+    fn list_snapshots(&self) -> Result<Vec<SnapshotSummary>, StorageError> {
+        let _guard = lock_storage(&self.root, "list_snapshots")?;
+        let snapshot_root = self.snapshot_root();
+        if !path_exists(&snapshot_root)? {
+            return Ok(Vec::new());
+        }
+        require_storage_directory(&snapshot_root, "missing snapshots directory")?;
+
+        let mut snapshots = Vec::new();
+        for entry in sorted_directory_entries(&snapshot_root)? {
+            if is_hidden_storage_entry(&entry) {
+                continue;
+            }
+            let snapshot_path = entry.path();
+            let Some(metadata) = storage_path_metadata(&snapshot_path)? else {
+                continue;
+            };
+            if !metadata.is_dir() {
+                return Err(corrupt_state(
+                    snapshot_path,
+                    "visible snapshot path exists but is not a directory",
+                ));
+            }
+
+            let name = storage_file_name(&snapshot_path, "snapshot path")?.to_owned();
+            validate_snapshot_name(&name)?;
+            read_validated_snapshot_manifest(&snapshot_path)?;
+            snapshots.push(SnapshotSummary { name });
+        }
+
+        snapshots.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(snapshots)
     }
 
     fn delete_object(&self, bucket: &BucketName, key: &ObjectKey) -> Result<(), StorageError> {
@@ -1423,6 +1484,47 @@ impl<C> FilesystemStorage<C> {
         }
 
         read_json(&metadata_path)
+    }
+
+    fn list_buckets_unlocked(&self) -> Result<Vec<BucketSummary>, StorageError> {
+        self.recover_if_dirty()?;
+        let bucket_root = self.bucket_root();
+        if !path_exists(&bucket_root)? {
+            return Ok(Vec::new());
+        }
+
+        let mut buckets = Vec::new();
+        for entry in sorted_directory_entries(&bucket_root)? {
+            if is_hidden_storage_entry(&entry) {
+                continue;
+            }
+
+            let entry_path = entry.path();
+            let Some(entry_metadata) = storage_path_metadata(&entry_path)? else {
+                continue;
+            };
+            if !entry_metadata.is_dir() {
+                continue;
+            }
+
+            let metadata_path = entry_path.join(BUCKET_METADATA_FILE);
+            if !path_exists(&metadata_path)? {
+                return Err(corrupt_state(metadata_path, "missing bucket metadata"));
+            }
+
+            let record: BucketRecord = read_json(&metadata_path)?;
+            validate_listed_bucket_record(&entry_path, &metadata_path, &record)?;
+            require_storage_directory(
+                &entry_path.join(OBJECTS_DIR),
+                "missing bucket objects directory",
+            )?;
+            buckets.push(BucketSummary {
+                name: BucketName::new(record.bucket),
+            });
+        }
+
+        buckets.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(buckets)
     }
 
     fn read_object_metadata(
@@ -3268,6 +3370,15 @@ fn is_hidden_storage_entry(entry: &fs::DirEntry) -> bool {
         .file_name()
         .to_str()
         .is_some_and(|file_name| file_name.starts_with('.'))
+}
+
+fn storage_file_name<'a>(path: &'a Path, description: &str) -> Result<&'a str, StorageError> {
+    path.file_name().and_then(OsStr::to_str).ok_or_else(|| {
+        corrupt_state(
+            path.to_path_buf(),
+            format!("{description} is not valid UTF-8"),
+        )
+    })
 }
 
 fn visible_storage_directory_path(

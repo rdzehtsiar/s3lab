@@ -48,6 +48,10 @@ pub trait Storage {
         options: ListObjectsOptions,
     ) -> Result<ObjectListing, StorageError>;
 
+    fn list_multipart_uploads(&self) -> Result<Vec<MultipartUploadListing>, StorageError>;
+
+    fn list_snapshots(&self) -> Result<Vec<SnapshotSummary>, StorageError>;
+
     fn delete_object(&self, bucket: &BucketName, key: &ObjectKey) -> Result<(), StorageError>;
 
     fn create_multipart_upload(
@@ -156,6 +160,17 @@ pub struct MultipartUpload {
 pub struct MultipartUploadPartListing {
     pub upload: MultipartUpload,
     pub parts: Vec<StoredPart>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MultipartUploadListing {
+    pub upload: MultipartUpload,
+    pub parts: Vec<StoredPart>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SnapshotSummary {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
