@@ -2147,6 +2147,48 @@ fn snapshot_restore_returns_deterministic_saved_state_and_keeps_storage_usable()
 }
 
 #[test]
+fn snapshot_restore_carries_active_multipart_state() {
+    let (_temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("large.bin");
+    storage.create_bucket(&bucket).expect("create bucket");
+    let upload = storage
+        .create_multipart_upload(create_multipart_request(&bucket, key.as_str()))
+        .expect("create multipart upload");
+    let part = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            1,
+            b"part",
+        ))
+        .expect("upload part");
+
+    storage
+        .save_snapshot("with-multipart")
+        .expect("save snapshot");
+    storage
+        .abort_multipart_upload(&bucket, &key, &upload.upload_id)
+        .expect("abort after snapshot");
+    storage
+        .restore_snapshot("with-multipart")
+        .expect("restore snapshot");
+
+    let restored = storage
+        .list_parts(&bucket, &key, &upload.upload_id)
+        .expect("restored multipart upload is readable");
+
+    assert_eq!(restored.upload, upload);
+    assert_eq!(restored.parts, vec![part]);
+    assert!(storage
+        .list_objects(&bucket, ListObjectsOptions::default())
+        .expect("active multipart remains invisible")
+        .objects
+        .is_empty());
+}
+
+#[test]
 fn save_snapshot_rejects_overwriting_existing_snapshot() {
     let (_temp_dir, storage) = storage();
 

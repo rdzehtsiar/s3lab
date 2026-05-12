@@ -216,12 +216,87 @@ pub enum JournalMutation {
         bucket: String,
         key: String,
     },
+    MultipartUploadCreate {
+        bucket: String,
+        key: String,
+        upload_id: String,
+        initiated_unix_seconds: i64,
+        initiated_nanoseconds: u32,
+        content_type: Option<String>,
+        user_metadata: BTreeMap<String, String>,
+    },
+    MultipartPartUpload {
+        bucket: String,
+        key: String,
+        upload_id: String,
+        part_number: u32,
+        etag: String,
+        content_length: u64,
+        content_sha256: String,
+        last_modified_unix_seconds: i64,
+        last_modified_nanoseconds: u32,
+    },
+    MultipartUploadComplete {
+        bucket: String,
+        key: String,
+        upload_id: String,
+        content_length: u64,
+        content_sha256: String,
+        etag: String,
+        content_type: Option<String>,
+        last_modified_unix_seconds: i64,
+        last_modified_nanoseconds: u32,
+        user_metadata: BTreeMap<String, String>,
+    },
+    MultipartUploadAbort {
+        bucket: String,
+        key: String,
+        upload_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct JournalObjectPut {
     pub bucket: String,
     pub key: String,
+    pub content_length: u64,
+    pub content_sha256: String,
+    pub etag: String,
+    pub content_type: Option<String>,
+    pub last_modified_unix_seconds: i64,
+    pub last_modified_nanoseconds: u32,
+    pub user_metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct JournalMultipartUploadCreate {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub initiated_unix_seconds: i64,
+    pub initiated_nanoseconds: u32,
+    pub content_type: Option<String>,
+    pub user_metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct JournalMultipartPartUpload {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub part_number: u32,
+    pub etag: String,
+    pub content_length: u64,
+    pub content_sha256: String,
+    pub last_modified_unix_seconds: i64,
+    pub last_modified_nanoseconds: u32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct JournalMultipartUploadComplete {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
     pub content_length: u64,
     pub content_sha256: String,
     pub etag: String,
@@ -264,6 +339,55 @@ impl JournalMutation {
             key: key.as_str().to_owned(),
         }
     }
+
+    pub fn multipart_upload_create(fields: JournalMultipartUploadCreate) -> Self {
+        Self::MultipartUploadCreate {
+            bucket: fields.bucket,
+            key: fields.key,
+            upload_id: fields.upload_id,
+            initiated_unix_seconds: fields.initiated_unix_seconds,
+            initiated_nanoseconds: fields.initiated_nanoseconds,
+            content_type: fields.content_type,
+            user_metadata: fields.user_metadata,
+        }
+    }
+
+    pub fn multipart_part_upload(fields: JournalMultipartPartUpload) -> Self {
+        Self::MultipartPartUpload {
+            bucket: fields.bucket,
+            key: fields.key,
+            upload_id: fields.upload_id,
+            part_number: fields.part_number,
+            etag: fields.etag,
+            content_length: fields.content_length,
+            content_sha256: fields.content_sha256,
+            last_modified_unix_seconds: fields.last_modified_unix_seconds,
+            last_modified_nanoseconds: fields.last_modified_nanoseconds,
+        }
+    }
+
+    pub fn multipart_upload_complete(fields: JournalMultipartUploadComplete) -> Self {
+        Self::MultipartUploadComplete {
+            bucket: fields.bucket,
+            key: fields.key,
+            upload_id: fields.upload_id,
+            content_length: fields.content_length,
+            content_sha256: fields.content_sha256,
+            etag: fields.etag,
+            content_type: fields.content_type,
+            last_modified_unix_seconds: fields.last_modified_unix_seconds,
+            last_modified_nanoseconds: fields.last_modified_nanoseconds,
+            user_metadata: fields.user_metadata,
+        }
+    }
+
+    pub fn multipart_upload_abort(bucket: &BucketName, key: &ObjectKey, upload_id: &str) -> Self {
+        Self::MultipartUploadAbort {
+            bucket: bucket.as_str().to_owned(),
+            key: key.as_str().to_owned(),
+            upload_id: upload_id.to_owned(),
+        }
+    }
 }
 
 fn lock_journal(path: &Path) -> Result<MutexGuard<'static, ()>, StorageError> {
@@ -301,8 +425,9 @@ fn corrupt_journal(path: &Path, message: impl Into<String>) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Journal, JournalMutation, JournalObjectPut, JournalPhase, JournalRecord, EVENTS_DIR,
-        JOURNAL_FILE_NAME,
+        Journal, JournalMultipartPartUpload, JournalMultipartUploadComplete,
+        JournalMultipartUploadCreate, JournalMutation, JournalObjectPut, JournalPhase,
+        JournalRecord, EVENTS_DIR, JOURNAL_FILE_NAME,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::object::ObjectKey;
@@ -341,8 +466,44 @@ mod tests {
             ),
             JournalRecord::begin(5, JournalMutation::object_delete(&bucket, &key)),
             JournalRecord::commit(6, JournalMutation::object_delete(&bucket, &key)),
-            JournalRecord::begin(7, JournalMutation::bucket_delete(&bucket)),
-            JournalRecord::commit(8, JournalMutation::bucket_delete(&bucket)),
+            JournalRecord::begin(
+                7,
+                JournalMutation::multipart_upload_create(sample_multipart_create(&bucket, &key)),
+            ),
+            JournalRecord::commit(
+                8,
+                JournalMutation::multipart_upload_create(sample_multipart_create(&bucket, &key)),
+            ),
+            JournalRecord::begin(
+                9,
+                JournalMutation::multipart_part_upload(sample_multipart_part(&bucket, &key)),
+            ),
+            JournalRecord::commit(
+                10,
+                JournalMutation::multipart_part_upload(sample_multipart_part(&bucket, &key)),
+            ),
+            JournalRecord::begin(
+                11,
+                JournalMutation::multipart_upload_complete(sample_multipart_complete(
+                    &bucket, &key,
+                )),
+            ),
+            JournalRecord::commit(
+                12,
+                JournalMutation::multipart_upload_complete(sample_multipart_complete(
+                    &bucket, &key,
+                )),
+            ),
+            JournalRecord::begin(
+                13,
+                JournalMutation::multipart_upload_abort(&bucket, &key, "upload-test-000000000001"),
+            ),
+            JournalRecord::commit(
+                14,
+                JournalMutation::multipart_upload_abort(&bucket, &key, "upload-test-000000000001"),
+            ),
+            JournalRecord::begin(15, JournalMutation::bucket_delete(&bucket)),
+            JournalRecord::commit(16, JournalMutation::bucket_delete(&bucket)),
         ];
 
         for record in &records {
@@ -367,6 +528,55 @@ mod tests {
                 ("a-key".to_owned(), "first".to_owned()),
                 ("z-key".to_owned(), "last".to_owned()),
             ]),
+        }
+    }
+
+    fn sample_multipart_create(
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> JournalMultipartUploadCreate {
+        JournalMultipartUploadCreate {
+            bucket: bucket.as_str().to_owned(),
+            key: key.as_str().to_owned(),
+            upload_id: "upload-test-000000000001".to_owned(),
+            initiated_unix_seconds: 1_778_400_000,
+            initiated_nanoseconds: 123,
+            content_type: Some("text/plain".to_owned()),
+            user_metadata: BTreeMap::from([("owner".to_owned(), "local".to_owned())]),
+        }
+    }
+
+    fn sample_multipart_part(bucket: &BucketName, key: &ObjectKey) -> JournalMultipartPartUpload {
+        JournalMultipartPartUpload {
+            bucket: bucket.as_str().to_owned(),
+            key: key.as_str().to_owned(),
+            upload_id: "upload-test-000000000001".to_owned(),
+            part_number: 1,
+            etag: "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"".to_owned(),
+            content_length: 11,
+            content_sha256: "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff"
+                .to_owned(),
+            last_modified_unix_seconds: 1_778_400_000,
+            last_modified_nanoseconds: 123,
+        }
+    }
+
+    fn sample_multipart_complete(
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> JournalMultipartUploadComplete {
+        JournalMultipartUploadComplete {
+            bucket: bucket.as_str().to_owned(),
+            key: key.as_str().to_owned(),
+            upload_id: "upload-test-000000000001".to_owned(),
+            content_length: 11,
+            content_sha256: "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff"
+                .to_owned(),
+            etag: "\"241d8a27c836427bd7f04461b60e7359-1\"".to_owned(),
+            content_type: Some("text/plain".to_owned()),
+            last_modified_unix_seconds: 1_778_400_000,
+            last_modified_nanoseconds: 123,
+            user_metadata: BTreeMap::from([("owner".to_owned(), "local".to_owned())]),
         }
     }
 
