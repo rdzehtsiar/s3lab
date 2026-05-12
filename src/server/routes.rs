@@ -8,7 +8,7 @@ use crate::s3::sigv4::{
     build_canonical_request, parse_authorization_header, parse_query_authorization,
     verify_query_signature, verify_signature, SigV4Authorization, SigV4ParseDiagnostic,
     SigV4QueryAuthorization, SigV4QueryParseDiagnostic, SigV4QueryVerificationRequest,
-    SigV4VerificationDiagnostic, SigV4VerificationRequest,
+    SigV4VerificationDiagnostic, SigV4VerificationRequest, SignedHeaderName,
 };
 use crate::s3::time::http_date;
 use crate::s3::xml::{
@@ -316,35 +316,23 @@ fn auth_rejection_response(
         payload_hash: &verification_request.payload_hash,
     };
 
-    match build_canonical_request(
-        request.method,
-        request.path,
-        request.query,
-        request.headers,
-        authorization.signed_headers(),
-        request.payload_hash,
+    if let Some(response) = record_canonical_request_built(
+        state,
+        request_id,
+        CanonicalRequestBuildInput {
+            method: request.method,
+            path: request.path,
+            query: request.query,
+            headers: request.headers,
+            signed_headers: authorization.signed_headers(),
+            payload_hash: request.payload_hash,
+        },
+        AuthErrorContext {
+            resource: &resource,
+            is_head,
+        },
     ) {
-        Ok(canonical_request) => {
-            state.record_trace(TraceEvent::CanonicalRequestBuilt(
-                CanonicalRequestBuiltTrace::from_canonical_request(
-                    request_id.as_str(),
-                    authorization
-                        .signed_headers()
-                        .iter()
-                        .map(|header| header.as_str()),
-                    &canonical_request,
-                ),
-            ));
-        }
-        Err(diagnostic) => {
-            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-                request_id.as_str(),
-                AuthDecision::Rejected(auth_rejection_reason(&diagnostic)),
-            )));
-            return Some(sigv4_verification_error_response(
-                diagnostic, &resource, is_head, request_id,
-            ));
-        }
+        return Some(response);
     }
 
     match verify_signature(&authorization, LOCAL_SECRET_ACCESS_KEY, request) {
@@ -451,35 +439,23 @@ fn query_auth_rejection_response(
         .copied()
         .filter(|(name, _)| *name != X_AMZ_SIGNATURE_QUERY)
         .collect::<Vec<_>>();
-    match build_canonical_request(
-        method,
-        path,
-        &query_without_signature,
-        &header_refs,
-        authorization.signed_headers(),
-        authorization.payload_hash(),
+    if let Some(response) = record_canonical_request_built(
+        state,
+        request_id,
+        CanonicalRequestBuildInput {
+            method,
+            path,
+            query: &query_without_signature,
+            headers: &header_refs,
+            signed_headers: authorization.signed_headers(),
+            payload_hash: authorization.payload_hash(),
+        },
+        AuthErrorContext {
+            resource: &resource,
+            is_head,
+        },
     ) {
-        Ok(canonical_request) => {
-            state.record_trace(TraceEvent::CanonicalRequestBuilt(
-                CanonicalRequestBuiltTrace::from_canonical_request(
-                    request_id.as_str(),
-                    authorization
-                        .signed_headers()
-                        .iter()
-                        .map(|header| header.as_str()),
-                    &canonical_request,
-                ),
-            ));
-        }
-        Err(diagnostic) => {
-            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-                request_id.as_str(),
-                AuthDecision::Rejected(auth_rejection_reason(&diagnostic)),
-            )));
-            return Some(sigv4_verification_error_response(
-                diagnostic, &resource, is_head, request_id,
-            ));
-        }
+        return Some(response);
     }
 
     let request = SigV4QueryVerificationRequest {
@@ -812,6 +788,59 @@ fn sigv4_header_pairs(
                 })
         })
         .collect()
+}
+
+struct CanonicalRequestBuildInput<'a> {
+    method: &'a str,
+    path: &'a str,
+    query: &'a [(&'a str, &'a str)],
+    headers: &'a [(&'a str, &'a str)],
+    signed_headers: &'a [SignedHeaderName],
+    payload_hash: &'a str,
+}
+
+struct AuthErrorContext<'a> {
+    resource: &'a str,
+    is_head: bool,
+}
+
+fn record_canonical_request_built(
+    state: &ServerState,
+    request_id: &S3RequestId,
+    input: CanonicalRequestBuildInput<'_>,
+    error_context: AuthErrorContext<'_>,
+) -> Option<Response<Body>> {
+    match build_canonical_request(
+        input.method,
+        input.path,
+        input.query,
+        input.headers,
+        input.signed_headers,
+        input.payload_hash,
+    ) {
+        Ok(canonical_request) => {
+            state.record_trace(TraceEvent::CanonicalRequestBuilt(
+                CanonicalRequestBuiltTrace::from_canonical_request(
+                    request_id.as_str(),
+                    input.signed_headers.iter().map(|header| header.as_str()),
+                    &canonical_request,
+                ),
+            ));
+            None
+        }
+        Err(diagnostic) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(auth_rejection_reason(&diagnostic)),
+            )));
+            Some(sigv4_verification_error_response(
+                diagnostic,
+                error_context.resource,
+                error_context.is_head,
+                request_id,
+            ))
+        }
+    }
 }
 
 fn sigv4_verification_error_response(
