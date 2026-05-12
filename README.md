@@ -39,7 +39,9 @@ Milestone 3 adds narrow presigned URL support for path-style object `GET` and `P
 
 Milestone 4 adds local storage durability tools for the current object model: a local WAL/event log, content-addressed object blobs, crash recovery for committed dirty mutations, named snapshots, snapshot restore, and reset that removes current state while preserving snapshots. See [Milestone 4 Smoke Tests](./docs/milestone4-smoke-tests.md) for offline snapshot and reset recipes.
 
-Current limitations include no virtual-host style routing, no session-token presigned URLs, no configurable credentials, no strict authentication mode, no multipart uploads or multipart snapshot semantics beyond the current object model, no trace persistence/API/UI, no hosted backend, no production storage guarantee, no broad S3 compatibility claim, no full streaming chunk-signature validation, and no cross-process write locking guarantee.
+Milestone 5 adds narrow multipart upload support for the local path-style endpoint: create a multipart upload, upload parts, list parts, complete the upload into a readable object, list the completed object, and abort an active upload. See [Milestone 5 Smoke Tests](./docs/milestone5-smoke-tests.md) for offline AWS CLI recipes.
+
+Current limitations include no virtual-host style routing, no session-token presigned URLs, no configurable credentials, no strict authentication mode, no broad multipart compatibility claim beyond the documented local workflow, no trace persistence/API/UI, no hosted backend, no production storage guarantee, no broad S3 compatibility claim, no full compatibility matrix, no full streaming chunk-signature validation, and no cross-process write locking guarantee.
 
 ## Intended Users
 
