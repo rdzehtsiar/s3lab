@@ -275,18 +275,14 @@ fn auth_rejection_response(
         }
     };
 
-    if authorization.credential().access_key_id() != LOCAL_ACCESS_KEY_ID {
-        state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-            request_id.as_str(),
-            AuthDecision::Rejected(AuthRejectionReason::InvalidAccessKey),
-        )));
-        return Some(auth_error_response(
-            S3ErrorCode::InvalidAccessKeyId,
-            "The access key id is not configured for this local S3Lab server.",
-            &resource,
-            is_head,
-            request_id,
-        ));
+    if let Some(response) = invalid_access_key_response(
+        state,
+        authorization.credential().access_key_id(),
+        &resource,
+        is_head,
+        request_id,
+    ) {
+        return Some(response);
     }
 
     let verification_request = match owned_sigv4_verification_request(
@@ -376,18 +372,14 @@ fn query_auth_rejection_response(
         }
     };
 
-    if authorization.credential().access_key_id() != LOCAL_ACCESS_KEY_ID {
-        state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-            request_id.as_str(),
-            AuthDecision::Rejected(AuthRejectionReason::InvalidAccessKey),
-        )));
-        return Some(auth_error_response(
-            S3ErrorCode::InvalidAccessKeyId,
-            "The access key id is not configured for this local S3Lab server.",
-            &resource,
-            is_head,
-            request_id,
-        ));
+    if let Some(response) = invalid_access_key_response(
+        state,
+        authorization.credential().access_key_id(),
+        &resource,
+        is_head,
+        request_id,
+    ) {
+        return Some(response);
     }
 
     if let Some(response) = presigned_expiration_rejection_response(
@@ -534,6 +526,30 @@ fn invalid_authorization_response(
         AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
     )));
     Some(response)
+}
+
+fn invalid_access_key_response(
+    state: &ServerState,
+    access_key_id: &str,
+    resource: &str,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Option<Response<Body>> {
+    if access_key_id == LOCAL_ACCESS_KEY_ID {
+        return None;
+    }
+
+    state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+        request_id.as_str(),
+        AuthDecision::Rejected(AuthRejectionReason::InvalidAccessKey),
+    )));
+    Some(auth_error_response(
+        S3ErrorCode::InvalidAccessKeyId,
+        "The access key id is not configured for this local S3Lab server.",
+        resource,
+        is_head,
+        request_id,
+    ))
 }
 
 fn parse_presigned_request_datetime(value: &str) -> Result<OffsetDateTime, ()> {
