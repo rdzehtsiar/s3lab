@@ -6,8 +6,10 @@ use super::journal::{
 };
 use super::key::{encode_bucket_name, encode_object_key, EncodedObjectKey};
 use super::{
-    BucketSummary, ListObjectsOptions, ObjectListing, ObjectListingEntry, PutObjectRequest,
-    Storage, StorageError, StoredObject, StoredObjectMetadata, DEFAULT_OBJECT_CONTENT_TYPE,
+    BucketSummary, CompleteMultipartUploadRequest, CompletedMultipartPart,
+    CreateMultipartUploadRequest, ListObjectsOptions, MultipartUpload, MultipartUploadPartListing,
+    ObjectListing, ObjectListingEntry, PutObjectRequest, Storage, StorageError, StoredObject,
+    StoredObjectMetadata, StoredPart, UploadPartRequest, DEFAULT_OBJECT_CONTENT_TYPE,
     STORAGE_ROOT_DIR,
 };
 use crate::s3::bucket::{is_valid_s3_bucket_name, BucketName};
@@ -35,6 +37,12 @@ const OBJECTS_DIR: &str = "objects";
 const OBJECT_CONTENT_FILE: &str = "content.bin";
 const OBJECT_METADATA_FILE: &str = "metadata.json";
 const OBJECT_METADATA_SCHEMA_VERSION: u32 = 1;
+const MULTIPART_UPLOADS_DIR: &str = "multipart";
+const MULTIPART_UPLOAD_METADATA_FILE: &str = "upload.json";
+const MULTIPART_UPLOAD_METADATA_SCHEMA_VERSION: u32 = 1;
+const MULTIPART_PARTS_DIR: &str = "parts";
+const MULTIPART_PART_METADATA_SCHEMA_VERSION: u32 = 1;
+const MAX_MULTIPART_PART_NUMBER: u32 = 10_000;
 const SNAPSHOT_MANIFEST_FILE: &str = "manifest.json";
 const SNAPSHOT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOTS_DIR: &str = "snapshots";
@@ -51,6 +59,7 @@ static STORAGE_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_NEW_OBJECT_STATE_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_MULTIPART_UPLOAD_REMOVE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_STAGED_RESTORE_RENAME: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -266,6 +275,11 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
                 bucket: bucket.clone(),
             });
         }
+        if self.bucket_has_active_multipart_uploads(bucket)? {
+            return Err(StorageError::BucketNotEmpty {
+                bucket: bucket.clone(),
+            });
+        }
 
         self.commit_and_apply_mutation(JournalMutation::bucket_delete(bucket), || {
             remove_dir_all(&self.bucket_dir(bucket))
@@ -294,8 +308,8 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
             last_modified: now,
             user_metadata: request.user_metadata,
         };
-        let record = ObjectMetadataRecord::from_metadata(&metadata);
         let content_sha256 = sha256_for_bytes(&request.bytes);
+        let record = ObjectMetadataRecord::from_metadata(&metadata, Some(content_sha256.clone()));
         self.store_blob(&content_sha256, &request.bytes)?;
         let mutation = JournalMutation::object_put(JournalObjectPut {
             bucket: request.bucket.as_str().to_owned(),
@@ -487,6 +501,148 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
             Ok(())
         })
     }
+
+    fn create_multipart_upload(
+        &self,
+        request: CreateMultipartUploadRequest,
+    ) -> Result<MultipartUpload, StorageError> {
+        let _guard = lock_storage(&self.root, "create_multipart_upload")?;
+        self.recover_if_dirty()?;
+        self.ensure_bucket(&request.bucket)?;
+        encode_object_key(&request.key)?;
+
+        let upload_id = self.next_multipart_upload_id(&request.bucket, &request.key)?;
+        let initiated = self.clock.now_utc();
+        let upload = MultipartUpload {
+            bucket: request.bucket,
+            key: request.key,
+            upload_id,
+            initiated,
+            content_type: Some(
+                request
+                    .content_type
+                    .unwrap_or_else(|| DEFAULT_OBJECT_CONTENT_TYPE.to_owned()),
+            ),
+            user_metadata: request.user_metadata,
+        };
+        let record = MultipartUploadRecord::from_upload(&upload);
+        self.write_new_multipart_upload_atomically(&upload, &record)?;
+        Ok(upload)
+    }
+
+    fn upload_part(&self, request: UploadPartRequest) -> Result<StoredPart, StorageError> {
+        let _guard = lock_storage(&self.root, "upload_part")?;
+        self.recover_if_dirty()?;
+        self.ensure_bucket(&request.bucket)?;
+        validate_part_number(request.part_number)?;
+        let upload =
+            self.read_multipart_upload(&request.bucket, &request.key, &request.upload_id)?;
+
+        let content_sha256 = sha256_for_bytes(&request.bytes);
+        self.store_blob(&content_sha256, &request.bytes)?;
+        let part = StoredPart {
+            part_number: request.part_number,
+            etag: etag_for_bytes(&request.bytes),
+            content_length: request.bytes.len() as u64,
+            last_modified: self.clock.now_utc(),
+        };
+        let record = MultipartPartRecord::from_part(&part, content_sha256);
+        self.write_multipart_part_atomically(&upload, &record)?;
+        Ok(part)
+    }
+
+    fn list_parts(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &str,
+    ) -> Result<MultipartUploadPartListing, StorageError> {
+        let _guard = lock_storage(&self.root, "list_parts")?;
+        self.recover_if_dirty()?;
+        self.ensure_bucket(bucket)?;
+        let upload = self.read_multipart_upload(bucket, key, upload_id)?;
+        let parts = self.read_multipart_parts(&upload)?;
+        Ok(MultipartUploadPartListing { upload, parts })
+    }
+
+    fn complete_multipart_upload(
+        &self,
+        request: CompleteMultipartUploadRequest,
+    ) -> Result<StoredObjectMetadata, StorageError> {
+        let _guard = lock_storage(&self.root, "complete_multipart_upload")?;
+        self.recover_if_dirty()?;
+        self.ensure_bucket(&request.bucket)?;
+        let encoded_key = encode_object_key(&request.key)?;
+        let upload =
+            self.read_multipart_upload(&request.bucket, &request.key, &request.upload_id)?;
+        let completed_parts = validate_completed_parts(&request.parts)?;
+        let part_records = self.read_completed_multipart_part_records(&upload, completed_parts)?;
+        let part_bytes = self.read_completed_multipart_part_bytes(&part_records)?;
+        let object_bytes = concatenate_parts(&part_bytes);
+        let content_sha256 = sha256_for_bytes(&object_bytes);
+        self.store_blob(&content_sha256, &object_bytes)?;
+
+        let metadata = StoredObjectMetadata {
+            bucket: request.bucket.clone(),
+            key: request.key.clone(),
+            etag: multipart_etag_for_part_bytes(&part_bytes),
+            content_length: object_bytes.len() as u64,
+            content_type: upload.content_type.clone(),
+            last_modified: self.clock.now_utc(),
+            user_metadata: upload.user_metadata.clone(),
+        };
+        let record = ObjectMetadataRecord::from_metadata(&metadata, Some(content_sha256.clone()));
+        let object_dir = self.object_dir(&request.bucket, &encoded_key);
+        let object_state = object_path_state(&object_dir)?;
+        let mutation = JournalMutation::object_put(JournalObjectPut {
+            bucket: request.bucket.as_str().to_owned(),
+            key: request.key.as_str().to_owned(),
+            content_length: metadata.content_length,
+            content_sha256,
+            etag: metadata.etag.clone(),
+            content_type: metadata.content_type.clone(),
+            last_modified_unix_seconds: metadata.last_modified.unix_timestamp(),
+            last_modified_nanoseconds: metadata.last_modified.nanosecond(),
+            user_metadata: metadata.user_metadata.clone(),
+        });
+
+        self.commit_and_apply_mutation(mutation, || {
+            let staged_upload_removal = self.stage_multipart_upload_removal(&upload)?;
+
+            let write_result = match object_state {
+                ObjectPathState::Committed => {
+                    write_object_files_atomically(&object_dir, &object_bytes, &record)
+                }
+                ObjectPathState::Missing => {
+                    write_new_object_dir_atomically(&object_dir, &object_bytes, &record)
+                }
+            };
+
+            if let Err(error) = write_result {
+                if object_state == ObjectPathState::Missing {
+                    remove_new_object_dirs_best_effort(&object_dir);
+                }
+                self.restore_staged_multipart_upload(staged_upload_removal)?;
+                return Err(error);
+            }
+
+            self.discard_staged_multipart_upload(staged_upload_removal);
+            Ok(metadata)
+        })
+    }
+
+    fn abort_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &str,
+    ) -> Result<(), StorageError> {
+        let _guard = lock_storage(&self.root, "abort_multipart_upload")?;
+        self.recover_if_dirty()?;
+        self.ensure_bucket(bucket)?;
+        let upload = self.read_multipart_upload(bucket, key, upload_id)?;
+        self.remove_multipart_upload(&upload)
+    }
 }
 
 impl<C> FilesystemStorage<C> {
@@ -524,6 +680,24 @@ impl<C> FilesystemStorage<C> {
             .join(OBJECTS_DIR)
             .join(encoded_key.shard())
             .join(encoded_key.as_path_component())
+    }
+
+    fn multipart_uploads_dir(&self, bucket: &BucketName) -> PathBuf {
+        self.bucket_dir(bucket).join(MULTIPART_UPLOADS_DIR)
+    }
+
+    fn multipart_upload_dir(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &str,
+    ) -> Result<PathBuf, StorageError> {
+        validate_upload_id(upload_id)?;
+        let encoded_key = encode_object_key(key)?;
+        Ok(self
+            .multipart_uploads_dir(bucket)
+            .join(encoded_key.shard())
+            .join(upload_id))
     }
 
     fn journal(&self) -> Journal {
@@ -909,8 +1083,7 @@ impl<C> FilesystemStorage<C> {
             recovered.content_length,
             &bytes,
         )?;
-        let actual_etag = etag_for_bytes(&bytes);
-        if actual_etag != recovered.etag {
+        if !etag_matches_content_or_is_multipart(&recovered.etag, &bytes) {
             return Err(corrupt_state(
                 blob_path,
                 "recovered blob ETag does not match journal object put",
@@ -927,7 +1100,8 @@ impl<C> FilesystemStorage<C> {
             last_modified: recovered.last_modified,
             user_metadata: recovered.user_metadata,
         };
-        let record = ObjectMetadataRecord::from_metadata(&metadata);
+        let record =
+            ObjectMetadataRecord::from_metadata(&metadata, Some(recovered.content_sha256.clone()));
         let object_dir = self.object_dir(&recovered.bucket, &encoded_key);
         match object_path_state(&object_dir) {
             Ok(ObjectPathState::Committed) => {
@@ -1036,7 +1210,8 @@ impl<C> FilesystemStorage<C> {
         let metadata_path = object_dir.join(OBJECT_METADATA_FILE);
         let content_path = object_dir.join(OBJECT_CONTENT_FILE);
 
-        let metadata = object_metadata_from_path(&metadata_path)?;
+        let record = object_metadata_record_from_path(&metadata_path)?;
+        let metadata = record.to_metadata(&metadata_path)?;
         if metadata.bucket != *bucket || metadata.key != *key {
             return Err(corrupt_state(
                 metadata_path,
@@ -1044,7 +1219,7 @@ impl<C> FilesystemStorage<C> {
             ));
         }
         let bytes = read_object_content_bytes(&content_path)?;
-        validate_object_content_bytes(&content_path, &metadata, &bytes)?;
+        validate_object_content_bytes(&content_path, &metadata, record.content_sha256(), &bytes)?;
 
         Ok(StoredObject { metadata, bytes })
     }
@@ -1058,7 +1233,8 @@ impl<C> FilesystemStorage<C> {
             return Err(corrupt_state(metadata_path, "missing object metadata"));
         }
 
-        let metadata = object_metadata_from_path(metadata_path)?;
+        let record = object_metadata_record_from_path(metadata_path)?;
+        let metadata = record.to_metadata(metadata_path)?;
         if metadata.bucket != *bucket {
             return Err(corrupt_state(
                 metadata_path.to_path_buf(),
@@ -1088,7 +1264,7 @@ impl<C> FilesystemStorage<C> {
         if !path_exists(&content_path)? {
             return Err(corrupt_state(content_path, "missing object content"));
         }
-        validate_object_content(&content_path, &metadata)?;
+        validate_object_content(&content_path, &metadata, record.content_sha256())?;
 
         Ok(metadata)
     }
@@ -1162,6 +1338,324 @@ impl<C> FilesystemStorage<C> {
 
         Ok(VisibleCommittedObjectVisit::Continue)
     }
+
+    fn next_multipart_upload_id(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<String, StorageError> {
+        let base = multipart_upload_id_base(bucket, key);
+        for sequence in 1..=u64::MAX {
+            let upload_id = format!("{base}-{sequence:012}");
+            let upload_dir = self.multipart_upload_dir(bucket, key, &upload_id)?;
+            if !path_exists(&upload_dir)? {
+                return Ok(upload_id);
+            }
+        }
+
+        Err(StorageError::InvalidArgument {
+            message: format!(
+                "could not allocate deterministic multipart upload ID for {}/{}",
+                bucket.as_str(),
+                key.as_str()
+            ),
+        })
+    }
+
+    fn write_new_multipart_upload_atomically(
+        &self,
+        upload: &MultipartUpload,
+        record: &MultipartUploadRecord,
+    ) -> Result<(), StorageError> {
+        let upload_dir =
+            self.multipart_upload_dir(&upload.bucket, &upload.key, &upload.upload_id)?;
+        let Some(shard_dir) = upload_dir.parent() else {
+            return Err(corrupt_state(
+                upload_dir,
+                "multipart upload path has no shard directory",
+            ));
+        };
+        create_dir_all(shard_dir)?;
+        let temporary_upload_dir = create_temporary_sibling_dir(&upload_dir)?;
+
+        let write_result = (|| {
+            write_json_atomically(
+                &temporary_upload_dir.join(MULTIPART_UPLOAD_METADATA_FILE),
+                record,
+            )?;
+            create_dir_all(&temporary_upload_dir.join(MULTIPART_PARTS_DIR))?;
+            sync_parent_dir_best_effort(&temporary_upload_dir.join(MULTIPART_PARTS_DIR));
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            remove_path_best_effort(&temporary_upload_dir);
+            remove_empty_dir_best_effort(shard_dir);
+            return Err(error);
+        }
+
+        if let Err(error) = rename_path(&temporary_upload_dir, &upload_dir) {
+            remove_path_best_effort(&temporary_upload_dir);
+            remove_empty_dir_best_effort(shard_dir);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn read_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &str,
+    ) -> Result<MultipartUpload, StorageError> {
+        let upload_dir = self.multipart_upload_dir(bucket, key, upload_id)?;
+        match multipart_upload_path_state(&upload_dir)? {
+            MultipartUploadPathState::Committed => {}
+            MultipartUploadPathState::Missing => {
+                return Err(StorageError::InvalidArgument {
+                    message: format!(
+                        "multipart upload does not exist in bucket {} for key {}: {}",
+                        bucket.as_str(),
+                        key.as_str(),
+                        upload_id
+                    ),
+                });
+            }
+        }
+
+        let metadata_path = upload_dir.join(MULTIPART_UPLOAD_METADATA_FILE);
+        let upload = multipart_upload_from_path(&metadata_path)?;
+        if upload.bucket != *bucket || upload.key != *key || upload.upload_id != upload_id {
+            return Err(corrupt_state(
+                metadata_path,
+                "multipart upload metadata does not match requested bucket/key/upload ID",
+            ));
+        }
+
+        Ok(upload)
+    }
+
+    fn write_multipart_part_atomically(
+        &self,
+        upload: &MultipartUpload,
+        record: &MultipartPartRecord,
+    ) -> Result<(), StorageError> {
+        let upload_dir =
+            self.multipart_upload_dir(&upload.bucket, &upload.key, &upload.upload_id)?;
+        let part_path = multipart_part_metadata_path(&upload_dir, record.part_number);
+        write_json_atomically(&part_path, record)
+    }
+
+    fn read_multipart_parts(
+        &self,
+        upload: &MultipartUpload,
+    ) -> Result<Vec<StoredPart>, StorageError> {
+        let upload_dir =
+            self.multipart_upload_dir(&upload.bucket, &upload.key, &upload.upload_id)?;
+        let parts_dir = upload_dir.join(MULTIPART_PARTS_DIR);
+        require_storage_directory(&parts_dir, "missing multipart upload parts directory")?;
+
+        let mut parts = Vec::new();
+        for entry in sorted_directory_entries(&parts_dir)? {
+            let path = entry.path();
+            if is_hidden_storage_entry(&entry) {
+                continue;
+            }
+            let Some(metadata) = storage_path_metadata(&path)? else {
+                continue;
+            };
+            if !metadata.is_file() {
+                return Err(corrupt_state(
+                    path,
+                    "multipart part metadata path exists but is not a file",
+                ));
+            }
+
+            let record = multipart_part_record_from_path(&entry.path())?;
+            self.validate_part_blob(&record)?;
+            parts.push(record.into_part(&entry.path())?);
+        }
+
+        parts.sort_by_key(|part| part.part_number);
+        Ok(parts)
+    }
+
+    fn read_completed_multipart_part_records(
+        &self,
+        upload: &MultipartUpload,
+        completed_parts: &[CompletedMultipartPart],
+    ) -> Result<Vec<MultipartPartRecord>, StorageError> {
+        let upload_dir =
+            self.multipart_upload_dir(&upload.bucket, &upload.key, &upload.upload_id)?;
+        let mut records = Vec::with_capacity(completed_parts.len());
+        for completed in completed_parts {
+            let path = multipart_part_metadata_path(&upload_dir, completed.part_number);
+            if !path_exists(&path)? {
+                return Err(StorageError::InvalidArgument {
+                    message: format!(
+                        "completed multipart part {} was not uploaded",
+                        completed.part_number
+                    ),
+                });
+            }
+            let record = multipart_part_record_from_path(&path)?;
+            if record.etag != completed.etag {
+                return Err(StorageError::InvalidArgument {
+                    message: format!(
+                        "completed multipart part {} ETag does not match uploaded part",
+                        completed.part_number
+                    ),
+                });
+            }
+            self.validate_part_blob(&record)?;
+            records.push(record);
+        }
+
+        Ok(records)
+    }
+
+    fn read_completed_multipart_part_bytes(
+        &self,
+        part_records: &[MultipartPartRecord],
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        let mut part_bytes = Vec::with_capacity(part_records.len());
+        for record in part_records {
+            let blob_path = self.blob_path(&record.content_sha256)?;
+            let bytes = read_bytes(&blob_path)?;
+            validate_blob_bytes(
+                &blob_path,
+                &record.content_sha256,
+                record.content_length,
+                &bytes,
+            )?;
+            if etag_for_bytes(&bytes) != record.etag {
+                return Err(corrupt_state(
+                    blob_path,
+                    "multipart part blob ETag does not match part metadata",
+                ));
+            }
+            part_bytes.push(bytes);
+        }
+
+        Ok(part_bytes)
+    }
+
+    fn validate_part_blob(&self, record: &MultipartPartRecord) -> Result<(), StorageError> {
+        validate_part_number(record.part_number)?;
+        let blob_path = self.blob_path(&record.content_sha256)?;
+        let bytes = read_bytes(&blob_path)?;
+        validate_blob_bytes(
+            &blob_path,
+            &record.content_sha256,
+            record.content_length,
+            &bytes,
+        )?;
+        if etag_for_bytes(&bytes) == record.etag {
+            return Ok(());
+        }
+
+        Err(corrupt_state(
+            blob_path,
+            "multipart part blob ETag does not match part metadata",
+        ))
+    }
+
+    fn remove_multipart_upload(&self, upload: &MultipartUpload) -> Result<(), StorageError> {
+        let upload_dir =
+            self.multipart_upload_dir(&upload.bucket, &upload.key, &upload.upload_id)?;
+        #[cfg(test)]
+        if FAIL_NEXT_MULTIPART_UPLOAD_REMOVE.replace(false) {
+            return Err(StorageError::Io {
+                path: upload_dir,
+                source: io::Error::other("forced multipart upload remove failure"),
+            });
+        }
+
+        remove_dir_all(&upload_dir)?;
+        if let Some(shard_dir) = upload_dir.parent() {
+            if path_exists(shard_dir)? && !directory_has_entries(shard_dir)? {
+                remove_dir(shard_dir)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn stage_multipart_upload_removal(
+        &self,
+        upload: &MultipartUpload,
+    ) -> Result<StagedMultipartUploadRemoval, StorageError> {
+        let upload_dir =
+            self.multipart_upload_dir(&upload.bucket, &upload.key, &upload.upload_id)?;
+        #[cfg(test)]
+        if FAIL_NEXT_MULTIPART_UPLOAD_REMOVE.replace(false) {
+            return Err(StorageError::Io {
+                path: upload_dir,
+                source: io::Error::other("forced multipart upload remove failure"),
+            });
+        }
+
+        let backup_dir = move_existing_path_to_backup(&upload_dir)?.ok_or_else(|| {
+            corrupt_state(
+                upload_dir.clone(),
+                "multipart upload disappeared before staged removal",
+            )
+        })?;
+
+        Ok(StagedMultipartUploadRemoval {
+            upload_dir,
+            backup_dir,
+        })
+    }
+
+    fn restore_staged_multipart_upload(
+        &self,
+        staged: StagedMultipartUploadRemoval,
+    ) -> Result<(), StorageError> {
+        rename_path(&staged.backup_dir, &staged.upload_dir)
+    }
+
+    fn discard_staged_multipart_upload(&self, staged: StagedMultipartUploadRemoval) {
+        remove_path_best_effort(&staged.backup_dir);
+        if let Some(shard_dir) = staged.upload_dir.parent() {
+            remove_empty_dir_best_effort(shard_dir);
+        }
+    }
+
+    fn bucket_has_active_multipart_uploads(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<bool, StorageError> {
+        let multipart_dir = self.multipart_uploads_dir(bucket);
+        if !path_exists(&multipart_dir)? {
+            return Ok(false);
+        }
+        require_storage_directory(&multipart_dir, "missing multipart uploads directory")?;
+
+        for shard_entry in sorted_directory_entries(&multipart_dir)? {
+            let Some(shard_path) = visible_storage_directory_path(
+                &shard_entry,
+                "visible multipart upload shard path exists but is not a directory",
+            )?
+            else {
+                continue;
+            };
+
+            for upload_entry in sorted_directory_entries(&shard_path)? {
+                let Some(upload_path) = visible_storage_directory_path(
+                    &upload_entry,
+                    "visible multipart upload path exists but is not a directory",
+                )?
+                else {
+                    continue;
+                };
+
+                multipart_upload_path_state(&upload_path)?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1174,6 +1668,12 @@ enum VisibleCommittedObjectVisit {
 struct StagedSnapshotPath {
     target: PathBuf,
     temporary: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct StagedMultipartUploadRemoval {
+    upload_dir: PathBuf,
+    backup_dir: PathBuf,
 }
 
 impl ObjectListingEntry {
@@ -1260,6 +1760,7 @@ struct ObjectMetadataRecord {
     etag: String,
     content_length: u64,
     content_type: Option<String>,
+    content_sha256: Option<String>,
     last_modified_unix_seconds: i64,
     last_modified_nanoseconds: u32,
     user_metadata: BTreeMap<String, String>,
@@ -1276,8 +1777,31 @@ struct RecoveredObjectPut {
     user_metadata: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct MultipartUploadRecord {
+    schema_version: u32,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    initiated_unix_seconds: i64,
+    initiated_nanoseconds: u32,
+    content_type: Option<String>,
+    user_metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MultipartPartRecord {
+    schema_version: u32,
+    part_number: u32,
+    etag: String,
+    content_length: u64,
+    content_sha256: String,
+    last_modified_unix_seconds: i64,
+    last_modified_nanoseconds: u32,
+}
+
 impl ObjectMetadataRecord {
-    fn from_metadata(metadata: &StoredObjectMetadata) -> Self {
+    fn from_metadata(metadata: &StoredObjectMetadata, content_sha256: Option<String>) -> Self {
         Self {
             schema_version: OBJECT_METADATA_SCHEMA_VERSION,
             bucket: metadata.bucket.as_str().to_owned(),
@@ -1285,18 +1809,22 @@ impl ObjectMetadataRecord {
             etag: metadata.etag.clone(),
             content_length: metadata.content_length,
             content_type: metadata.content_type.clone(),
+            content_sha256,
             last_modified_unix_seconds: metadata.last_modified.unix_timestamp(),
             last_modified_nanoseconds: metadata.last_modified.nanosecond(),
             user_metadata: metadata.user_metadata.clone(),
         }
     }
 
-    fn into_metadata(self, path: &Path) -> Result<StoredObjectMetadata, StorageError> {
+    fn to_metadata(&self, path: &Path) -> Result<StoredObjectMetadata, StorageError> {
         if self.schema_version != OBJECT_METADATA_SCHEMA_VERSION {
             return Err(corrupt_state(
                 path.to_path_buf(),
                 "unsupported object metadata schema version",
             ));
+        }
+        if let Some(content_sha256) = &self.content_sha256 {
+            validate_content_sha256(content_sha256, path)?;
         }
 
         let base_time = OffsetDateTime::from_unix_timestamp(self.last_modified_unix_seconds)
@@ -1316,25 +1844,170 @@ impl ObjectMetadataRecord {
             })?;
 
         Ok(StoredObjectMetadata {
+            bucket: BucketName::new(self.bucket.clone()),
+            key: ObjectKey::new(self.key.clone()),
+            etag: self.etag.clone(),
+            content_length: self.content_length,
+            content_type: self.content_type.clone(),
+            last_modified,
+            user_metadata: self.user_metadata.clone(),
+        })
+    }
+
+    fn content_sha256(&self) -> Option<&str> {
+        self.content_sha256.as_deref()
+    }
+}
+
+impl MultipartUploadRecord {
+    fn from_upload(upload: &MultipartUpload) -> Self {
+        Self {
+            schema_version: MULTIPART_UPLOAD_METADATA_SCHEMA_VERSION,
+            bucket: upload.bucket.as_str().to_owned(),
+            key: upload.key.as_str().to_owned(),
+            upload_id: upload.upload_id.clone(),
+            initiated_unix_seconds: upload.initiated.unix_timestamp(),
+            initiated_nanoseconds: upload.initiated.nanosecond(),
+            content_type: upload.content_type.clone(),
+            user_metadata: upload.user_metadata.clone(),
+        }
+    }
+
+    fn into_upload(self, path: &Path) -> Result<MultipartUpload, StorageError> {
+        if self.schema_version != MULTIPART_UPLOAD_METADATA_SCHEMA_VERSION {
+            return Err(corrupt_state(
+                path.to_path_buf(),
+                "unsupported multipart upload metadata schema version",
+            ));
+        }
+        validate_upload_id(&self.upload_id)?;
+
+        let base_time =
+            OffsetDateTime::from_unix_timestamp(self.initiated_unix_seconds).map_err(|error| {
+                corrupt_state(
+                    path.to_path_buf(),
+                    format!("invalid initiated_unix_seconds: {error}"),
+                )
+            })?;
+        let initiated = base_time
+            .replace_nanosecond(self.initiated_nanoseconds)
+            .map_err(|error| {
+                corrupt_state(
+                    path.to_path_buf(),
+                    format!("invalid initiated_nanoseconds: {error}"),
+                )
+            })?;
+
+        Ok(MultipartUpload {
             bucket: BucketName::new(self.bucket),
             key: ObjectKey::new(self.key),
-            etag: self.etag,
-            content_length: self.content_length,
+            upload_id: self.upload_id,
+            initiated,
             content_type: self.content_type,
-            last_modified,
             user_metadata: self.user_metadata,
         })
     }
 }
 
-fn object_metadata_from_path(path: &Path) -> Result<StoredObjectMetadata, StorageError> {
-    let record: ObjectMetadataRecord = read_json(path)?;
-    record.into_metadata(path)
+impl MultipartPartRecord {
+    fn from_part(part: &StoredPart, content_sha256: String) -> Self {
+        Self {
+            schema_version: MULTIPART_PART_METADATA_SCHEMA_VERSION,
+            part_number: part.part_number,
+            etag: part.etag.clone(),
+            content_length: part.content_length,
+            content_sha256,
+            last_modified_unix_seconds: part.last_modified.unix_timestamp(),
+            last_modified_nanoseconds: part.last_modified.nanosecond(),
+        }
+    }
+
+    fn into_part(self, path: &Path) -> Result<StoredPart, StorageError> {
+        self.validate(path)?;
+        let base_time = OffsetDateTime::from_unix_timestamp(self.last_modified_unix_seconds)
+            .map_err(|error| {
+                corrupt_state(
+                    path.to_path_buf(),
+                    format!("invalid last_modified_unix_seconds: {error}"),
+                )
+            })?;
+        let last_modified = base_time
+            .replace_nanosecond(self.last_modified_nanoseconds)
+            .map_err(|error| {
+                corrupt_state(
+                    path.to_path_buf(),
+                    format!("invalid last_modified_nanoseconds: {error}"),
+                )
+            })?;
+
+        Ok(StoredPart {
+            part_number: self.part_number,
+            etag: self.etag,
+            content_length: self.content_length,
+            last_modified,
+        })
+    }
+
+    fn validate(&self, path: &Path) -> Result<(), StorageError> {
+        if self.schema_version != MULTIPART_PART_METADATA_SCHEMA_VERSION {
+            return Err(corrupt_state(
+                path.to_path_buf(),
+                "unsupported multipart part metadata schema version",
+            ));
+        }
+        validate_part_number(self.part_number)?;
+        validate_content_sha256(&self.content_sha256, path)
+    }
+}
+
+fn object_metadata_record_from_path(path: &Path) -> Result<ObjectMetadataRecord, StorageError> {
+    read_json(path)
+}
+
+fn multipart_upload_from_path(path: &Path) -> Result<MultipartUpload, StorageError> {
+    let record: MultipartUploadRecord = read_json(path)?;
+    record.into_upload(path)
+}
+
+fn multipart_part_record_from_path(path: &Path) -> Result<MultipartPartRecord, StorageError> {
+    let record: MultipartPartRecord = read_json(path)?;
+    record.validate(path)?;
+    Ok(record)
 }
 
 fn etag_for_bytes(bytes: &[u8]) -> String {
     let digest = Md5::digest(bytes);
     format!("\"{}\"", lower_hex(&digest))
+}
+
+fn multipart_etag_for_part_bytes(part_bytes: &[Vec<u8>]) -> String {
+    let mut joined_digests = Vec::with_capacity(part_bytes.len() * 16);
+    for bytes in part_bytes {
+        joined_digests.extend_from_slice(&Md5::digest(bytes));
+    }
+    let digest = Md5::digest(&joined_digests);
+    format!("\"{}-{}\"", lower_hex(&digest), part_bytes.len())
+}
+
+fn etag_matches_content_or_is_multipart(etag: &str, bytes: &[u8]) -> bool {
+    etag_for_bytes(bytes) == etag || is_multipart_etag(etag)
+}
+
+fn is_multipart_etag(etag: &str) -> bool {
+    let Some(inner) = etag
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return false;
+    };
+    let Some((digest, part_count)) = inner.split_once('-') else {
+        return false;
+    };
+
+    digest.len() == 32
+        && digest.bytes().all(is_lower_hex_byte)
+        && !part_count.is_empty()
+        && part_count.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn sha256_for_bytes(bytes: &[u8]) -> String {
@@ -1413,6 +2086,79 @@ fn invalid_list_objects_delimiter() -> StorageError {
     StorageError::InvalidArgument {
         message: "unsupported ListObjectsV2 delimiter".to_owned(),
     }
+}
+
+fn multipart_upload_id_base(bucket: &BucketName, key: &ObjectKey) -> String {
+    let digest = sha256_for_bytes(format!("{}\0{}", bucket.as_str(), key.as_str()).as_bytes());
+    format!("upload-{digest}")
+}
+
+fn validate_upload_id(upload_id: &str) -> Result<(), StorageError> {
+    let valid = upload_id
+        .strip_prefix("upload-")
+        .is_some_and(|rest| rest.len() == 77 && rest.as_bytes()[64] == b'-')
+        && upload_id["upload-".len().."upload-".len() + 64]
+            .bytes()
+            .all(is_lower_hex_byte)
+        && upload_id[upload_id.len() - 12..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit());
+    if valid {
+        return Ok(());
+    }
+
+    Err(StorageError::InvalidArgument {
+        message: "invalid multipart upload ID".to_owned(),
+    })
+}
+
+fn validate_part_number(part_number: u32) -> Result<(), StorageError> {
+    if (1..=MAX_MULTIPART_PART_NUMBER).contains(&part_number) {
+        return Ok(());
+    }
+
+    Err(StorageError::InvalidArgument {
+        message: format!("multipart part number must be between 1 and {MAX_MULTIPART_PART_NUMBER}"),
+    })
+}
+
+fn validate_completed_parts(
+    parts: &[CompletedMultipartPart],
+) -> Result<&[CompletedMultipartPart], StorageError> {
+    if parts.is_empty() {
+        return Err(StorageError::InvalidArgument {
+            message: "complete multipart upload requires at least one part".to_owned(),
+        });
+    }
+
+    let mut previous = None;
+    for part in parts {
+        validate_part_number(part.part_number)?;
+        if previous.is_some_and(|previous| part.part_number <= previous) {
+            return Err(StorageError::InvalidArgument {
+                message: "completed multipart parts must be sorted by ascending part number"
+                    .to_owned(),
+            });
+        }
+        previous = Some(part.part_number);
+    }
+
+    Ok(parts)
+}
+
+fn multipart_part_metadata_path(upload_dir: &Path, part_number: u32) -> PathBuf {
+    upload_dir
+        .join(MULTIPART_PARTS_DIR)
+        .join(format!("{part_number:05}.json"))
+}
+
+fn concatenate_parts(part_bytes: &[Vec<u8>]) -> Vec<u8> {
+    let content_length = part_bytes.iter().map(Vec::len).sum();
+    let mut bytes = Vec::with_capacity(content_length);
+    for part in part_bytes {
+        bytes.extend_from_slice(part);
+    }
+    bytes
 }
 
 fn next_journal_sequence(journal: &Journal) -> Result<u64, StorageError> {
@@ -1785,7 +2531,8 @@ fn validate_bucket_object(
 ) -> Result<(), StorageError> {
     object_path_state(object_path)?;
     let metadata_path = object_path.join(OBJECT_METADATA_FILE);
-    let metadata = object_metadata_from_path(&metadata_path)?;
+    let record = object_metadata_record_from_path(&metadata_path)?;
+    let metadata = record.to_metadata(&metadata_path)?;
     if metadata.bucket != *bucket {
         return Err(corrupt_state(
             metadata_path,
@@ -1812,7 +2559,11 @@ fn validate_bucket_object(
         ));
     }
 
-    validate_object_content(&object_path.join(OBJECT_CONTENT_FILE), &metadata)
+    validate_object_content(
+        &object_path.join(OBJECT_CONTENT_FILE),
+        &metadata,
+        record.content_sha256(),
+    )
 }
 
 fn validate_snapshot_events_contents(
@@ -1942,8 +2693,7 @@ fn validate_journal_object_put_blob(
     })?;
     validate_blob_bytes(&blob_path, content_sha256, content_length, &bytes)?;
 
-    let actual_etag = etag_for_bytes(&bytes);
-    if actual_etag == etag {
+    if etag_matches_content_or_is_multipart(etag, &bytes) {
         return Ok(());
     }
 
@@ -2125,14 +2875,16 @@ fn read_object_content_bytes(path: &Path) -> Result<Vec<u8>, StorageError> {
 fn validate_object_content(
     content_path: &Path,
     metadata: &StoredObjectMetadata,
+    content_sha256: Option<&str>,
 ) -> Result<(), StorageError> {
     let bytes = read_object_content_bytes(content_path)?;
-    validate_object_content_bytes(content_path, metadata, &bytes)
+    validate_object_content_bytes(content_path, metadata, content_sha256, &bytes)
 }
 
 fn validate_object_content_bytes(
     content_path: &Path,
     metadata: &StoredObjectMetadata,
+    content_sha256: Option<&str>,
     bytes: &[u8],
 ) -> Result<(), StorageError> {
     if bytes.len() as u64 != metadata.content_length {
@@ -2142,8 +2894,15 @@ fn validate_object_content_bytes(
         ));
     }
 
-    let actual_etag = etag_for_bytes(bytes);
-    if actual_etag != metadata.etag {
+    if let Some(content_sha256) = content_sha256 {
+        let actual_sha256 = sha256_for_bytes(bytes);
+        if actual_sha256 != content_sha256 {
+            return Err(corrupt_state(
+                content_path.to_path_buf(),
+                "object content SHA-256 does not match metadata",
+            ));
+        }
+    } else if !etag_matches_content_or_is_multipart(&metadata.etag, bytes) {
         return Err(corrupt_state(
             content_path.to_path_buf(),
             "object content ETag does not match metadata",
@@ -2195,6 +2954,12 @@ fn write_new_bucket_state(bucket_dir: &Path, record: &BucketRecord) -> Result<()
         return Err(error);
     }
     sync_parent_dir_best_effort(&bucket_dir.join(OBJECTS_DIR));
+
+    if let Err(error) = create_dir_all(&bucket_dir.join(MULTIPART_UPLOADS_DIR)) {
+        remove_path_best_effort(bucket_dir);
+        return Err(error);
+    }
+    sync_parent_dir_best_effort(&bucket_dir.join(MULTIPART_UPLOADS_DIR));
 
     Ok(())
 }
@@ -2255,6 +3020,11 @@ fn fail_next_new_object_state_write_for_test() {
 }
 
 #[cfg(test)]
+fn fail_next_multipart_upload_remove_for_test() {
+    FAIL_NEXT_MULTIPART_UPLOAD_REMOVE.set(true);
+}
+
+#[cfg(test)]
 fn fail_next_staged_restore_rename_for_test() {
     FAIL_NEXT_STAGED_RESTORE_RENAME.set(true);
 }
@@ -2301,6 +3071,12 @@ enum ObjectPathState {
     Committed,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MultipartUploadPathState {
+    Missing,
+    Committed,
+}
+
 fn object_path_state(object_dir: &Path) -> Result<ObjectPathState, StorageError> {
     let Some(object_dir_metadata) = storage_path_metadata(object_dir)? else {
         return Ok(ObjectPathState::Missing);
@@ -2337,6 +3113,45 @@ fn object_path_state(object_dir: &Path) -> Result<ObjectPathState, StorageError>
     Err(corrupt_state(
         object_dir.to_path_buf(),
         "object directory is missing committed content or metadata",
+    ))
+}
+
+fn multipart_upload_path_state(
+    upload_dir: &Path,
+) -> Result<MultipartUploadPathState, StorageError> {
+    let Some(upload_dir_metadata) = storage_path_metadata(upload_dir)? else {
+        return Ok(MultipartUploadPathState::Missing);
+    };
+    if !upload_dir_metadata.is_dir() {
+        return Err(corrupt_state(
+            upload_dir.to_path_buf(),
+            "multipart upload path exists but is not a directory",
+        ));
+    }
+
+    let metadata_path = upload_dir.join(MULTIPART_UPLOAD_METADATA_FILE);
+    let parts_dir = upload_dir.join(MULTIPART_PARTS_DIR);
+    let upload_metadata = storage_path_metadata(&metadata_path)?;
+    let parts_metadata = storage_path_metadata(&parts_dir)?;
+    if let (Some(upload_metadata), Some(parts_metadata)) = (upload_metadata, parts_metadata) {
+        if !upload_metadata.is_file() {
+            return Err(corrupt_state(
+                metadata_path,
+                "multipart upload metadata path exists but is not a file",
+            ));
+        }
+        if !parts_metadata.is_dir() {
+            return Err(corrupt_state(
+                parts_dir,
+                "multipart upload parts path exists but is not a directory",
+            ));
+        }
+        return Ok(MultipartUploadPathState::Committed);
+    }
+
+    Err(corrupt_state(
+        upload_dir.to_path_buf(),
+        "multipart upload directory is missing committed metadata or parts directory",
     ))
 }
 
@@ -2854,11 +3669,11 @@ fn corrupt_state(path: impl Into<PathBuf>, message: impl Into<String>) -> Storag
 mod tests {
     use super::{
         commit_object_files, create_temporary_sibling_dir,
-        fail_next_new_object_state_write_for_test, fail_next_staged_restore_rename_for_test,
-        move_existing_path_to_backup, replace_file_with_temporary, restore_path_backup,
-        sha256_for_bytes, sibling_path, storage_path_metadata, write_new_bucket_state,
-        write_temporary_sibling, BucketRecord, FilesystemStorage, StorageClock, StorageError,
-        OBJECTS_DIR,
+        fail_next_multipart_upload_remove_for_test, fail_next_new_object_state_write_for_test,
+        fail_next_staged_restore_rename_for_test, move_existing_path_to_backup,
+        replace_file_with_temporary, restore_path_backup, sha256_for_bytes, sibling_path,
+        storage_path_metadata, write_new_bucket_state, write_temporary_sibling, BucketRecord,
+        FilesystemStorage, StorageClock, StorageError, OBJECTS_DIR,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::object::ObjectKey;
@@ -2866,7 +3681,10 @@ mod tests {
         Journal, JournalMutation, JournalObjectPut, JournalPhase, JournalRecord,
     };
     use crate::storage::key::encode_object_key;
-    use crate::storage::{PutObjectRequest, Storage};
+    use crate::storage::{
+        CompleteMultipartUploadRequest, CreateMultipartUploadRequest, PutObjectRequest, Storage,
+        UploadPartRequest,
+    };
     use std::collections::BTreeMap;
     use std::fmt::{Display, Formatter};
     use std::fs;
@@ -3317,6 +4135,114 @@ mod tests {
 
         assert!(matches!(error, StorageError::NoSuchKey { .. }));
         assert!(!storage.dirty_marker_path().exists());
+    }
+
+    #[test]
+    fn complete_multipart_upload_cleanup_failure_does_not_publish_object() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let storage =
+            FilesystemStorage::with_clock(temp_dir.path().to_path_buf(), FixedClock(fixed_time()));
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("large.bin");
+        storage.create_bucket(&bucket).expect("create bucket");
+        let upload = storage
+            .create_multipart_upload(CreateMultipartUploadRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                content_type: None,
+                user_metadata: BTreeMap::new(),
+            })
+            .expect("create multipart upload");
+        let part = storage
+            .upload_part(UploadPartRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload.upload_id.clone(),
+                part_number: 1,
+                bytes: b"body".to_vec(),
+            })
+            .expect("upload part");
+
+        fail_next_multipart_upload_remove_for_test();
+        let error = storage
+            .complete_multipart_upload(CompleteMultipartUploadRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload.upload_id.clone(),
+                parts: vec![crate::storage::CompletedMultipartPart {
+                    part_number: 1,
+                    etag: part.etag,
+                }],
+            })
+            .expect_err("forced cleanup failure fails completion");
+
+        assert!(matches!(error, StorageError::Io { .. }));
+        assert!(matches!(
+            storage
+                .get_object_metadata(&bucket, &key)
+                .expect_err("failed completion does not publish object"),
+            StorageError::NoSuchKey { .. }
+        ));
+        assert!(storage
+            .list_parts(&bucket, &key, &upload.upload_id)
+            .expect("active upload remains after cleanup failure")
+            .parts
+            .iter()
+            .any(|stored_part| stored_part.part_number == 1));
+    }
+
+    #[test]
+    fn complete_multipart_upload_object_write_failure_keeps_active_upload() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let storage =
+            FilesystemStorage::with_clock(temp_dir.path().to_path_buf(), FixedClock(fixed_time()));
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("large.bin");
+        storage.create_bucket(&bucket).expect("create bucket");
+        let upload = storage
+            .create_multipart_upload(CreateMultipartUploadRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                content_type: None,
+                user_metadata: BTreeMap::new(),
+            })
+            .expect("create multipart upload");
+        let part = storage
+            .upload_part(UploadPartRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload.upload_id.clone(),
+                part_number: 1,
+                bytes: b"body".to_vec(),
+            })
+            .expect("upload part");
+
+        fail_next_new_object_state_write_for_test();
+        let error = storage
+            .complete_multipart_upload(CompleteMultipartUploadRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload.upload_id.clone(),
+                parts: vec![crate::storage::CompletedMultipartPart {
+                    part_number: 1,
+                    etag: part.etag,
+                }],
+            })
+            .expect_err("forced object write failure fails completion");
+
+        assert!(matches!(error, StorageError::Io { .. }));
+        assert!(matches!(
+            storage
+                .get_object_metadata(&bucket, &key)
+                .expect_err("failed completion does not publish object"),
+            StorageError::NoSuchKey { .. }
+        ));
+        assert!(storage
+            .list_parts(&bucket, &key, &upload.upload_id)
+            .expect("active upload remains after object write failure")
+            .parts
+            .iter()
+            .any(|stored_part| stored_part.part_number == 1));
     }
 
     #[test]

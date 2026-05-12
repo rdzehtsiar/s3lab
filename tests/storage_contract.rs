@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use md5::Md5;
 use s3lab::s3::bucket::BucketName;
 use s3lab::s3::object::{ObjectKey, MAX_OBJECT_KEY_UTF8_BYTES};
 use s3lab::storage::fs::{FilesystemStorage, StorageClock};
 use s3lab::storage::{
+    CompleteMultipartUploadRequest, CompletedMultipartPart, CreateMultipartUploadRequest,
     ListObjectsOptions, ObjectListingEntry, PutObjectRequest, Storage, StorageError,
-    StoredObjectMetadata, STORAGE_ROOT_DIR,
+    StoredObjectMetadata, UploadPartRequest, STORAGE_ROOT_DIR,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -1004,6 +1006,420 @@ fn put_object_overwrites_existing_object() {
             .user_metadata["version"],
         "2"
     );
+}
+
+#[test]
+fn create_multipart_upload_persists_initiation_metadata_with_deterministic_id() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("large.bin");
+    storage.create_bucket(&bucket).expect("create bucket");
+
+    let upload = storage
+        .create_multipart_upload(CreateMultipartUploadRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            content_type: Some("application/octet-stream".to_owned()),
+            user_metadata: BTreeMap::from([("owner".to_owned(), "local".to_owned())]),
+        })
+        .expect("create multipart upload");
+
+    assert_eq!(upload.bucket, bucket);
+    assert_eq!(upload.key, key);
+    assert!(upload.upload_id.starts_with("upload-"));
+    assert!(upload.upload_id.ends_with("-000000000001"));
+    assert_eq!(upload.initiated, fixed_time());
+    assert_eq!(
+        upload.content_type.as_deref(),
+        Some("application/octet-stream")
+    );
+    assert_eq!(upload.user_metadata["owner"], "local");
+    assert!(filesystem_path_components(temp_dir.path())
+        .iter()
+        .any(|component| component == "multipart"));
+
+    let reopened =
+        FilesystemStorage::with_clock(temp_dir.path().to_path_buf(), FixedClock(fixed_time()));
+    assert_eq!(
+        reopened
+            .list_parts(&bucket, &ObjectKey::new("large.bin"), &upload.upload_id)
+            .expect("persisted multipart upload is readable")
+            .upload,
+        upload
+    );
+}
+
+#[test]
+fn upload_part_overwrites_and_list_parts_returns_sorted_parts() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("large.bin");
+    storage.create_bucket(&bucket).expect("create bucket");
+    let upload = storage
+        .create_multipart_upload(create_multipart_request(&bucket, key.as_str()))
+        .expect("create multipart upload");
+
+    let part_three = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            3,
+            b"three",
+        ))
+        .expect("upload part 3");
+    let part_one = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            1,
+            b"one",
+        ))
+        .expect("upload part 1");
+    let overwritten = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            3,
+            b"THREE",
+        ))
+        .expect("overwrite part 3");
+
+    assert_ne!(part_three.etag, overwritten.etag);
+    assert_eq!(overwritten.content_length, 5);
+    assert_eq!(
+        storage
+            .list_parts(&bucket, &key, &upload.upload_id)
+            .expect("list parts")
+            .parts
+            .iter()
+            .map(|part| (part.part_number, part.etag.as_str(), part.content_length))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, part_one.etag.as_str(), 3),
+            (3, overwritten.etag.as_str(), 5)
+        ]
+    );
+    assert!(blob_path(temp_dir.path(), b"one").is_file());
+    assert!(blob_path(temp_dir.path(), b"THREE").is_file());
+}
+
+#[test]
+fn complete_multipart_upload_creates_normal_object_and_removes_active_upload() {
+    let (_temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("large.bin");
+    storage.create_bucket(&bucket).expect("create bucket");
+    let upload = storage
+        .create_multipart_upload(CreateMultipartUploadRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            content_type: Some("application/octet-stream".to_owned()),
+            user_metadata: BTreeMap::from([("owner".to_owned(), "local".to_owned())]),
+        })
+        .expect("create multipart upload");
+    let first = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            1,
+            b"hello ",
+        ))
+        .expect("upload first part");
+    let second = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            2,
+            b"world",
+        ))
+        .expect("upload second part");
+
+    let completed = storage
+        .complete_multipart_upload(CompleteMultipartUploadRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload.upload_id.clone(),
+            parts: vec![
+                completed_part(1, &first.etag),
+                completed_part(2, &second.etag),
+            ],
+        })
+        .expect("complete multipart upload");
+
+    assert_metadata_matches(&completed, &bucket, key.as_str(), 11);
+    assert_eq!(
+        completed.etag,
+        multipart_etag_for([b"hello ".as_slice(), b"world".as_slice()])
+    );
+    assert_eq!(
+        completed.content_type.as_deref(),
+        Some("application/octet-stream")
+    );
+    assert_eq!(completed.user_metadata["owner"], "local");
+    assert_eq!(
+        storage
+            .get_object_bytes(&bucket, &key)
+            .expect("completed object is readable"),
+        b"hello world"
+    );
+    assert!(matches!(
+        storage
+            .list_parts(&bucket, &key, &upload.upload_id)
+            .expect_err("completed upload is removed"),
+        StorageError::InvalidArgument { .. }
+    ));
+}
+
+#[test]
+fn completed_multipart_object_detects_same_length_content_corruption() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("large.bin");
+    storage.create_bucket(&bucket).expect("create bucket");
+    let upload = storage
+        .create_multipart_upload(create_multipart_request(&bucket, key.as_str()))
+        .expect("create multipart upload");
+    let first = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            1,
+            b"hello ",
+        ))
+        .expect("upload first part");
+    let second = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            2,
+            b"world",
+        ))
+        .expect("upload second part");
+    storage
+        .complete_multipart_upload(CompleteMultipartUploadRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload.upload_id,
+            parts: vec![
+                completed_part(1, &first.etag),
+                completed_part(2, &second.etag),
+            ],
+        })
+        .expect("complete multipart upload");
+
+    fs::write(
+        object_paths(temp_dir.path(), &bucket, &key).content,
+        b"HELLO WORLD",
+    )
+    .expect("mutate completed object content to same length");
+
+    let object_error = storage
+        .get_object(&bucket, &key)
+        .expect_err("object read rejects same-length corruption");
+    let metadata_error = storage
+        .get_object_metadata(&bucket, &key)
+        .expect_err("metadata read rejects same-length corruption");
+    let list_error = storage
+        .list_objects(&bucket, ListObjectsOptions::default())
+        .expect_err("list rejects same-length corruption");
+
+    assert!(matches!(object_error, StorageError::CorruptState { .. }));
+    assert!(matches!(metadata_error, StorageError::CorruptState { .. }));
+    assert!(matches!(list_error, StorageError::CorruptState { .. }));
+}
+
+#[test]
+fn multipart_upload_rejects_invalid_part_number() {
+    let (_temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("large.bin");
+    storage.create_bucket(&bucket).expect("create bucket");
+    let upload = storage
+        .create_multipart_upload(create_multipart_request(&bucket, key.as_str()))
+        .expect("create multipart upload");
+
+    let error = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            0,
+            b"part",
+        ))
+        .expect_err("part number zero is invalid");
+
+    assert!(matches!(error, StorageError::InvalidArgument { .. }));
+}
+
+#[test]
+fn complete_multipart_upload_rejects_missing_wrong_duplicate_and_unsorted_parts() {
+    let (_temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("large.bin");
+    storage.create_bucket(&bucket).expect("create bucket");
+    let upload = storage
+        .create_multipart_upload(create_multipart_request(&bucket, key.as_str()))
+        .expect("create multipart upload");
+    let first = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            1,
+            b"one",
+        ))
+        .expect("upload first part");
+    let second = storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            2,
+            b"two",
+        ))
+        .expect("upload second part");
+
+    for parts in [
+        vec![completed_part(3, "\"missing\"")],
+        vec![completed_part(1, "\"bad-etag\"")],
+        vec![
+            completed_part(1, &first.etag),
+            completed_part(1, &first.etag),
+        ],
+        vec![
+            completed_part(2, &second.etag),
+            completed_part(1, &first.etag),
+        ],
+    ] {
+        let error = storage
+            .complete_multipart_upload(CompleteMultipartUploadRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload.upload_id.clone(),
+                parts,
+            })
+            .expect_err("invalid completed part list fails");
+
+        assert!(matches!(error, StorageError::InvalidArgument { .. }));
+        assert!(matches!(
+            storage
+                .get_object_metadata(&bucket, &key)
+                .expect_err("failed completion does not create object"),
+            StorageError::NoSuchKey { .. }
+        ));
+    }
+}
+
+#[test]
+fn abort_multipart_upload_removes_active_upload_without_creating_object() {
+    let (_temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("large.bin");
+    storage.create_bucket(&bucket).expect("create bucket");
+    let upload = storage
+        .create_multipart_upload(create_multipart_request(&bucket, key.as_str()))
+        .expect("create multipart upload");
+    storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            1,
+            b"part",
+        ))
+        .expect("upload part");
+
+    storage
+        .abort_multipart_upload(&bucket, &key, &upload.upload_id)
+        .expect("abort multipart upload");
+
+    assert!(matches!(
+        storage
+            .list_parts(&bucket, &key, &upload.upload_id)
+            .expect_err("aborted upload is removed"),
+        StorageError::InvalidArgument { .. }
+    ));
+    assert!(matches!(
+        storage
+            .get_object_metadata(&bucket, &key)
+            .expect_err("abort does not create object"),
+        StorageError::NoSuchKey { .. }
+    ));
+}
+
+#[test]
+fn active_multipart_uploads_do_not_affect_object_list_read_or_head() {
+    let (_temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("large.bin");
+    storage.create_bucket(&bucket).expect("create bucket");
+    let upload = storage
+        .create_multipart_upload(create_multipart_request(&bucket, key.as_str()))
+        .expect("create multipart upload");
+    storage
+        .upload_part(upload_part_request(
+            &bucket,
+            &key,
+            &upload.upload_id,
+            1,
+            b"part",
+        ))
+        .expect("upload part");
+
+    assert!(storage
+        .list_objects(&bucket, ListObjectsOptions::default())
+        .expect("list objects")
+        .objects
+        .is_empty());
+    assert!(matches!(
+        storage
+            .get_object_bytes(&bucket, &key)
+            .expect_err("active upload is not readable as object"),
+        StorageError::NoSuchKey { .. }
+    ));
+    assert!(matches!(
+        storage
+            .get_object_metadata(&bucket, &key)
+            .expect_err("active upload has no object metadata"),
+        StorageError::NoSuchKey { .. }
+    ));
+}
+
+#[test]
+fn delete_bucket_with_active_multipart_upload_is_deterministic() {
+    let (temp_dir, storage) = storage();
+    let bucket = BucketName::new("example-bucket");
+    let key = ObjectKey::new("large.bin");
+    storage.create_bucket(&bucket).expect("create bucket");
+    let upload = storage
+        .create_multipart_upload(create_multipart_request(&bucket, key.as_str()))
+        .expect("create multipart upload");
+
+    let error = storage
+        .delete_bucket(&bucket)
+        .expect_err("active multipart upload keeps bucket non-empty");
+
+    assert!(matches!(
+        error,
+        StorageError::BucketNotEmpty { bucket: failed_bucket }
+            if failed_bucket == bucket
+    ));
+    assert!(bucket_dir(temp_dir.path(), &bucket).is_dir());
+
+    storage
+        .abort_multipart_upload(&bucket, &key, &upload.upload_id)
+        .expect("abort multipart upload");
+    storage
+        .delete_bucket(&bucket)
+        .expect("bucket delete succeeds after abort");
+    assert!(!bucket_dir(temp_dir.path(), &bucket).exists());
 }
 
 #[test]
@@ -2504,6 +2920,38 @@ fn put_request(bucket: &BucketName, key: &str, bytes: &[u8]) -> PutObjectRequest
     }
 }
 
+fn create_multipart_request(bucket: &BucketName, key: &str) -> CreateMultipartUploadRequest {
+    CreateMultipartUploadRequest {
+        bucket: bucket.clone(),
+        key: ObjectKey::new(key),
+        content_type: None,
+        user_metadata: BTreeMap::new(),
+    }
+}
+
+fn upload_part_request(
+    bucket: &BucketName,
+    key: &ObjectKey,
+    upload_id: &str,
+    part_number: u32,
+    bytes: &[u8],
+) -> UploadPartRequest {
+    UploadPartRequest {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        upload_id: upload_id.to_owned(),
+        part_number,
+        bytes: bytes.to_vec(),
+    }
+}
+
+fn completed_part(part_number: u32, etag: &str) -> CompletedMultipartPart {
+    CompletedMultipartPart {
+        part_number,
+        etag: etag.to_owned(),
+    }
+}
+
 fn assert_metadata_matches(
     metadata: &StoredObjectMetadata,
     bucket: &BucketName,
@@ -2728,6 +3176,22 @@ fn snapshot_blob_path(snapshot_root: &Path, bytes: &[u8]) -> PathBuf {
         .join("blobs")
         .join(&content_sha256[..2])
         .join(content_sha256)
+}
+
+fn blob_path(root: &Path, bytes: &[u8]) -> PathBuf {
+    let content_sha256 = sha256_lower_hex_bytes(bytes);
+    root.join("blobs")
+        .join(&content_sha256[..2])
+        .join(content_sha256)
+}
+
+fn multipart_etag_for<const N: usize>(parts: [&[u8]; N]) -> String {
+    let mut joined_digests = Vec::new();
+    for part in parts {
+        joined_digests.extend_from_slice(&Md5::digest(part));
+    }
+    let digest = Md5::digest(joined_digests);
+    format!("\"{}-{}\"", lower_hex(&digest), N)
 }
 
 fn sha256_lower_hex(value: &str) -> String {

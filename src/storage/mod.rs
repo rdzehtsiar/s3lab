@@ -49,6 +49,52 @@ pub trait Storage {
     ) -> Result<ObjectListing, StorageError>;
 
     fn delete_object(&self, bucket: &BucketName, key: &ObjectKey) -> Result<(), StorageError>;
+
+    fn create_multipart_upload(
+        &self,
+        _request: CreateMultipartUploadRequest,
+    ) -> Result<MultipartUpload, StorageError> {
+        Err(StorageError::InvalidArgument {
+            message: "multipart storage is not implemented by this storage backend".to_owned(),
+        })
+    }
+
+    fn upload_part(&self, _request: UploadPartRequest) -> Result<StoredPart, StorageError> {
+        Err(StorageError::InvalidArgument {
+            message: "multipart storage is not implemented by this storage backend".to_owned(),
+        })
+    }
+
+    fn list_parts(
+        &self,
+        _bucket: &BucketName,
+        _key: &ObjectKey,
+        _upload_id: &str,
+    ) -> Result<MultipartUploadPartListing, StorageError> {
+        Err(StorageError::InvalidArgument {
+            message: "multipart storage is not implemented by this storage backend".to_owned(),
+        })
+    }
+
+    fn complete_multipart_upload(
+        &self,
+        _request: CompleteMultipartUploadRequest,
+    ) -> Result<StoredObjectMetadata, StorageError> {
+        Err(StorageError::InvalidArgument {
+            message: "multipart storage is not implemented by this storage backend".to_owned(),
+        })
+    }
+
+    fn abort_multipart_upload(
+        &self,
+        _bucket: &BucketName,
+        _key: &ObjectKey,
+        _upload_id: &str,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::InvalidArgument {
+            message: "multipart storage is not implemented by this storage backend".to_owned(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -63,6 +109,61 @@ pub struct PutObjectRequest {
     pub bytes: Vec<u8>,
     pub content_type: Option<String>,
     pub user_metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CreateMultipartUploadRequest {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub content_type: Option<String>,
+    pub user_metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct UploadPartRequest {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub upload_id: String,
+    pub part_number: u32,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompleteMultipartUploadRequest {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub upload_id: String,
+    pub parts: Vec<CompletedMultipartPart>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompletedMultipartPart {
+    pub part_number: u32,
+    pub etag: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MultipartUpload {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub upload_id: String,
+    pub initiated: OffsetDateTime,
+    pub content_type: Option<String>,
+    pub user_metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MultipartUploadPartListing {
+    pub upload: MultipartUpload,
+    pub parts: Vec<StoredPart>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StoredPart {
+    pub part_number: u32,
+    pub etag: String,
+    pub content_length: u64,
+    pub last_modified: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -158,7 +259,9 @@ pub enum StorageError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ListObjectsOptions, ObjectListing, PutObjectRequest, StorageError, StoredObjectMetadata,
+        CompletedMultipartPart, CreateMultipartUploadRequest, ListObjectsOptions, MultipartUpload,
+        ObjectListing, PutObjectRequest, StorageError, StoredObjectMetadata, StoredPart,
+        UploadPartRequest,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::object::ObjectKey;
@@ -220,6 +323,55 @@ mod tests {
         assert_eq!(request.bytes, b"hello");
         assert_eq!(request.content_type.as_deref(), Some("text/plain"));
         assert_eq!(request.user_metadata["owner"], "local");
+    }
+
+    #[test]
+    fn multipart_types_preserve_identity_parts_and_initiation_metadata() {
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("large-object.bin");
+        let user_metadata = BTreeMap::from([("owner".to_owned(), "local".to_owned())]);
+
+        let create = CreateMultipartUploadRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            content_type: Some("application/octet-stream".to_owned()),
+            user_metadata: user_metadata.clone(),
+        };
+        let upload = MultipartUpload {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: "upload-1".to_owned(),
+            initiated: fixed_last_modified(),
+            content_type: create.content_type.clone(),
+            user_metadata: create.user_metadata.clone(),
+        };
+        let part = StoredPart {
+            part_number: 2,
+            etag: "\"7d793037a0760186574b0282f2f435e7\"".to_owned(),
+            content_length: 4,
+            last_modified: fixed_last_modified(),
+        };
+        let upload_part = UploadPartRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload.upload_id.clone(),
+            part_number: part.part_number,
+            bytes: b"part".to_vec(),
+        };
+        let completed = CompletedMultipartPart {
+            part_number: part.part_number,
+            etag: part.etag.clone(),
+        };
+
+        assert_eq!(create.bucket, bucket);
+        assert_eq!(create.key, key);
+        assert_eq!(
+            upload.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(upload.user_metadata, user_metadata);
+        assert_eq!(upload_part.bytes, b"part");
+        assert_eq!(completed.etag, part.etag);
     }
 
     #[test]
