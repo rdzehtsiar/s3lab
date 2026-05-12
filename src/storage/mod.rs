@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod fs;
+pub mod journal;
 pub(crate) mod key;
 
 use crate::s3::bucket::BucketName;
