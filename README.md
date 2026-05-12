@@ -37,7 +37,9 @@ For signed `PUT` object requests, S3Lab checks literal `x-amz-content-sha256` bo
 
 Milestone 3 adds narrow presigned URL support for path-style object `GET` and `PUT` requests against the offline local endpoint. S3Lab validates query-string SigV4 parameters, static local credentials `s3lab` / `s3lab-secret`, and expiration. No cloud account is required. See [Milestone 3 Smoke Tests](./docs/milestone3-smoke-tests.md) for local presigned URL recipes.
 
-Current limitations include no virtual-host style routing, no session-token presigned URLs, no configurable credentials, no strict authentication mode, no multipart uploads, no trace persistence/API/UI, and no full streaming chunk-signature validation. These limitations should not be read as a broad S3 compatibility claim.
+Milestone 4 adds local storage durability tools for the current object model: a local WAL/event log, content-addressed object blobs, crash recovery for committed dirty mutations, named snapshots, snapshot restore, and reset that removes current state while preserving snapshots. See [Milestone 4 Smoke Tests](./docs/milestone4-smoke-tests.md) for offline snapshot and reset recipes.
+
+Current limitations include no virtual-host style routing, no session-token presigned URLs, no configurable credentials, no strict authentication mode, no multipart uploads or multipart snapshot semantics beyond the current object model, no trace persistence/API/UI, no hosted backend, no production storage guarantee, no broad S3 compatibility claim, no full streaming chunk-signature validation, and no cross-process write locking guarantee.
 
 ## Intended Users
 
