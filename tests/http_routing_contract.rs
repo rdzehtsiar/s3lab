@@ -843,6 +843,67 @@ async fn bad_presigned_query_signature_is_rejected_without_storage_call() {
 }
 
 #[tokio::test]
+async fn missing_required_presigned_query_param_is_rejected_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let uri = uri_without_query_param(
+        &presigned_object_uri(Method::GET, "/bucket/object.txt", "s3lab", &[]),
+        "X-Amz-Expires",
+    );
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::GET,
+            &uri,
+            &[("host", "localhost")],
+            Body::empty(),
+        ))
+        .await
+        .expect("missing presigned query parameter response");
+
+    assert_s3_error_xml_with_message(
+        response,
+        StatusCode::BAD_REQUEST,
+        "AuthorizationHeaderMalformed",
+        "Include the required X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders, and X-Amz-Signature query parameters.",
+        "/bucket/object.txt",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
+async fn duplicate_presigned_query_auth_param_is_rejected_without_storage_call() {
+    let storage = RecordingStorage::default();
+    let calls = Arc::clone(&storage.calls);
+    let app = router(test_server_state(storage));
+    let uri = format!(
+        "{}&X-Amz-Algorithm=AWS4-HMAC-SHA256",
+        presigned_object_uri(Method::GET, "/bucket/object.txt", "s3lab", &[])
+    );
+
+    let response = app
+        .oneshot(request_with_headers(
+            Method::GET,
+            &uri,
+            &[("host", "localhost")],
+            Body::empty(),
+        ))
+        .await
+        .expect("duplicate presigned query parameter response");
+
+    assert_s3_error_xml(
+        response,
+        StatusCode::BAD_REQUEST,
+        "InvalidArgument",
+        "/bucket/object.txt",
+    )
+    .await;
+    assert_no_storage_calls(&calls);
+}
+
+#[tokio::test]
 async fn presigned_put_literal_payload_hash_mismatch_is_rejected_without_storage_call() {
     let storage = RecordingStorage::default();
     let calls = Arc::clone(&storage.calls);
@@ -3756,6 +3817,21 @@ fn replace_query_signature(uri: &str, signature: &str) -> String {
         .map(|index| &old_signature[index..])
         .unwrap_or("");
     format!("{prefix}X-Amz-Signature={signature}{suffix}")
+}
+
+fn uri_without_query_param(uri: &str, param_name: &str) -> String {
+    let (path, query) = uri.split_once('?').expect("query string");
+    let query = query
+        .split('&')
+        .filter(|pair| {
+            pair.split_once('=')
+                .map(|(name, _value)| name != param_name)
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    format!("{path}?{query}")
 }
 
 fn query_signature_from_uri(uri: &str) -> &str {

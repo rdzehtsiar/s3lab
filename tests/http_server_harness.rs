@@ -7,6 +7,10 @@ use hyper::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use hyper::http::{Method, Response, StatusCode};
 use s3lab::s3::bucket::BucketName;
 use s3lab::s3::object::ObjectKey;
+use s3lab::s3::sigv4::{
+    build_canonical_request, build_string_to_sign, parse_query_authorization,
+    SIGV4_UNSIGNED_PAYLOAD,
+};
 use s3lab::storage::fs::{FilesystemStorage, StorageClock};
 use s3lab::storage::STORAGE_ROOT_DIR;
 use sha2::{Digest, Sha256};
@@ -146,6 +150,80 @@ async fn object_lifecycle_over_real_http() {
     assert_eq!(
         response_text(missing).await.expect("missing object body"),
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Resource>/bucket-a/object.txt</Resource><RequestId>s3lab-test-request-id</RequestId></Error>"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn presigned_object_get_and_put_round_trip_over_real_http() {
+    let server = TestServer::start().await;
+    let host = server
+        .base_url()
+        .strip_prefix("http://")
+        .expect("loopback HTTP base URL");
+
+    assert_eq!(
+        request(Method::PUT, &server.url("/bucket-a"), Bytes::new(), &[])
+            .await
+            .expect("create bucket")
+            .status(),
+        StatusCode::OK
+    );
+
+    let put_path = presigned_object_path_query(Method::PUT, "/bucket-a/object.txt", host);
+    let put = request(
+        Method::PUT,
+        &server.url(&put_path),
+        Bytes::from_static(b"hello from real presigned http"),
+        &[
+            ("host", host),
+            ("content-type", "text/plain"),
+            ("x-amz-meta-case", "value"),
+        ],
+    )
+    .await
+    .expect("presigned put object over HTTP");
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_eq!(
+        put.headers()
+            .get("x-amz-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    assert!(response_bytes(put).await.expect("put body").is_empty());
+
+    let get_path = presigned_object_path_query(Method::GET, "/bucket-a/object.txt", host);
+    let get = request(
+        Method::GET,
+        &server.url(&get_path),
+        Bytes::new(),
+        &[("host", host)],
+    )
+    .await
+    .expect("presigned get object over HTTP");
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(
+        get.headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        get.headers()
+            .get("x-amz-meta-case")
+            .and_then(|value| value.to_str().ok()),
+        Some("value")
+    );
+    assert_eq!(
+        get.headers()
+            .get("x-amz-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("s3lab-test-request-id")
+    );
+    assert_eq!(
+        response_bytes(get).await.expect("get body"),
+        Bytes::from_static(b"hello from real presigned http")
     );
 
     server.shutdown().await;
@@ -721,6 +799,131 @@ fn deterministic_bytes(len: usize) -> Bytes {
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>(),
     )
+}
+
+fn presigned_object_path_query(method: Method, path: &str, host: &str) -> String {
+    let request_datetime = "20260512T010203Z";
+    let credential_scope = "20260512/us-east-1/s3/aws4_request";
+    let mut query = vec![
+        ("X-Amz-Algorithm".to_owned(), "AWS4-HMAC-SHA256".to_owned()),
+        (
+            "X-Amz-Credential".to_owned(),
+            format!("s3lab/{credential_scope}"),
+        ),
+        ("X-Amz-Date".to_owned(), request_datetime.to_owned()),
+        ("X-Amz-Expires".to_owned(), "60".to_owned()),
+        ("X-Amz-SignedHeaders".to_owned(), "host".to_owned()),
+    ];
+    let unsigned_query_refs = query_refs(&query);
+    let mut query_with_placeholder = query.clone();
+    query_with_placeholder.push((
+        "X-Amz-Signature".to_owned(),
+        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+    ));
+    let placeholder_refs = query_refs(&query_with_placeholder);
+    let authorization =
+        parse_query_authorization(&placeholder_refs).expect("presigned query shape");
+    let canonical_request = build_canonical_request(
+        method.as_str(),
+        path,
+        &unsigned_query_refs,
+        &[("host", host)],
+        authorization.signed_headers(),
+        SIGV4_UNSIGNED_PAYLOAD,
+    )
+    .expect("canonical presigned request");
+    let string_to_sign = build_string_to_sign(
+        request_datetime,
+        authorization.credential().scope(),
+        &canonical_request,
+    );
+    let signature = sigv4_signature(
+        "s3lab-secret",
+        "20260512",
+        "us-east-1",
+        "s3",
+        &string_to_sign,
+    );
+    query.push(("X-Amz-Signature".to_owned(), signature));
+
+    format!("{path}?{}", encoded_query(&query))
+}
+
+fn query_refs(query: &[(String, String)]) -> Vec<(&str, &str)> {
+    query
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect()
+}
+
+fn encoded_query(query: &[(String, String)]) -> String {
+    query
+        .iter()
+        .map(|(name, value)| format!("{}={}", aws_query_encode(name), aws_query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn aws_query_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn sigv4_signature(
+    secret: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+    string_to_sign: &str,
+) -> String {
+    let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let region_key = hmac_sha256(&date_key, region.as_bytes());
+    let service_key = hmac_sha256(&region_key, service.as_bytes());
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+    hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()))
+}
+
+fn hmac_sha256(key: &[u8], value: &[u8]) -> [u8; 32] {
+    const HMAC_SHA256_BLOCK_SIZE: usize = 64;
+    let mut normalized_key = [0_u8; HMAC_SHA256_BLOCK_SIZE];
+    if key.len() > HMAC_SHA256_BLOCK_SIZE {
+        let digest = Sha256::digest(key);
+        normalized_key[..digest.len()].copy_from_slice(&digest);
+    } else {
+        normalized_key[..key.len()].copy_from_slice(key);
+    }
+
+    let mut outer_key_pad = [0x5c_u8; HMAC_SHA256_BLOCK_SIZE];
+    let mut inner_key_pad = [0x36_u8; HMAC_SHA256_BLOCK_SIZE];
+    for index in 0..HMAC_SHA256_BLOCK_SIZE {
+        outer_key_pad[index] ^= normalized_key[index];
+        inner_key_pad[index] ^= normalized_key[index];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_key_pad);
+    inner.update(value);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_key_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn hex_encode(value: &[u8]) -> String {
+    value
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
