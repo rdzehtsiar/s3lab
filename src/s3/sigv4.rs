@@ -1875,19 +1875,10 @@ mod tests {
             parse_query_authorization(&query_refs).expect("valid presigned query authorization");
 
         assert_eq!(authorization.payload_hash(), SIGV4_UNSIGNED_PAYLOAD);
-        assert!(verify_query_signature(
-            &authorization,
-            TEST_SECRET_ACCESS_KEY,
-            SigV4QueryVerificationRequest {
-                method: "GET",
-                path: "/example-bucket/object.txt",
-                query: &query_refs,
-                headers: &[("host", "examplebucket.s3.amazonaws.com")],
-            },
-        )
-        .expect("presigned query signature should verify")
-        .canonical_request()
-        .ends_with(SIGV4_UNSIGNED_PAYLOAD));
+        assert!(
+            verified_presigned_query_canonical_request(&authorization, &query_refs)
+                .ends_with(SIGV4_UNSIGNED_PAYLOAD)
+        );
     }
 
     #[test]
@@ -1899,19 +1890,10 @@ mod tests {
 
         assert_eq!(authorization.content_sha256(), Some(EMPTY_PAYLOAD_SHA256));
         assert_eq!(authorization.payload_hash(), EMPTY_PAYLOAD_SHA256);
-        assert!(verify_query_signature(
-            &authorization,
-            TEST_SECRET_ACCESS_KEY,
-            SigV4QueryVerificationRequest {
-                method: "GET",
-                path: "/example-bucket/object.txt",
-                query: &query_refs,
-                headers: &[("host", "examplebucket.s3.amazonaws.com")],
-            },
-        )
-        .expect("presigned query signature should verify")
-        .canonical_request()
-        .ends_with(EMPTY_PAYLOAD_SHA256));
+        assert!(
+            verified_presigned_query_canonical_request(&authorization, &query_refs)
+                .ends_with(EMPTY_PAYLOAD_SHA256)
+        );
     }
 
     #[test]
@@ -2024,6 +2006,25 @@ mod tests {
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect()
+    }
+
+    fn verified_presigned_query_canonical_request(
+        authorization: &super::SigV4QueryAuthorization,
+        query: &[(&str, &str)],
+    ) -> String {
+        verify_query_signature(
+            authorization,
+            TEST_SECRET_ACCESS_KEY,
+            SigV4QueryVerificationRequest {
+                method: "GET",
+                path: "/example-bucket/object.txt",
+                query,
+                headers: &[("host", "examplebucket.s3.amazonaws.com")],
+            },
+        )
+        .expect("presigned query signature should verify")
+        .canonical_request()
+        .to_owned()
     }
 
     fn valid_iam_authorization() -> super::SigV4Authorization {
