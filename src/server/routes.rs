@@ -335,24 +335,15 @@ fn auth_rejection_response(
         return Some(response);
     }
 
-    match verify_signature(&authorization, LOCAL_SECRET_ACCESS_KEY, request) {
-        Ok(_verification) => {
-            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-                request_id.as_str(),
-                AuthDecision::Accepted,
-            )));
-            None
-        }
-        Err(diagnostic) => {
-            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-                request_id.as_str(),
-                AuthDecision::Rejected(auth_rejection_reason(&diagnostic)),
-            )));
-            Some(sigv4_verification_error_response(
-                diagnostic, &resource, is_head, request_id,
-            ))
-        }
-    }
+    sigv4_verification_response(
+        state,
+        request_id,
+        verify_signature(&authorization, LOCAL_SECRET_ACCESS_KEY, request),
+        AuthErrorContext {
+            resource: &resource,
+            is_head,
+        },
+    )
 }
 
 fn query_auth_rejection_response(
@@ -464,24 +455,15 @@ fn query_auth_rejection_response(
         query: &query_refs,
         headers: &header_refs,
     };
-    match verify_query_signature(&authorization, LOCAL_SECRET_ACCESS_KEY, request) {
-        Ok(_verification) => {
-            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-                request_id.as_str(),
-                AuthDecision::Accepted,
-            )));
-            None
-        }
-        Err(diagnostic) => {
-            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-                request_id.as_str(),
-                AuthDecision::Rejected(auth_rejection_reason(&diagnostic)),
-            )));
-            Some(sigv4_verification_error_response(
-                diagnostic, &resource, is_head, request_id,
-            ))
-        }
-    }
+    sigv4_verification_response(
+        state,
+        request_id,
+        verify_query_signature(&authorization, LOCAL_SECRET_ACCESS_KEY, request),
+        AuthErrorContext {
+            resource: &resource,
+            is_head,
+        },
+    )
 }
 
 fn presigned_expiration_rejection_response(
@@ -826,6 +808,35 @@ fn record_canonical_request_built(
                     &canonical_request,
                 ),
             ));
+            None
+        }
+        Err(diagnostic) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Rejected(auth_rejection_reason(&diagnostic)),
+            )));
+            Some(sigv4_verification_error_response(
+                diagnostic,
+                error_context.resource,
+                error_context.is_head,
+                request_id,
+            ))
+        }
+    }
+}
+
+fn sigv4_verification_response<T>(
+    state: &ServerState,
+    request_id: &S3RequestId,
+    result: Result<T, SigV4VerificationDiagnostic>,
+    error_context: AuthErrorContext<'_>,
+) -> Option<Response<Body>> {
+    match result {
+        Ok(_) => {
+            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+                request_id.as_str(),
+                AuthDecision::Accepted,
+            )));
             None
         }
         Err(diagnostic) => {
