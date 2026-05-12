@@ -2,6 +2,7 @@
 
 pub mod routes;
 pub mod state;
+mod ui;
 
 use crate::config::{ConfigError, RuntimeConfig};
 use crate::s3::bucket::{is_valid_s3_bucket_name, BucketName};
@@ -54,7 +55,8 @@ pub fn router(state: ServerState) -> Router {
 
 pub fn inspector_router(server_state: ServerState, trace_store: InMemoryTraceStore) -> Router {
     Router::new()
-        .route("/", get(inspector_root))
+        .route("/", get(ui::inspector_root))
+        .route("/assets/{asset}", get(inspector_asset))
         .route("/health", get(inspector_health))
         .route("/api/requests", get(inspector_requests))
         .route("/api/requests/{request_id}", get(inspector_request_events))
@@ -71,8 +73,8 @@ pub fn inspector_router(server_state: ServerState, trace_store: InMemoryTraceSto
         })
 }
 
-async fn inspector_root() -> &'static str {
-    "S3Lab inspector\n"
+async fn inspector_asset(Path(asset): Path<String>) -> axum::response::Response {
+    ui::inspector_asset(&asset).await
 }
 
 async fn inspector_health() -> &'static str {
@@ -349,6 +351,7 @@ mod tests {
     };
     use crate::trace::InMemoryTraceStore;
     use axum::body::Body;
+    use axum::http::header::CONTENT_TYPE;
     use axum::http::{Request, StatusCode};
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -401,6 +404,79 @@ mod tests {
             .expect("health response");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn inspector_router_serves_embedded_ui_shell_at_root() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let state = ServerState::from_storage(FilesystemStorage::new(temp_dir.path()));
+
+        let response = inspector_router(state, InMemoryTraceStore::default())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("root request"),
+            )
+            .await
+            .expect("root response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        let body = response_text(response).await;
+        assert!(body.contains(r#"id="s3lab-app""#));
+        assert!(body.contains("Local S3-compatible request and storage inspection."));
+        assert!(body.contains(r#"<script src="/assets/app.js"></script>"#));
+    }
+
+    #[tokio::test]
+    async fn inspector_router_serves_embedded_static_assets_with_content_types() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let state = ServerState::from_storage(FilesystemStorage::new(temp_dir.path()));
+        let app = inspector_router(state, InMemoryTraceStore::default());
+
+        let css = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/app.css")
+                    .body(Body::empty())
+                    .expect("css request"),
+            )
+            .await
+            .expect("css response");
+        assert_eq!(css.status(), StatusCode::OK);
+        assert_eq!(
+            css.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/css; charset=utf-8")
+        );
+        assert!(response_text(css).await.contains(".app-shell"));
+
+        let js = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/app.js")
+                    .body(Body::empty())
+                    .expect("js request"),
+            )
+            .await
+            .expect("js response");
+        assert_eq!(js.status(), StatusCode::OK);
+        assert_eq!(
+            js.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert!(response_text(js).await.contains("/api/requests"));
     }
 
     #[tokio::test]
@@ -703,5 +779,13 @@ mod tests {
             .expect("read response body");
 
         serde_json::from_slice(&bytes).expect("valid json")
+    }
+
+    async fn response_text(response: axum::http::Response<Body>) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+
+        String::from_utf8(bytes.to_vec()).expect("utf-8 response")
     }
 }

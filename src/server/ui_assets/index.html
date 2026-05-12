@@ -1,0 +1,36 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>S3Lab Inspector</title>
+    <link rel="stylesheet" href="/assets/app.css">
+  </head>
+  <body>
+    <div id="s3lab-app" class="app-shell" data-app="s3lab-inspector">
+      <aside class="sidebar" aria-label="Inspector navigation">
+        <div class="brand">
+          <span class="brand-mark">S3</span>
+          <div>
+            <strong>S3Lab</strong>
+            <span>Local inspector</span>
+          </div>
+        </div>
+        <nav id="navigation" class="nav-list"></nav>
+      </aside>
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <h1 id="view-title">Dashboard</h1>
+            <p id="view-copy">Local S3-compatible request and storage inspection.</p>
+          </div>
+          <button id="refresh" type="button">Refresh</button>
+        </header>
+        <section id="status-line" class="status-line" aria-live="polite">Loading local inspector data...</section>
+        <section id="content" class="content" aria-label="Inspector content"></section>
+      </main>
+    </div>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>
