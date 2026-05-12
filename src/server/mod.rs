@@ -4,6 +4,7 @@ pub mod routes;
 pub mod state;
 
 use crate::config::{ConfigError, RuntimeConfig};
+use axum::routing::get;
 use axum::Router;
 use routes::handle_request;
 use state::ServerState;
@@ -35,6 +36,20 @@ pub fn router(state: ServerState) -> Router {
     Router::new().fallback(handle_request).with_state(state)
 }
 
+pub fn inspector_router() -> Router {
+    Router::new()
+        .route("/", get(inspector_root))
+        .route("/health", get(inspector_health))
+}
+
+async fn inspector_root() -> &'static str {
+    "S3Lab inspector\n"
+}
+
+async fn inspector_health() -> &'static str {
+    "ok\n"
+}
+
 pub async fn bind_listener(config: &RuntimeConfig) -> Result<TcpListener, ServerError> {
     config
         .validate()
@@ -43,6 +58,18 @@ pub async fn bind_listener(config: &RuntimeConfig) -> Result<TcpListener, Server
         .await
         .map_err(|source| ServerError::Bind {
             endpoint: config.endpoint(),
+            source,
+        })
+}
+
+pub async fn bind_inspector_listener(config: &RuntimeConfig) -> Result<TcpListener, ServerError> {
+    config
+        .validate()
+        .map_err(|source| ServerError::Config { source })?;
+    TcpListener::bind((config.inspector_bind_host(), config.inspector_port))
+        .await
+        .map_err(|source| ServerError::Bind {
+            endpoint: config.inspector_endpoint(),
             source,
         })
 }
@@ -65,6 +92,19 @@ where
     let app = router(state);
 
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(|source| ServerError::Run { source })
+}
+
+pub async fn serve_inspector_listener_until<F>(
+    listener: TcpListener,
+    shutdown: F,
+) -> Result<(), ServerError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(listener, inspector_router())
         .with_graceful_shutdown(shutdown)
         .await
         .map_err(|source| ServerError::Run { source })
@@ -106,11 +146,16 @@ impl Error for ServerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_listener, listener_endpoint, ServerError};
+    use super::{
+        bind_inspector_listener, bind_listener, inspector_router, listener_endpoint, ServerError,
+    };
     use crate::config::{ConfigError, RuntimeConfig, DEFAULT_DATA_DIR};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
     use std::error::Error;
     use std::io;
     use tokio::net::TcpListener;
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn bind_listener_normalizes_localhost_to_ipv4_loopback() {
@@ -123,6 +168,35 @@ mod tests {
 
         assert!(address.ip().is_loopback());
         assert_eq!(address.ip().to_string(), "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn bind_inspector_listener_uses_loopback_config() {
+        let config =
+            RuntimeConfig::new("127.0.0.1", 0, DEFAULT_DATA_DIR).with_inspector("localhost", 0);
+
+        let listener = bind_inspector_listener(&config)
+            .await
+            .expect("bind inspector listener");
+        let address = listener.local_addr().expect("read inspector address");
+
+        assert!(address.ip().is_loopback());
+        assert_eq!(address.ip().to_string(), "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn inspector_router_serves_minimal_health_response() {
+        let response = inspector_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

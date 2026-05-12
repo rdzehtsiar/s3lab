@@ -16,7 +16,14 @@ fn binary_serve_prints_startup_output_and_keeps_running() {
     let data_dir = parent.path().join("s3lab-data");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_s3lab"))
-        .args(["serve", "--port", "0", "--data-dir"])
+        .args([
+            "serve",
+            "--port",
+            "0",
+            "--inspector-port",
+            "0",
+            "--data-dir",
+        ])
         .arg(&data_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -33,7 +40,7 @@ fn binary_serve_prints_startup_output_and_keeps_running() {
         }
     });
 
-    let stdout_lines = wait_for_startup_lines(&stdout_rx, 2);
+    let stdout_lines = wait_for_startup_lines(&stdout_rx, 3);
 
     let exited_status = child.try_wait().expect("check child status");
     let kept_running = exited_status.is_none();
@@ -53,7 +60,7 @@ fn binary_serve_prints_startup_output_and_keeps_running() {
 
     assert_eq!(
         stdout_lines.len(),
-        2,
+        3,
         "serve did not print startup output within {STARTUP_TIMEOUT:?}; status: {final_status:?}; data dir: {}; stdout: {stdout_lines:?}; stderr: {stderr}",
         data_dir.display()
     );
@@ -64,8 +71,10 @@ fn binary_serve_prints_startup_output_and_keeps_running() {
     assert!(data_dir.is_dir());
     assert!(stdout_lines[0].starts_with("S3 endpoint:  http://127.0.0.1:"));
     assert_ne!(stdout_lines[0], "S3 endpoint:  http://127.0.0.1:0");
+    assert!(stdout_lines[1].starts_with("Inspector UI: http://127.0.0.1:"));
+    assert_ne!(stdout_lines[1], "Inspector UI: http://127.0.0.1:0");
     assert_eq!(
-        stdout_lines[1],
+        stdout_lines[2],
         format!("Data dir:     {}", data_dir.display())
     );
     assert_no_child_failure_output(&stderr);
@@ -77,7 +86,14 @@ fn binary_serve_answers_http_requests_after_startup() {
     let data_dir = parent.path().join("s3lab-data");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_s3lab"))
-        .args(["serve", "--port", "0", "--data-dir"])
+        .args([
+            "serve",
+            "--port",
+            "0",
+            "--inspector-port",
+            "0",
+            "--data-dir",
+        ])
         .arg(&data_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -94,11 +110,16 @@ fn binary_serve_answers_http_requests_after_startup() {
         }
     });
 
-    let stdout_lines = wait_for_startup_lines(&stdout_rx, 2);
+    let stdout_lines = wait_for_startup_lines(&stdout_rx, 3);
     let endpoint = parse_endpoint(
         stdout_lines
             .first()
             .expect("serve prints endpoint before accepting requests"),
+    );
+    let inspector_endpoint = parse_inspector_endpoint(
+        stdout_lines
+            .get(1)
+            .expect("serve prints inspector endpoint before accepting requests"),
     );
 
     let create_response = http_request(
@@ -121,6 +142,18 @@ fn binary_serve_answers_http_requests_after_startup() {
     assert!(
         list_response.contains("<Name>binary-smoke-bucket</Name>"),
         "created bucket missing from list response: {list_response}"
+    );
+    let inspector_response = http_request(
+        &inspector_endpoint,
+        "GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        inspector_response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected inspector health response: {inspector_response}"
+    );
+    assert!(
+        inspector_response.ends_with("\r\n\r\nok\n"),
+        "unexpected inspector health body: {inspector_response}"
     );
     assert_no_extra_stdout_lines(&stdout_rx);
 
@@ -170,6 +203,12 @@ fn wait_for_startup_lines(
 fn parse_endpoint(line: &str) -> String {
     line.strip_prefix("S3 endpoint:  ")
         .expect("startup line contains endpoint")
+        .to_owned()
+}
+
+fn parse_inspector_endpoint(line: &str) -> String {
+    line.strip_prefix("Inspector UI: ")
+        .expect("startup line contains inspector endpoint")
         .to_owned()
 }
 

@@ -10,12 +10,16 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 9000;
+pub const DEFAULT_INSPECTOR_HOST: &str = "127.0.0.1";
+pub const DEFAULT_INSPECTOR_PORT: u16 = 9001;
 pub const DEFAULT_DATA_DIR: &str = "./s3lab-data";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RuntimeConfig {
     pub host: String,
     pub port: u16,
+    pub inspector_host: String,
+    pub inspector_port: u16,
     pub data_dir: PathBuf,
 }
 
@@ -41,6 +45,8 @@ impl Default for RuntimeConfig {
         Self {
             host: DEFAULT_HOST.to_owned(),
             port: DEFAULT_PORT,
+            inspector_host: DEFAULT_INSPECTOR_HOST.to_owned(),
+            inspector_port: DEFAULT_INSPECTOR_PORT,
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
         }
     }
@@ -51,6 +57,8 @@ impl RuntimeConfig {
         Self {
             host: host.into(),
             port,
+            inspector_host: DEFAULT_INSPECTOR_HOST.to_owned(),
+            inspector_port: DEFAULT_INSPECTOR_PORT,
             data_dir: data_dir.into(),
         }
     }
@@ -59,20 +67,35 @@ impl RuntimeConfig {
         format!("http://{}:{}", host_for_endpoint(&self.host), self.port)
     }
 
+    pub fn inspector_endpoint(&self) -> String {
+        format!(
+            "http://{}:{}",
+            host_for_endpoint(&self.inspector_host),
+            self.inspector_port
+        )
+    }
+
     pub fn bind_host(&self) -> &str {
-        if self.host.eq_ignore_ascii_case("localhost") {
-            "127.0.0.1"
-        } else {
-            &self.host
-        }
+        bind_host(&self.host)
+    }
+
+    pub fn inspector_bind_host(&self) -> &str {
+        bind_host(&self.inspector_host)
+    }
+
+    pub fn with_inspector(
+        mut self,
+        inspector_host: impl Into<String>,
+        inspector_port: u16,
+    ) -> Self {
+        self.inspector_host = inspector_host.into();
+        self.inspector_port = inspector_port;
+        self
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !is_loopback_host(&self.host) {
-            return Err(ConfigError::NonLoopbackHost {
-                host: self.host.clone(),
-            });
-        }
+        validate_loopback_host(&self.host)?;
+        validate_loopback_host(&self.inspector_host)?;
 
         Ok(())
     }
@@ -80,6 +103,24 @@ impl RuntimeConfig {
     pub fn ensure_data_dir(&self) -> Result<(), ConfigError> {
         ensure_data_dir(&self.data_dir)
     }
+}
+
+fn bind_host(host: &str) -> &str {
+    if host.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1"
+    } else {
+        host
+    }
+}
+
+fn validate_loopback_host(host: &str) -> Result<(), ConfigError> {
+    if !is_loopback_host(host) {
+        return Err(ConfigError::NonLoopbackHost {
+            host: host.to_owned(),
+        });
+    }
+
+    Ok(())
 }
 
 pub fn is_loopback_host(host: &str) -> bool {
@@ -213,7 +254,7 @@ impl Error for ConfigError {
 mod tests {
     use super::{
         ensure_data_dir, is_loopback_host, ConfigError, RuntimeConfig, DEFAULT_DATA_DIR,
-        DEFAULT_HOST, DEFAULT_PORT,
+        DEFAULT_HOST, DEFAULT_INSPECTOR_HOST, DEFAULT_INSPECTOR_PORT, DEFAULT_PORT,
     };
     use std::error::Error;
     use std::fmt::{Display, Formatter};
@@ -227,6 +268,8 @@ mod tests {
             RuntimeConfig {
                 host: DEFAULT_HOST.to_owned(),
                 port: DEFAULT_PORT,
+                inspector_host: DEFAULT_INSPECTOR_HOST.to_owned(),
+                inspector_port: DEFAULT_INSPECTOR_PORT,
                 data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             }
         );
@@ -238,7 +281,19 @@ mod tests {
 
         assert_eq!(config.host, "localhost");
         assert_eq!(config.port, 4567);
+        assert_eq!(config.inspector_host, DEFAULT_INSPECTOR_HOST);
+        assert_eq!(config.inspector_port, DEFAULT_INSPECTOR_PORT);
         assert_eq!(config.data_dir, PathBuf::from("custom-data"));
+    }
+
+    #[test]
+    fn explicit_inspector_config_overrides_inspector_defaults() {
+        let config =
+            RuntimeConfig::new("127.0.0.1", 4567, "custom-data").with_inspector("::1", 7654);
+
+        assert_eq!(config.inspector_host, "::1");
+        assert_eq!(config.inspector_port, 7654);
+        assert_eq!(config.inspector_endpoint(), "http://[::1]:7654");
     }
 
     #[test]
@@ -273,6 +328,12 @@ mod tests {
             RuntimeConfig::new("::1", DEFAULT_PORT, DEFAULT_DATA_DIR).bind_host(),
             "::1"
         );
+        assert_eq!(
+            RuntimeConfig::new("127.0.0.1", DEFAULT_PORT, DEFAULT_DATA_DIR)
+                .with_inspector("localhost", DEFAULT_INSPECTOR_PORT)
+                .inspector_bind_host(),
+            "127.0.0.1"
+        );
     }
 
     #[test]
@@ -301,6 +362,20 @@ mod tests {
     }
 
     #[test]
+    fn loopback_host_validation_rejects_non_loopback_inspector_hosts() {
+        let error = RuntimeConfig::new("127.0.0.1", DEFAULT_PORT, DEFAULT_DATA_DIR)
+            .with_inspector("example.com", DEFAULT_INSPECTOR_PORT)
+            .validate()
+            .expect_err("non-loopback inspector host should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::NonLoopbackHost { ref host } if host == "example.com"
+        ));
+        assert!(error.to_string().contains("loopback host"));
+    }
+
+    #[test]
     fn config_can_be_cloned_without_changing_values() {
         let config = RuntimeConfig::default();
 
@@ -313,6 +388,8 @@ mod tests {
 
         assert!(debug.contains("host"));
         assert!(debug.contains("port"));
+        assert!(debug.contains("inspector_host"));
+        assert!(debug.contains("inspector_port"));
         assert!(debug.contains("data_dir"));
     }
 

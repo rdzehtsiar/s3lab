@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{RuntimeConfig, DEFAULT_DATA_DIR, DEFAULT_HOST, DEFAULT_PORT};
+use crate::config::{
+    RuntimeConfig, DEFAULT_DATA_DIR, DEFAULT_HOST, DEFAULT_INSPECTOR_HOST, DEFAULT_INSPECTOR_PORT,
+    DEFAULT_PORT,
+};
 use crate::server::state::ServerState;
 use crate::storage::fs::FilesystemStorage;
 use clap::{Parser, Subcommand};
@@ -50,6 +53,14 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = DEFAULT_PORT)]
     port: u16,
 
+    /// Host address for the local inspector UI.
+    #[arg(long, default_value = DEFAULT_INSPECTOR_HOST)]
+    inspector_host: String,
+
+    /// Port for the local inspector UI.
+    #[arg(long, default_value_t = DEFAULT_INSPECTOR_PORT)]
+    inspector_port: u16,
+
     /// Directory used for local S3Lab data.
     #[arg(long, default_value = DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
@@ -89,6 +100,7 @@ struct ResetArgs {
 impl From<ServeArgs> for RuntimeConfig {
     fn from(args: ServeArgs) -> Self {
         Self::new(args.host, args.port, args.data_dir)
+            .with_inspector(args.inspector_host, args.inspector_port)
     }
 }
 
@@ -271,27 +283,45 @@ where
     config.ensure_data_dir()?;
     let listener = crate::server::bind_listener(&config).await?;
     let endpoint = crate::server::listener_endpoint(&listener)?;
+    let inspector_listener = crate::server::bind_inspector_listener(&config).await?;
+    let inspector_endpoint = crate::server::listener_endpoint(&inspector_listener)?;
 
     {
         writeln!(writer, "S3 endpoint:  {endpoint}")?;
+        writeln!(writer, "Inspector UI: {inspector_endpoint}")?;
         writeln!(writer, "Data dir:     {}", config.data_dir.display())?;
         writer.flush()?;
     }
     tracing::info!(
         endpoint = %endpoint,
+        inspector_endpoint = %inspector_endpoint,
         data_dir = %config.data_dir.display(),
-        "local server listening"
+        "local server and inspector listening"
     );
 
     let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel();
-    let shutdown = async move {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
         if let Err(error) = shutdown.await {
             let _ = shutdown_error_tx.send(error);
         }
-    };
+        let _ = shutdown_tx.send(true);
+    });
 
     let state = ServerState::from_storage(FilesystemStorage::new(config.data_dir));
-    crate::server::serve_listener_until(listener, state, shutdown).await?;
+    let mut s3_shutdown_rx = shutdown_rx.clone();
+    let s3_shutdown = async move {
+        let _ = s3_shutdown_rx.changed().await;
+    };
+    let mut inspector_shutdown_rx = shutdown_rx;
+    let inspector_shutdown = async move {
+        let _ = inspector_shutdown_rx.changed().await;
+    };
+
+    tokio::try_join!(
+        crate::server::serve_listener_until(listener, state, s3_shutdown),
+        crate::server::serve_inspector_listener_until(inspector_listener, inspector_shutdown)
+    )?;
 
     if let Ok(error) = shutdown_error_rx.await {
         return Err(error);
@@ -380,6 +410,8 @@ mod tests {
                 "serve",
                 "--port",
                 "0",
+                "--inspector-port",
+                "0",
                 "--data-dir",
                 data_dir.to_str().expect("utf-8 temp path"),
             ],
@@ -390,9 +422,13 @@ mod tests {
         .expect("serve should validate config");
 
         let output = String::from_utf8(output).expect("utf-8 output");
-        assert!(output.contains("S3 endpoint:  http://127.0.0.1:"));
-        assert!(!output.contains("S3 endpoint:  http://127.0.0.1:0"));
-        assert!(output.contains(&format!("Data dir:     {}", data_dir.display())));
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("S3 endpoint:  http://127.0.0.1:"));
+        assert_ne!(lines[0], "S3 endpoint:  http://127.0.0.1:0");
+        assert!(lines[1].starts_with("Inspector UI: http://127.0.0.1:"));
+        assert_ne!(lines[1], "Inspector UI: http://127.0.0.1:0");
+        assert_eq!(lines[2], format!("Data dir:     {}", data_dir.display()));
         assert!(data_dir.is_dir());
     }
 
@@ -410,6 +446,10 @@ mod tests {
                 "127.0.0.1",
                 "--port",
                 "0",
+                "--inspector-host",
+                "127.0.0.1",
+                "--inspector-port",
+                "0",
                 "--data-dir",
                 data_dir.to_str().expect("utf-8 temp path"),
             ],
@@ -421,6 +461,7 @@ mod tests {
 
         let output = String::from_utf8(output).expect("utf-8 output");
         assert!(output.contains("S3 endpoint:  http://127.0.0.1:"));
+        assert!(output.contains("Inspector UI: http://127.0.0.1:"));
         assert!(output.contains(&format!("Data dir:     {}", data_dir.display())));
     }
 
@@ -433,6 +474,8 @@ mod tests {
 
         assert_eq!(args.host, "127.0.0.1");
         assert_eq!(args.port, 9000);
+        assert_eq!(args.inspector_host, "127.0.0.1");
+        assert_eq!(args.inspector_port, 9001);
         assert_eq!(args.data_dir, PathBuf::from("./s3lab-data"));
     }
 
@@ -507,6 +550,8 @@ mod tests {
         assert!(help.contains("serve"));
         assert!(help.contains("--host"));
         assert!(help.contains("--port"));
+        assert!(help.contains("--inspector-host"));
+        assert!(help.contains("--inspector-port"));
         assert!(help.contains("--data-dir"));
     }
 
@@ -760,6 +805,8 @@ mod tests {
                 "0.0.0.0",
                 "--port",
                 "0",
+                "--inspector-port",
+                "0",
                 "--data-dir",
                 data_dir.to_str().expect("utf-8 temp path"),
             ],
@@ -768,6 +815,38 @@ mod tests {
         )
         .await
         .expect_err("wildcard host should fail");
+
+        assert!(matches!(error, CliError::Config(_)));
+        assert!(error.to_string().contains("loopback host"));
+        assert!(error.to_string().contains("0.0.0.0"));
+        assert!(output.is_empty());
+        assert!(!data_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_non_loopback_inspector_host_before_creating_data_dir() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let data_dir = parent.path().join("s3lab-data");
+        let mut output = Vec::new();
+
+        let error = run_with_writer_until(
+            [
+                "s3lab",
+                "serve",
+                "--port",
+                "0",
+                "--inspector-host",
+                "0.0.0.0",
+                "--inspector-port",
+                "0",
+                "--data-dir",
+                data_dir.to_str().expect("utf-8 temp path"),
+            ],
+            &mut output,
+            async { Ok(()) },
+        )
+        .await
+        .expect_err("wildcard inspector host should fail");
 
         assert!(matches!(error, CliError::Config(_)));
         assert!(error.to_string().contains("loopback host"));
@@ -796,6 +875,8 @@ mod tests {
                 "serve",
                 "--port",
                 &port,
+                "--inspector-port",
+                "0",
                 "--data-dir",
                 data_dir.to_str().expect("utf-8 temp path"),
             ],
@@ -821,6 +902,8 @@ mod tests {
                 "s3lab",
                 "serve",
                 "--port",
+                "0",
+                "--inspector-port",
                 "0",
                 "--data-dir",
                 data_dir.to_str().expect("utf-8 temp path"),
@@ -849,6 +932,8 @@ mod tests {
                 "serve",
                 "--port",
                 "0",
+                "--inspector-port",
+                "0",
                 "--data-dir",
                 data_dir.to_str().expect("utf-8 temp path"),
             ],
@@ -874,6 +959,8 @@ mod tests {
                 "s3lab",
                 "serve",
                 "--port",
+                "0",
+                "--inspector-port",
                 "0",
                 "--data-dir",
                 data_dir.to_str().expect("utf-8 temp path"),
