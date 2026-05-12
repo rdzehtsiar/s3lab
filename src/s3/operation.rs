@@ -36,6 +36,31 @@ pub enum S3Operation {
         bucket: BucketName,
         key: ObjectKey,
     },
+    CreateMultipartUpload {
+        bucket: BucketName,
+        key: ObjectKey,
+    },
+    UploadPart {
+        bucket: BucketName,
+        key: ObjectKey,
+        upload_id: String,
+        part_number: u32,
+    },
+    ListParts {
+        bucket: BucketName,
+        key: ObjectKey,
+        upload_id: String,
+    },
+    CompleteMultipartUpload {
+        bucket: BucketName,
+        key: ObjectKey,
+        upload_id: String,
+    },
+    AbortMultipartUpload {
+        bucket: BucketName,
+        key: ObjectKey,
+        upload_id: String,
+    },
     ListObjectsV2 {
         bucket: BucketName,
         prefix: Option<ObjectKey>,

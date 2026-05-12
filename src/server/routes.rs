@@ -63,6 +63,9 @@ const ENCODING_TYPE: &str = "encoding-type";
 const START_AFTER: &str = "start-after";
 const FETCH_OWNER: &str = "fetch-owner";
 const X_ID: &str = "x-id";
+const UPLOADS: &str = "uploads";
+const UPLOAD_ID: &str = "uploadId";
+const PART_NUMBER: &str = "partNumber";
 const X_AMZ_CHECKSUM_ALGORITHM: &str = "x-amz-checksum-algorithm";
 const X_AMZ_CHECKSUM_CRC32: &str = "x-amz-checksum-crc32";
 const X_AMZ_CHECKSUM_CRC64NVME: &str = "x-amz-checksum-crc64nvme";
@@ -1090,6 +1093,11 @@ fn trace_operation(operation: &S3Operation) -> TraceS3Operation {
         S3Operation::GetObject { .. } => TraceS3Operation::GetObject,
         S3Operation::HeadObject { .. } => TraceS3Operation::HeadObject,
         S3Operation::DeleteObject { .. } => TraceS3Operation::DeleteObject,
+        S3Operation::CreateMultipartUpload { .. } => TraceS3Operation::CreateMultipartUpload,
+        S3Operation::UploadPart { .. } => TraceS3Operation::UploadPart,
+        S3Operation::ListParts { .. } => TraceS3Operation::ListParts,
+        S3Operation::CompleteMultipartUpload { .. } => TraceS3Operation::CompleteMultipartUpload,
+        S3Operation::AbortMultipartUpload { .. } => TraceS3Operation::AbortMultipartUpload,
         S3Operation::ListObjectsV2 { .. } => TraceS3Operation::ListObjectsV2,
     }
 }
@@ -1133,6 +1141,7 @@ fn resolve_root_operation(
     query: &QueryParams,
     resource: &str,
 ) -> Result<S3Operation, RouteRejection> {
+    reject_misplaced_multipart_query_params(query, resource)?;
     reject_query_params(query, resource)?;
 
     if method == Method::GET {
@@ -1151,6 +1160,8 @@ fn resolve_bucket_operation(
     query: &QueryParams,
     resource: &str,
 ) -> Result<S3Operation, RouteRejection> {
+    reject_misplaced_multipart_query_params(query, resource)?;
+
     match *method {
         Method::PUT => {
             reject_query_params(query, resource)?;
@@ -1170,6 +1181,20 @@ fn resolve_bucket_operation(
             resource.to_owned(),
         )),
     }
+}
+
+fn reject_misplaced_multipart_query_params(
+    query: &QueryParams,
+    resource: &str,
+) -> Result<(), RouteRejection> {
+    if query.has_multipart_param() {
+        return Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn resolve_bucket_get_operation(
@@ -1252,6 +1277,10 @@ fn resolve_object_operation(
     query: &QueryParams,
     resource: &str,
 ) -> Result<S3Operation, RouteRejection> {
+    if query.has_multipart_param() {
+        return resolve_object_multipart_operation(method, bucket, key, query, resource);
+    }
+
     match *method {
         Method::PUT => {
             reject_object_query_params(query, resource)?;
@@ -1271,6 +1300,49 @@ fn resolve_object_operation(
         }
         _ => Err(RouteRejection::new(
             S3ErrorCode::MethodNotAllowed,
+            resource.to_owned(),
+        )),
+    }
+}
+
+fn resolve_object_multipart_operation(
+    method: &Method,
+    bucket: BucketName,
+    key: ObjectKey,
+    query: &QueryParams,
+    resource: &str,
+) -> Result<S3Operation, RouteRejection> {
+    match *method {
+        Method::POST if query.is_create_multipart_upload_query() => {
+            Ok(S3Operation::CreateMultipartUpload { bucket, key })
+        }
+        Method::PUT if query.is_upload_part_query() => Ok(S3Operation::UploadPart {
+            bucket,
+            key,
+            upload_id: parse_upload_id(query, resource)?,
+            part_number: parse_part_number(query, resource)?,
+        }),
+        Method::GET if query.is_upload_id_only_query() => Ok(S3Operation::ListParts {
+            bucket,
+            key,
+            upload_id: parse_upload_id(query, resource)?,
+        }),
+        Method::POST if query.is_upload_id_only_query() => {
+            Ok(S3Operation::CompleteMultipartUpload {
+                bucket,
+                key,
+                upload_id: parse_upload_id(query, resource)?,
+            })
+        }
+        Method::DELETE if query.is_upload_id_only_query() => {
+            Ok(S3Operation::AbortMultipartUpload {
+                bucket,
+                key,
+                upload_id: parse_upload_id(query, resource)?,
+            })
+        }
+        _ => Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
             resource.to_owned(),
         )),
     }
@@ -1347,6 +1419,13 @@ async fn execute_storage_operation(
         S3Operation::DeleteObject { bucket, key } => {
             delete_object_response(&state, bucket, key, request_id)
         }
+        S3Operation::CreateMultipartUpload { bucket, key }
+        | S3Operation::UploadPart { bucket, key, .. }
+        | S3Operation::ListParts { bucket, key, .. }
+        | S3Operation::CompleteMultipartUpload { bucket, key, .. }
+        | S3Operation::AbortMultipartUpload { bucket, key, .. } => Ok(
+            multipart_not_implemented_response(bucket, key, is_head, request_id),
+        ),
         S3Operation::ListObjectsV2 {
             bucket,
             prefix,
@@ -1367,6 +1446,19 @@ async fn execute_storage_operation(
             request_id,
         ),
     }
+}
+
+fn multipart_not_implemented_response(
+    bucket: BucketName,
+    key: ObjectKey,
+    is_head: bool,
+    request_id: &S3RequestId,
+) -> Response<Body> {
+    route_error_response(
+        RouteRejection::new(S3ErrorCode::NotImplemented, object_resource(&bucket, &key)),
+        is_head,
+        request_id,
+    )
 }
 
 fn list_buckets_response(
@@ -1877,6 +1969,59 @@ fn parse_list_objects_encoding(
             resource.to_owned(),
         )),
     }
+}
+
+fn parse_upload_id(query: &QueryParams, resource: &str) -> Result<String, RouteRejection> {
+    let Some(upload_id) = query.get(UPLOAD_ID) else {
+        return Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        ));
+    };
+
+    if is_valid_route_upload_id(upload_id) {
+        Ok(upload_id.clone())
+    } else {
+        Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        ))
+    }
+}
+
+fn parse_part_number(query: &QueryParams, resource: &str) -> Result<u32, RouteRejection> {
+    let Some(part_number) = query.get(PART_NUMBER) else {
+        return Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        ));
+    };
+
+    if part_number.is_empty() || !part_number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        ));
+    }
+
+    let part_number = part_number
+        .parse::<u32>()
+        .map_err(|_| RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned()))?;
+    if !(1..=10_000).contains(&part_number) {
+        return Err(RouteRejection::new(
+            S3ErrorCode::InvalidArgument,
+            resource.to_owned(),
+        ));
+    }
+
+    Ok(part_number)
+}
+
+fn is_valid_route_upload_id(upload_id: &str) -> bool {
+    !upload_id.is_empty()
+        && !upload_id
+            .chars()
+            .any(|ch| ch == '/' || ch == '\\' || ch.is_control())
 }
 
 fn has_valid_percent_encoding(raw: &str) -> bool {
@@ -2909,6 +3054,37 @@ impl QueryParams {
             .keys()
             .any(|name| PRESIGNED_QUERY_AUTH_PARAMS.contains(&name.as_str()))
     }
+
+    fn has_multipart_param(&self) -> bool {
+        self.values
+            .keys()
+            .any(|name| [UPLOADS, UPLOAD_ID, PART_NUMBER].contains(&name.as_str()))
+    }
+
+    fn is_create_multipart_upload_query(&self) -> bool {
+        self.get(UPLOADS).is_some_and(String::is_empty)
+            && self
+                .values
+                .keys()
+                .all(|name| name == UPLOADS || PRESIGNED_QUERY_AUTH_PARAMS.contains(&name.as_str()))
+    }
+
+    fn is_upload_id_only_query(&self) -> bool {
+        self.get(UPLOAD_ID).is_some()
+            && self.values.keys().all(|name| {
+                name == UPLOAD_ID || PRESIGNED_QUERY_AUTH_PARAMS.contains(&name.as_str())
+            })
+    }
+
+    fn is_upload_part_query(&self) -> bool {
+        self.get(UPLOAD_ID).is_some()
+            && self.get(PART_NUMBER).is_some()
+            && self.values.keys().all(|name| {
+                name == UPLOAD_ID
+                    || name == PART_NUMBER
+                    || PRESIGNED_QUERY_AUTH_PARAMS.contains(&name.as_str())
+            })
+    }
 }
 
 impl RouteRejection {
@@ -2924,9 +3100,6 @@ const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
     "acl",
     "delete",
     "tagging",
-    "uploads",
-    "uploadId",
-    "partNumber",
     "versionId",
     "versions",
     "policy",

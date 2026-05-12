@@ -93,6 +93,61 @@ fn supported_routes_resolve_to_explicit_operations() {
             },
         ),
         (
+            Method::POST,
+            "/example-bucket/object.txt?uploads",
+            S3Operation::CreateMultipartUpload {
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("object.txt"),
+            },
+        ),
+        (
+            Method::PUT,
+            "/example-bucket/object.txt?partNumber=1&uploadId=upload-abc",
+            S3Operation::UploadPart {
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("object.txt"),
+                upload_id: "upload-abc".to_owned(),
+                part_number: 1,
+            },
+        ),
+        (
+            Method::PUT,
+            "/example-bucket/object.txt?partNumber=10000&uploadId=upload-abc",
+            S3Operation::UploadPart {
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("object.txt"),
+                upload_id: "upload-abc".to_owned(),
+                part_number: 10_000,
+            },
+        ),
+        (
+            Method::GET,
+            "/example-bucket/object.txt?uploadId=upload-abc",
+            S3Operation::ListParts {
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("object.txt"),
+                upload_id: "upload-abc".to_owned(),
+            },
+        ),
+        (
+            Method::POST,
+            "/example-bucket/object.txt?uploadId=upload-abc",
+            S3Operation::CompleteMultipartUpload {
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("object.txt"),
+                upload_id: "upload-abc".to_owned(),
+            },
+        ),
+        (
+            Method::DELETE,
+            "/example-bucket/object.txt?uploadId=upload-abc",
+            S3Operation::AbortMultipartUpload {
+                bucket: BucketName::new("example-bucket"),
+                key: ObjectKey::new("object.txt"),
+                upload_id: "upload-abc".to_owned(),
+            },
+        ),
+        (
             Method::GET,
             "/example-bucket?list-type=2",
             S3Operation::ListObjectsV2 {
@@ -325,6 +380,56 @@ fn duplicate_and_unknown_query_params_are_invalid_argument() {
 }
 
 #[test]
+fn malformed_and_misplaced_multipart_query_params_are_invalid_argument() {
+    for (method, uri) in [
+        (Method::POST, "/bucket/key?uploads=value"),
+        (Method::POST, "/bucket/key?uploads&uploadId=upload-abc"),
+        (Method::PUT, "/bucket/key?partNumber=1"),
+        (Method::PUT, "/bucket/key?uploadId=upload-abc"),
+        (Method::PUT, "/bucket/key?partNumber=0&uploadId=upload-abc"),
+        (
+            Method::PUT,
+            "/bucket/key?partNumber=10001&uploadId=upload-abc",
+        ),
+        (
+            Method::PUT,
+            "/bucket/key?partNumber=abc&uploadId=upload-abc",
+        ),
+        (Method::PUT, "/bucket/key?partNumber=&uploadId=upload-abc"),
+        (Method::PUT, "/bucket/key?partNumber=1&uploadId="),
+        (
+            Method::PUT,
+            "/bucket/key?partNumber=1&uploadId=upload%2Fabc",
+        ),
+        (
+            Method::PUT,
+            "/bucket/key?partNumber=1&uploadId=upload%5Cabc",
+        ),
+        (
+            Method::PUT,
+            "/bucket/key?partNumber=1&uploadId=upload%00abc",
+        ),
+        (Method::GET, "/bucket/key?uploads"),
+        (Method::GET, "/bucket/key?partNumber=1&uploadId=upload-abc"),
+        (Method::POST, "/bucket/key?partNumber=1&uploadId=upload-abc"),
+        (
+            Method::DELETE,
+            "/bucket/key?partNumber=1&uploadId=upload-abc",
+        ),
+        (Method::HEAD, "/bucket/key?uploadId=upload-abc"),
+        (Method::POST, "/bucket?uploads"),
+        (Method::GET, "/bucket?uploadId=upload-abc"),
+        (Method::PUT, "/bucket?partNumber=1&uploadId=upload-abc"),
+        (Method::GET, "/?uploadId=upload-abc"),
+    ] {
+        let rejection = resolve_operation(&method, &uri.parse::<Uri>().expect("valid URI"))
+            .expect_err("multipart query must be rejected");
+
+        assert_eq!(rejection.code, S3ErrorCode::InvalidArgument);
+    }
+}
+
+#[test]
 fn object_get_and_put_routes_allow_presigned_query_auth_params() {
     for (method, uri, expected_operation) in [
         (
@@ -403,6 +508,14 @@ fn x_id_query_param_is_ignored_when_resolving_routes() {
                 key: ObjectKey::new("object.txt"),
             },
         ),
+        (
+            Method::POST,
+            "/bucket/object.txt?uploads&x-id=CreateMultipartUpload",
+            S3Operation::CreateMultipartUpload {
+                bucket: BucketName::new("bucket"),
+                key: ObjectKey::new("object.txt"),
+            },
+        ),
     ];
 
     for (method, uri, expected_operation) in cases {
@@ -440,9 +553,6 @@ fn known_s3_subresources_are_not_implemented() {
         "acl",
         "delete",
         "tagging",
-        "uploads",
-        "uploadId",
-        "partNumber",
         "versionId",
         "versions",
         "policy",
@@ -637,6 +747,66 @@ async fn unsupported_subresources_return_501_without_storage_call() {
             path_only(uri),
         )
         .await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn multipart_routes_return_501_without_storage_call_until_handlers_exist() {
+    for (method, uri) in [
+        (Method::POST, "/bucket/key?uploads"),
+        (Method::PUT, "/bucket/key?partNumber=1&uploadId=upload-abc"),
+        (Method::GET, "/bucket/key?uploadId=upload-abc"),
+        (Method::POST, "/bucket/key?uploadId=upload-abc"),
+        (Method::DELETE, "/bucket/key?uploadId=upload-abc"),
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(test_server_state(storage));
+
+        let response = app
+            .oneshot(request(method, uri, Body::empty()))
+            .await
+            .expect("multipart route response");
+
+        assert_s3_error_xml(
+            response,
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            path_only(uri),
+        )
+        .await;
+        assert_no_storage_calls(&calls);
+    }
+}
+
+#[tokio::test]
+async fn malformed_multipart_routes_return_invalid_argument_without_storage_call() {
+    for (method, uri) in [
+        (Method::POST, "/bucket/key?uploads=value"),
+        (Method::PUT, "/bucket/key?partNumber=0&uploadId=upload-abc"),
+        (
+            Method::PUT,
+            "/bucket/key?partNumber=10001&uploadId=upload-abc",
+        ),
+        (Method::PUT, "/bucket/key?partNumber=1&uploadId="),
+        (
+            Method::PUT,
+            "/bucket/key?partNumber=1&uploadId=upload%2Fabc",
+        ),
+        (Method::GET, "/bucket/key?partNumber=1&uploadId=upload-abc"),
+        (Method::POST, "/bucket?uploads"),
+    ] {
+        let storage = RecordingStorage::default();
+        let calls = Arc::clone(&storage.calls);
+        let app = router(test_server_state(storage));
+
+        let response = app
+            .oneshot(request(method, uri, Body::empty()))
+            .await
+            .expect("multipart rejection response");
+
+        assert_invalid_argument_xml(response, path_only(uri)).await;
         assert_no_storage_calls(&calls);
     }
 }

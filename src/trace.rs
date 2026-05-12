@@ -246,6 +246,11 @@ pub enum TraceS3Operation {
     GetObject,
     HeadObject,
     DeleteObject,
+    CreateMultipartUpload,
+    UploadPart,
+    ListParts,
+    CompleteMultipartUpload,
+    AbortMultipartUpload,
     ListObjectsV2,
 }
 
