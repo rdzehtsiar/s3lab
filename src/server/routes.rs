@@ -886,14 +886,15 @@ fn record_sigv4_parsed(
     authorization: &SigV4Authorization,
 ) {
     let scope = authorization.credential().scope();
-    state.record_trace(TraceEvent::SigV4Parsed(SigV4ParsedTrace::accepted(
-        request_id.as_str(),
+    record_accepted_sigv4_parsed(
+        state,
+        request_id,
         TraceCredentialScope::new(scope.date(), scope.region(), scope.service()),
         authorization
             .signed_headers()
             .iter()
             .map(|header| header.as_str()),
-    )));
+    );
 }
 
 fn record_sigv4_query_parsed(
@@ -902,13 +903,27 @@ fn record_sigv4_query_parsed(
     authorization: &SigV4QueryAuthorization,
 ) {
     let scope = authorization.credential().scope();
-    state.record_trace(TraceEvent::SigV4Parsed(SigV4ParsedTrace::accepted(
-        request_id.as_str(),
+    record_accepted_sigv4_parsed(
+        state,
+        request_id,
         TraceCredentialScope::new(scope.date(), scope.region(), scope.service()),
         authorization
             .signed_headers()
             .iter()
             .map(|header| header.as_str()),
+    );
+}
+
+fn record_accepted_sigv4_parsed<'a>(
+    state: &ServerState,
+    request_id: &S3RequestId,
+    scope: TraceCredentialScope,
+    signed_headers: impl Iterator<Item = &'a str>,
+) {
+    state.record_trace(TraceEvent::SigV4Parsed(SigV4ParsedTrace::accepted(
+        request_id.as_str(),
+        scope,
+        signed_headers,
     )));
 }
 
