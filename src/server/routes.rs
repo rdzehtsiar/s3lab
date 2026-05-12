@@ -2099,6 +2099,13 @@ fn corrupt_response_metadata(message: impl Into<String>) -> StorageError {
     }
 }
 
+fn header_value_to_owned(value: &HeaderValue, resource: &str) -> Result<String, RouteRejection> {
+    value
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|_| RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned()))
+}
+
 fn extract_user_metadata(
     headers: &HeaderMap,
     resource: &str,
@@ -2131,12 +2138,7 @@ fn extract_content_type(
 ) -> Result<Option<String>, RouteRejection> {
     headers
         .get(CONTENT_TYPE)
-        .map(|value| {
-            value
-                .to_str()
-                .map(str::to_owned)
-                .map_err(|_| RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned()))
-        })
+        .map(|value| header_value_to_owned(value, resource))
         .transpose()
 }
 
@@ -2169,12 +2171,7 @@ fn extract_checksum_header(
 ) -> Result<Option<String>, RouteRejection> {
     headers
         .get(header_name)
-        .map(|value| {
-            value
-                .to_str()
-                .map(str::to_owned)
-                .map_err(|_| RouteRejection::new(S3ErrorCode::InvalidArgument, resource.to_owned()))
-        })
+        .map(|value| header_value_to_owned(value, resource))
         .transpose()
 }
 
