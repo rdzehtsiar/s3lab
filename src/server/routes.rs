@@ -195,11 +195,7 @@ fn auth_rejection_response(
     let query_pairs = match sigv4_query_pairs(uri.query(), &resource, is_head, request_id) {
         Ok(query_pairs) => query_pairs,
         Err(response) => {
-            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-                request_id.as_str(),
-                AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
-            )));
-            return Some(*response);
+            return invalid_authorization_response(state, request_id, *response);
         }
     };
     let has_query_authorization = has_presigned_query_authorization(&query_pairs);
@@ -298,11 +294,7 @@ fn auth_rejection_response(
     ) {
         Ok(request) => request,
         Err(response) => {
-            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-                request_id.as_str(),
-                AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
-            )));
-            return Some(*response);
+            return invalid_authorization_response(state, request_id, *response);
         }
     };
     let query = verification_request.query_refs();
@@ -411,11 +403,7 @@ fn query_auth_rejection_response(
     let header_values = match sigv4_header_pairs(headers, &resource, is_head, request_id) {
         Ok(headers) => headers,
         Err(response) => {
-            state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
-                request_id.as_str(),
-                AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
-            )));
-            return Some(*response);
+            return invalid_authorization_response(state, request_id, *response);
         }
     };
     let header_refs = header_values
@@ -534,6 +522,18 @@ fn presigned_expiration_rejection_response(
     }
 
     None
+}
+
+fn invalid_authorization_response(
+    state: &ServerState,
+    request_id: &S3RequestId,
+    response: Response<Body>,
+) -> Option<Response<Body>> {
+    state.record_trace(TraceEvent::AuthDecision(AuthDecisionTrace::new(
+        request_id.as_str(),
+        AuthDecision::Rejected(AuthRejectionReason::InvalidAuthorization),
+    )));
+    Some(response)
 }
 
 fn parse_presigned_request_datetime(value: &str) -> Result<OffsetDateTime, ()> {
