@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use super::journal::{Journal, JournalMutation, JournalPhase, JournalRecord};
 use super::key::{encode_bucket_name, encode_object_key, EncodedObjectKey};
 use super::{
     BucketSummary, ListObjectsOptions, ObjectListing, ObjectListingEntry, PutObjectRequest,
@@ -10,6 +11,7 @@ use crate::s3::bucket::{is_valid_s3_bucket_name, BucketName};
 use crate::s3::object::{is_valid_s3_object_key_prefix, ObjectKey};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -23,7 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use time::OffsetDateTime;
 
+const BLOBS_DIR: &str = "blobs";
 const BUCKET_METADATA_FILE: &str = "bucket.json";
+const DIRTY_MUTATION_MARKER_FILE: &str = ".mutation-dirty";
 const OBJECTS_DIR: &str = "objects";
 const OBJECT_CONTENT_FILE: &str = "content.bin";
 const OBJECT_METADATA_FILE: &str = "metadata.json";
@@ -89,6 +93,7 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         }
 
         let _guard = lock_storage(&self.root, "create_bucket")?;
+        self.recover_if_dirty()?;
         let bucket_root = self.bucket_root();
         create_dir_all(&bucket_root)?;
 
@@ -107,17 +112,17 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
             });
         }
 
-        write_new_bucket_state_atomically(
-            &bucket_dir,
-            &BucketRecord {
-                bucket: bucket.as_str().to_owned(),
-            },
-            bucket,
-        )
+        let record = BucketRecord {
+            bucket: bucket.as_str().to_owned(),
+        };
+        self.commit_and_apply_mutation(JournalMutation::bucket_create(bucket), || {
+            write_new_bucket_state_atomically(&bucket_dir, &record, bucket)
+        })
     }
 
     fn list_buckets(&self) -> Result<Vec<BucketSummary>, StorageError> {
         let _guard = lock_storage(&self.root, "list_buckets")?;
+        self.recover_if_dirty()?;
         let bucket_root = self.bucket_root();
         if !path_exists(&bucket_root)? {
             return Ok(Vec::new());
@@ -159,6 +164,7 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
 
     fn bucket_exists(&self, bucket: &BucketName) -> Result<bool, StorageError> {
         let _guard = lock_storage(&self.root, "bucket_exists")?;
+        self.recover_if_dirty()?;
         let bucket_dir = self.bucket_dir(bucket);
         if !path_exists(&bucket_dir)? {
             return Ok(false);
@@ -171,6 +177,7 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
 
     fn delete_bucket(&self, bucket: &BucketName) -> Result<(), StorageError> {
         let _guard = lock_storage(&self.root, "delete_bucket")?;
+        self.recover_if_dirty()?;
         self.ensure_bucket(bucket)?;
 
         let objects_dir = self.bucket_dir(bucket).join(OBJECTS_DIR);
@@ -182,11 +189,14 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
             });
         }
 
-        remove_dir_all(&self.bucket_dir(bucket))
+        self.commit_and_apply_mutation(JournalMutation::bucket_delete(bucket), || {
+            remove_dir_all(&self.bucket_dir(bucket))
+        })
     }
 
     fn put_object(&self, request: PutObjectRequest) -> Result<StoredObjectMetadata, StorageError> {
         let _guard = lock_storage(&self.root, "put_object")?;
+        self.recover_if_dirty()?;
         self.ensure_bucket(&request.bucket)?;
         let encoded_key = encode_object_key(&request.key)?;
         let object_dir = self.object_dir(&request.bucket, &encoded_key);
@@ -207,24 +217,39 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
             user_metadata: request.user_metadata,
         };
         let record = ObjectMetadataRecord::from_metadata(&metadata);
+        let content_sha256 = sha256_for_bytes(&request.bytes);
+        self.store_blob(&content_sha256, &request.bytes)?;
+        let mutation = JournalMutation::object_put(
+            &request.bucket,
+            &request.key,
+            metadata.content_length,
+            content_sha256,
+            metadata.etag.clone(),
+            metadata.content_type.clone(),
+            metadata.last_modified.unix_timestamp(),
+            metadata.last_modified.nanosecond(),
+            metadata.user_metadata.clone(),
+        );
 
-        let write_result = match object_state {
-            ObjectPathState::Committed => {
-                write_object_files_atomically(&object_dir, &request.bytes, &record)
-            }
-            ObjectPathState::Missing => {
-                write_new_object_dir_atomically(&object_dir, &request.bytes, &record)
-            }
-        };
+        self.commit_and_apply_mutation(mutation, || {
+            let write_result = match object_state {
+                ObjectPathState::Committed => {
+                    write_object_files_atomically(&object_dir, &request.bytes, &record)
+                }
+                ObjectPathState::Missing => {
+                    write_new_object_dir_atomically(&object_dir, &request.bytes, &record)
+                }
+            };
 
-        if let Err(error) = write_result {
-            if object_state == ObjectPathState::Missing {
-                remove_new_object_dirs_best_effort(&object_dir);
+            if let Err(error) = write_result {
+                if object_state == ObjectPathState::Missing {
+                    remove_new_object_dirs_best_effort(&object_dir);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
 
-        Ok(metadata)
+            Ok(metadata)
+        })
     }
 
     fn get_object(
@@ -233,6 +258,7 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         key: &ObjectKey,
     ) -> Result<StoredObject, StorageError> {
         let _guard = lock_storage(&self.root, "get_object")?;
+        self.recover_if_dirty()?;
         self.ensure_bucket(bucket)?;
         let encoded_key = encode_object_key(key)?;
         self.read_object(bucket, key, &encoded_key)
@@ -244,6 +270,7 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         key: &ObjectKey,
     ) -> Result<StoredObjectMetadata, StorageError> {
         let _guard = lock_storage(&self.root, "get_object_metadata")?;
+        self.recover_if_dirty()?;
         self.ensure_bucket(bucket)?;
         let encoded_key = encode_object_key(key)?;
         self.read_object_metadata(bucket, key, &encoded_key)
@@ -255,6 +282,7 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         key: &ObjectKey,
     ) -> Result<Vec<u8>, StorageError> {
         let _guard = lock_storage(&self.root, "get_object_bytes")?;
+        self.recover_if_dirty()?;
         self.ensure_bucket(bucket)?;
         let encoded_key = encode_object_key(key)?;
         self.read_object(bucket, key, &encoded_key)
@@ -267,6 +295,7 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
         options: ListObjectsOptions,
     ) -> Result<ObjectListing, StorageError> {
         let _guard = lock_storage(&self.root, "list_objects")?;
+        self.recover_if_dirty()?;
         self.ensure_bucket(bucket)?;
         if options
             .prefix
@@ -360,22 +389,25 @@ impl<C: StorageClock> Storage for FilesystemStorage<C> {
 
     fn delete_object(&self, bucket: &BucketName, key: &ObjectKey) -> Result<(), StorageError> {
         let _guard = lock_storage(&self.root, "delete_object")?;
+        self.recover_if_dirty()?;
         self.ensure_bucket(bucket)?;
         let encoded_key = encode_object_key(key)?;
         self.read_object_metadata(bucket, key, &encoded_key)?;
 
         let object_dir = self.object_dir(bucket, &encoded_key);
-        remove_dir_all(&object_dir)?;
+        self.commit_and_apply_mutation(JournalMutation::object_delete(bucket, key), || {
+            remove_dir_all(&object_dir)?;
 
-        let shard_dir = self
-            .bucket_dir(bucket)
-            .join(OBJECTS_DIR)
-            .join(encoded_key.shard());
-        if path_exists(&shard_dir)? && !directory_has_entries(&shard_dir)? {
-            remove_dir(&shard_dir)?;
-        }
+            let shard_dir = self
+                .bucket_dir(bucket)
+                .join(OBJECTS_DIR)
+                .join(encoded_key.shard());
+            if path_exists(&shard_dir)? && !directory_has_entries(&shard_dir)? {
+                remove_dir(&shard_dir)?;
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -398,6 +430,289 @@ impl<C> FilesystemStorage<C> {
             .join(OBJECTS_DIR)
             .join(encoded_key.shard())
             .join(encoded_key.as_path_component())
+    }
+
+    fn journal(&self) -> Journal {
+        Journal::new(&self.root)
+    }
+
+    fn blob_path(&self, content_sha256: &str) -> Result<PathBuf, StorageError> {
+        validate_content_sha256(content_sha256, &self.root)?;
+        Ok(self
+            .root
+            .join(BLOBS_DIR)
+            .join(&content_sha256[..2])
+            .join(content_sha256))
+    }
+
+    fn dirty_marker_path(&self) -> PathBuf {
+        self.root.join(DIRTY_MUTATION_MARKER_FILE)
+    }
+
+    fn recover_if_dirty(&self) -> Result<(), StorageError> {
+        let marker_path = self.dirty_marker_path();
+        let Some(metadata) = storage_path_metadata(&marker_path)? else {
+            return Ok(());
+        };
+        if !metadata.is_file() {
+            return Err(corrupt_state(
+                marker_path,
+                "dirty mutation marker exists but is not a file",
+            ));
+        }
+
+        self.recover_committed_journal_events()?;
+        remove_file_if_exists(&marker_path)?;
+        sync_parent_dir_best_effort(&marker_path);
+        Ok(())
+    }
+
+    fn commit_and_apply_mutation<T>(
+        &self,
+        mutation: JournalMutation,
+        apply: impl FnOnce() -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        self.write_dirty_marker()?;
+        let journal = self.journal();
+        let begin_sequence = match next_journal_sequence(&journal) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                let _ = self.clear_dirty_marker();
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = journal.append(&JournalRecord::begin(begin_sequence, mutation.clone()))
+        {
+            let _ = self.clear_dirty_marker();
+            return Err(error);
+        }
+
+        let result = match apply() {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.clear_dirty_marker();
+                return Err(error);
+            }
+        };
+
+        journal.append(&JournalRecord::commit(begin_sequence + 1, mutation))?;
+        self.clear_dirty_marker()?;
+        Ok(result)
+    }
+
+    fn write_dirty_marker(&self) -> Result<(), StorageError> {
+        write_bytes_atomically(&self.dirty_marker_path(), b"dirty\n")
+    }
+
+    fn clear_dirty_marker(&self) -> Result<(), StorageError> {
+        let marker_path = self.dirty_marker_path();
+        remove_file_if_exists(&marker_path)?;
+        sync_parent_dir_best_effort(&marker_path);
+        Ok(())
+    }
+
+    fn store_blob(&self, content_sha256: &str, bytes: &[u8]) -> Result<(), StorageError> {
+        let blob_path = self.blob_path(content_sha256)?;
+        if path_exists(&blob_path)? {
+            let stored = read_bytes(&blob_path)?;
+            validate_blob_bytes(&blob_path, content_sha256, bytes.len() as u64, &stored)?;
+            return Ok(());
+        }
+
+        write_bytes_atomically(&blob_path, bytes)?;
+        sync_parent_dir_best_effort(&blob_path);
+        Ok(())
+    }
+
+    fn recover_committed_journal_events(&self) -> Result<(), StorageError> {
+        let mut pending = None;
+        for record in self.journal().read_records()? {
+            match record.phase {
+                JournalPhase::Begin => pending = Some(record.mutation),
+                JournalPhase::Commit => {
+                    if pending.as_ref() == Some(&record.mutation) {
+                        self.recover_committed_mutation(&record.mutation)?;
+                    }
+                    pending = None;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn recover_committed_mutation(&self, mutation: &JournalMutation) -> Result<(), StorageError> {
+        match mutation {
+            JournalMutation::BucketCreate { bucket } => {
+                self.recover_bucket_create(&BucketName::new(bucket.clone()))
+            }
+            JournalMutation::BucketDelete { bucket } => {
+                self.recover_bucket_delete(&BucketName::new(bucket.clone()))
+            }
+            JournalMutation::ObjectPut {
+                bucket,
+                key,
+                content_length,
+                content_sha256,
+                etag,
+                content_type,
+                last_modified_unix_seconds,
+                last_modified_nanoseconds,
+                user_metadata,
+            } => self.recover_object_put(RecoveredObjectPut {
+                bucket: BucketName::new(bucket.clone()),
+                key: ObjectKey::new(key.clone()),
+                content_length: *content_length,
+                content_sha256: content_sha256.clone(),
+                etag: etag.clone(),
+                content_type: content_type.clone(),
+                last_modified: journal_last_modified(
+                    *last_modified_unix_seconds,
+                    *last_modified_nanoseconds,
+                    &self.dirty_marker_path(),
+                )?,
+                user_metadata: user_metadata.clone(),
+            }),
+            JournalMutation::ObjectDelete { bucket, key } => self.recover_object_delete(
+                &BucketName::new(bucket.clone()),
+                &ObjectKey::new(key.clone()),
+            ),
+        }
+    }
+
+    fn recover_bucket_create(&self, bucket: &BucketName) -> Result<(), StorageError> {
+        validate_recovered_bucket_name(bucket, &self.dirty_marker_path())?;
+        create_dir_all(&self.bucket_root())?;
+        let bucket_dir = self.bucket_dir(bucket);
+        let record = BucketRecord {
+            bucket: bucket.as_str().to_owned(),
+        };
+
+        let Some(metadata) = storage_path_metadata(&bucket_dir)? else {
+            return write_new_bucket_state_atomically(&bucket_dir, &record, bucket);
+        };
+        if !metadata.is_dir() {
+            return Err(corrupt_state(
+                bucket_dir,
+                "recovered bucket path exists but is not a directory",
+            ));
+        }
+
+        let metadata_path = self.bucket_metadata_path(bucket);
+        if path_exists(&metadata_path)? {
+            let stored = self.read_bucket_record(bucket)?;
+            validate_bucket_record(bucket, &metadata_path, &stored)?;
+        } else {
+            write_json_atomically(&metadata_path, &record)?;
+        }
+
+        let objects_dir = bucket_dir.join(OBJECTS_DIR);
+        if path_exists(&objects_dir)? {
+            require_storage_directory(&objects_dir, "missing bucket objects directory")?;
+        } else {
+            create_dir_all(&objects_dir)?;
+        }
+        sync_parent_dir_best_effort(&objects_dir);
+        Ok(())
+    }
+
+    fn recover_bucket_delete(&self, bucket: &BucketName) -> Result<(), StorageError> {
+        validate_recovered_bucket_name(bucket, &self.dirty_marker_path())?;
+        let bucket_dir = self.bucket_dir(bucket);
+        let Some(metadata) = storage_path_metadata(&bucket_dir)? else {
+            return Ok(());
+        };
+        if !metadata.is_dir() {
+            return Err(corrupt_state(
+                bucket_dir,
+                "recovered bucket path exists but is not a directory",
+            ));
+        }
+
+        remove_dir_all(&bucket_dir)
+    }
+
+    fn recover_object_put(&self, recovered: RecoveredObjectPut) -> Result<(), StorageError> {
+        validate_recovered_bucket_name(&recovered.bucket, &self.dirty_marker_path())?;
+        let encoded_key = encode_object_key(&recovered.key)?;
+        let blob_path = self.blob_path(&recovered.content_sha256)?;
+        let bytes = read_bytes(&blob_path)?;
+        validate_blob_bytes(
+            &blob_path,
+            &recovered.content_sha256,
+            recovered.content_length,
+            &bytes,
+        )?;
+        let actual_etag = etag_for_bytes(&bytes);
+        if actual_etag != recovered.etag {
+            return Err(corrupt_state(
+                blob_path,
+                "recovered blob ETag does not match journal object put",
+            ));
+        }
+
+        self.recover_bucket_create(&recovered.bucket)?;
+        let metadata = StoredObjectMetadata {
+            bucket: recovered.bucket.clone(),
+            key: recovered.key.clone(),
+            etag: recovered.etag,
+            content_length: recovered.content_length,
+            content_type: recovered.content_type,
+            last_modified: recovered.last_modified,
+            user_metadata: recovered.user_metadata,
+        };
+        let record = ObjectMetadataRecord::from_metadata(&metadata);
+        let object_dir = self.object_dir(&recovered.bucket, &encoded_key);
+        match object_path_state(&object_dir) {
+            Ok(ObjectPathState::Committed) => {
+                let existing = self.read_object(&recovered.bucket, &recovered.key, &encoded_key)?;
+                if object_matches_recovered_put(&existing, &metadata, &bytes) {
+                    return Ok(());
+                }
+
+                write_object_files_atomically(&object_dir, &bytes, &record)
+            }
+            Ok(ObjectPathState::Missing) => {
+                write_new_object_dir_atomically(&object_dir, &bytes, &record)
+            }
+            Err(StorageError::CorruptState { .. }) => {
+                remove_new_object_dirs_best_effort(&object_dir);
+                write_new_object_dir_atomically(&object_dir, &bytes, &record)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn recover_object_delete(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<(), StorageError> {
+        validate_recovered_bucket_name(bucket, &self.dirty_marker_path())?;
+        let bucket_dir = self.bucket_dir(bucket);
+        if !path_exists(&bucket_dir)? {
+            return Ok(());
+        }
+
+        let encoded_key = encode_object_key(key)?;
+        let object_dir = self.object_dir(bucket, &encoded_key);
+        if let Some(metadata) = storage_path_metadata(&object_dir)? {
+            if !metadata.is_dir() {
+                return Err(corrupt_state(
+                    object_dir,
+                    "recovered object delete path exists but is not a directory",
+                ));
+            }
+            remove_dir_all(&object_dir)?;
+        }
+
+        let shard_dir = bucket_dir.join(OBJECTS_DIR).join(encoded_key.shard());
+        if path_exists(&shard_dir)? && !directory_has_entries(&shard_dir)? {
+            remove_dir(&shard_dir)?;
+        }
+
+        Ok(())
     }
 
     fn ensure_bucket(&self, bucket: &BucketName) -> Result<(), StorageError> {
@@ -666,6 +981,17 @@ struct ObjectMetadataRecord {
     user_metadata: BTreeMap<String, String>,
 }
 
+struct RecoveredObjectPut {
+    bucket: BucketName,
+    key: ObjectKey,
+    content_length: u64,
+    content_sha256: String,
+    etag: String,
+    content_type: Option<String>,
+    last_modified: OffsetDateTime,
+    user_metadata: BTreeMap<String, String>,
+}
+
 impl ObjectMetadataRecord {
     fn from_metadata(metadata: &StoredObjectMetadata) -> Self {
         Self {
@@ -725,6 +1051,11 @@ fn object_metadata_from_path(path: &Path) -> Result<StoredObjectMetadata, Storag
 fn etag_for_bytes(bytes: &[u8]) -> String {
     let digest = Md5::digest(bytes);
     format!("\"{}\"", lower_hex(&digest))
+}
+
+fn sha256_for_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    lower_hex(&digest)
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -798,6 +1129,98 @@ fn invalid_list_objects_delimiter() -> StorageError {
     StorageError::InvalidArgument {
         message: "unsupported ListObjectsV2 delimiter".to_owned(),
     }
+}
+
+fn next_journal_sequence(journal: &Journal) -> Result<u64, StorageError> {
+    Ok(journal
+        .read_records()?
+        .last()
+        .map_or(1, |record| record.sequence + 1))
+}
+
+fn validate_recovered_bucket_name(bucket: &BucketName, path: &Path) -> Result<(), StorageError> {
+    if is_valid_s3_bucket_name(bucket.as_str()) {
+        return Ok(());
+    }
+
+    Err(corrupt_state(
+        path.to_path_buf(),
+        "journal contains an invalid bucket name",
+    ))
+}
+
+fn validate_content_sha256(content_sha256: &str, path: &Path) -> Result<(), StorageError> {
+    if content_sha256.len() == 64
+        && content_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+
+    Err(corrupt_state(
+        path.to_path_buf(),
+        "journal contains an invalid content sha256",
+    ))
+}
+
+fn validate_blob_bytes(
+    path: &Path,
+    expected_sha256: &str,
+    expected_length: u64,
+    bytes: &[u8],
+) -> Result<(), StorageError> {
+    if bytes.len() as u64 != expected_length {
+        return Err(corrupt_state(
+            path.to_path_buf(),
+            "blob content length does not match journal object put",
+        ));
+    }
+
+    let actual_sha256 = sha256_for_bytes(bytes);
+    if actual_sha256 != expected_sha256 {
+        return Err(corrupt_state(
+            path.to_path_buf(),
+            "blob content sha256 does not match journal object put",
+        ));
+    }
+
+    Ok(())
+}
+
+fn object_matches_recovered_put(
+    existing: &StoredObject,
+    recovered: &StoredObjectMetadata,
+    recovered_bytes: &[u8],
+) -> bool {
+    existing.bytes == recovered_bytes
+        && existing.metadata.bucket == recovered.bucket
+        && existing.metadata.key == recovered.key
+        && existing.metadata.etag == recovered.etag
+        && existing.metadata.content_length == recovered.content_length
+        && existing.metadata.content_type == recovered.content_type
+        && existing.metadata.last_modified == recovered.last_modified
+        && existing.metadata.user_metadata == recovered.user_metadata
+}
+
+fn journal_last_modified(
+    unix_seconds: i64,
+    nanoseconds: u32,
+    path: &Path,
+) -> Result<OffsetDateTime, StorageError> {
+    let base_time = OffsetDateTime::from_unix_timestamp(unix_seconds).map_err(|source| {
+        corrupt_state(
+            path.to_path_buf(),
+            format!("invalid journal object put last_modified_unix_seconds: {source}"),
+        )
+    })?;
+
+    base_time.replace_nanosecond(nanoseconds).map_err(|source| {
+        corrupt_state(
+            path.to_path_buf(),
+            format!("invalid journal object put last_modified_nanoseconds: {source}"),
+        )
+    })
 }
 
 fn sorted_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, StorageError> {
@@ -1545,6 +1968,17 @@ fn remove_dir(path: &Path) -> Result<(), StorageError> {
     })
 }
 
+fn remove_file_if_exists(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StorageError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 fn remove_dir_all(path: &Path) -> Result<(), StorageError> {
     require_storage_directory(path, "missing storage directory")?;
     fs::remove_dir_all(path).map_err(|source| StorageError::Io {
@@ -1565,12 +1999,13 @@ mod tests {
     use super::{
         commit_object_files, create_temporary_sibling_dir,
         fail_next_new_object_state_write_for_test, move_existing_path_to_backup,
-        replace_file_with_temporary, restore_path_backup, sibling_path, storage_path_metadata,
-        write_new_bucket_state, write_temporary_sibling, BucketRecord, FilesystemStorage,
-        StorageClock, StorageError, OBJECTS_DIR,
+        replace_file_with_temporary, restore_path_backup, sha256_for_bytes, sibling_path,
+        storage_path_metadata, write_new_bucket_state, write_temporary_sibling, BucketRecord,
+        FilesystemStorage, StorageClock, StorageError, OBJECTS_DIR,
     };
     use crate::s3::bucket::BucketName;
     use crate::s3::object::ObjectKey;
+    use crate::storage::journal::{Journal, JournalMutation, JournalPhase, JournalRecord};
     use crate::storage::key::encode_object_key;
     use crate::storage::{PutObjectRequest, Storage};
     use std::collections::BTreeMap;
@@ -1829,6 +2264,206 @@ mod tests {
         assert!(!object_dir.exists());
     }
 
+    #[test]
+    fn mutations_append_begin_commit_journal_records_and_store_blobs() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let storage =
+            FilesystemStorage::with_clock(temp_dir.path().to_path_buf(), FixedClock(fixed_time()));
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("object.txt");
+
+        storage.create_bucket(&bucket).expect("create bucket");
+        storage
+            .put_object(PutObjectRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                bytes: b"body".to_vec(),
+                content_type: Some("text/plain".to_owned()),
+                user_metadata: BTreeMap::from([("owner".to_owned(), "local".to_owned())]),
+            })
+            .expect("put object");
+        storage.delete_object(&bucket, &key).expect("delete object");
+        storage.delete_bucket(&bucket).expect("delete bucket");
+
+        let records = Journal::new(temp_dir.path())
+            .read_records()
+            .expect("read journal");
+        assert_eq!(records.len(), 8);
+        assert!(records
+            .chunks_exact(2)
+            .all(|pair| pair[0].phase == JournalPhase::Begin
+                && pair[1].phase == JournalPhase::Commit
+                && pair[0].mutation == pair[1].mutation));
+        assert!(matches!(
+            &records[0].mutation,
+            JournalMutation::BucketCreate { bucket: recorded } if recorded == "example-bucket"
+        ));
+        assert!(matches!(
+            &records[2].mutation,
+            JournalMutation::ObjectPut {
+                bucket: recorded_bucket,
+                key: recorded_key,
+                content_sha256,
+                content_type,
+                last_modified_unix_seconds,
+                last_modified_nanoseconds,
+                user_metadata,
+                ..
+            } if recorded_bucket == "example-bucket"
+                && recorded_key == "object.txt"
+                && content_sha256 == &sha256_for_bytes(b"body")
+                && content_type.as_deref() == Some("text/plain")
+                && *last_modified_unix_seconds == fixed_time().unix_timestamp()
+                && *last_modified_nanoseconds == fixed_time().nanosecond()
+                && user_metadata.get("owner").map(String::as_str) == Some("local")
+        ));
+        assert!(storage
+            .blob_path(&sha256_for_bytes(b"body"))
+            .expect("blob path")
+            .is_file());
+    }
+
+    #[test]
+    fn dirty_marker_recovers_committed_object_put_from_journal_and_blob() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let storage =
+            FilesystemStorage::with_clock(temp_dir.path().to_path_buf(), FixedClock(fixed_time()));
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("object.txt");
+        storage.create_bucket(&bucket).expect("create bucket");
+        storage
+            .put_object(PutObjectRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                bytes: b"body".to_vec(),
+                content_type: None,
+                user_metadata: BTreeMap::new(),
+            })
+            .expect("put object");
+        let encoded_key = encode_object_key(&key).expect("valid key");
+        let object_dir = storage.object_dir(&bucket, &encoded_key);
+        fs::remove_dir_all(&object_dir).expect("simulate incomplete materialized object put");
+        storage.write_dirty_marker().expect("write dirty marker");
+
+        let bytes = storage
+            .get_object_bytes(&bucket, &key)
+            .expect("read recovered object");
+
+        assert_eq!(bytes, b"body");
+        assert!(object_dir.join("content.bin").is_file());
+        assert_eq!(
+            storage
+                .get_object_metadata(&bucket, &key)
+                .expect("read recovered metadata")
+                .last_modified,
+            fixed_time()
+        );
+        assert!(!storage.dirty_marker_path().exists());
+    }
+
+    #[test]
+    fn failed_object_put_apply_is_not_committed_or_replayed() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let storage =
+            FilesystemStorage::with_clock(temp_dir.path().to_path_buf(), FixedClock(fixed_time()));
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("object.txt");
+        storage.create_bucket(&bucket).expect("create bucket");
+        fail_next_new_object_state_write_for_test();
+
+        let error = storage
+            .put_object(PutObjectRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                bytes: b"body".to_vec(),
+                content_type: None,
+                user_metadata: BTreeMap::new(),
+            })
+            .expect_err("forced object write fails");
+
+        assert!(matches!(error, StorageError::Io { .. }));
+        let records = Journal::new(temp_dir.path())
+            .read_records()
+            .expect("read journal");
+        assert!(records
+            .iter()
+            .any(|record| record.phase == JournalPhase::Begin
+                && matches!(
+                    &record.mutation,
+                    JournalMutation::ObjectPut {
+                        bucket: recorded_bucket,
+                        key: recorded_key,
+                        ..
+                    } if recorded_bucket == "example-bucket" && recorded_key == "object.txt"
+                )));
+        assert!(!records
+            .iter()
+            .any(|record| record.phase == JournalPhase::Commit
+                && matches!(
+                    &record.mutation,
+                    JournalMutation::ObjectPut {
+                        bucket: recorded_bucket,
+                        key: recorded_key,
+                        ..
+                    } if recorded_bucket == "example-bucket" && recorded_key == "object.txt"
+                )));
+        storage.write_dirty_marker().expect("write dirty marker");
+
+        let error = storage
+            .get_object_metadata(&bucket, &key)
+            .expect_err("failed put is not recovered from begin-only journal");
+
+        assert!(matches!(error, StorageError::NoSuchKey { .. }));
+        assert!(!storage.dirty_marker_path().exists());
+    }
+
+    #[test]
+    fn dirty_marker_does_not_apply_begin_only_object_put() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let storage =
+            FilesystemStorage::with_clock(temp_dir.path().to_path_buf(), FixedClock(fixed_time()));
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("object.txt");
+        storage.create_bucket(&bucket).expect("create bucket");
+        storage
+            .store_blob(&sha256_for_bytes(b"body"), b"body")
+            .expect("store blob");
+        append_begin_only_object_put(temp_dir.path(), &bucket, &key, b"body");
+        storage.write_dirty_marker().expect("write dirty marker");
+
+        let error = storage
+            .get_object_metadata(&bucket, &key)
+            .expect_err("begin-only object put is not applied");
+
+        assert!(matches!(error, StorageError::NoSuchKey { .. }));
+        assert!(!storage.dirty_marker_path().exists());
+    }
+
+    #[test]
+    fn committed_object_delete_recovery_keeps_dirty_marker_when_delete_cannot_apply() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let storage =
+            FilesystemStorage::with_clock(temp_dir.path().to_path_buf(), FixedClock(fixed_time()));
+        let bucket = BucketName::new("example-bucket");
+        let key = ObjectKey::new("object.txt");
+        storage.create_bucket(&bucket).expect("create bucket");
+        let encoded_key = encode_object_key(&key).expect("valid key");
+        let object_dir = storage.object_dir(&bucket, &encoded_key);
+        fs::create_dir_all(object_dir.parent().expect("object shard dir"))
+            .expect("create object shard dir");
+        fs::write(&object_dir, b"not a directory").expect("create blocking object path");
+        append_committed_object_delete(temp_dir.path(), &bucket, &key);
+        storage.write_dirty_marker().expect("write dirty marker");
+
+        let error = storage
+            .bucket_exists(&bucket)
+            .expect_err("failed delete recovery stops operation");
+
+        assert!(matches!(error, StorageError::CorruptState { .. }));
+        assert!(storage.dirty_marker_path().exists());
+        assert!(object_dir.is_file());
+    }
+
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     struct FixedClock(OffsetDateTime);
 
@@ -1844,6 +2479,52 @@ mod tests {
             Time::MIDNIGHT,
         )
         .assume_utc()
+    }
+
+    fn append_begin_only_object_put(
+        root: &Path,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        bytes: &[u8],
+    ) {
+        let journal = Journal::new(root);
+        let next_sequence = journal
+            .read_records()
+            .expect("read records")
+            .last()
+            .map_or(1, |record| record.sequence + 1);
+        journal
+            .append(&JournalRecord::begin(
+                next_sequence,
+                JournalMutation::object_put(
+                    bucket,
+                    key,
+                    bytes.len() as u64,
+                    sha256_for_bytes(bytes),
+                    super::etag_for_bytes(bytes),
+                    Some(crate::storage::DEFAULT_OBJECT_CONTENT_TYPE.to_owned()),
+                    fixed_time().unix_timestamp(),
+                    fixed_time().nanosecond(),
+                    BTreeMap::new(),
+                ),
+            ))
+            .expect("append begin-only object put");
+    }
+
+    fn append_committed_object_delete(root: &Path, bucket: &BucketName, key: &ObjectKey) {
+        let journal = Journal::new(root);
+        let next_sequence = journal
+            .read_records()
+            .expect("read records")
+            .last()
+            .map_or(1, |record| record.sequence + 1);
+        let mutation = JournalMutation::object_delete(bucket, key);
+        journal
+            .append(&JournalRecord::begin(next_sequence, mutation.clone()))
+            .expect("append object delete begin");
+        journal
+            .append(&JournalRecord::commit(next_sequence + 1, mutation))
+            .expect("append object delete commit");
     }
 
     fn create_file_symlink_or_skip(target: &Path, link: &Path) -> Result<(), SymlinkTestSkipped> {

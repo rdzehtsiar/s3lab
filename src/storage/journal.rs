@@ -204,6 +204,8 @@ pub enum JournalMutation {
         content_sha256: String,
         etag: String,
         content_type: Option<String>,
+        last_modified_unix_seconds: i64,
+        last_modified_nanoseconds: u32,
         user_metadata: BTreeMap<String, String>,
     },
     ObjectDelete {
@@ -232,6 +234,8 @@ impl JournalMutation {
         content_sha256: impl Into<String>,
         etag: impl Into<String>,
         content_type: Option<String>,
+        last_modified_unix_seconds: i64,
+        last_modified_nanoseconds: u32,
         user_metadata: BTreeMap<String, String>,
     ) -> Self {
         Self::ObjectPut {
@@ -241,6 +245,8 @@ impl JournalMutation {
             content_sha256: content_sha256.into(),
             etag: etag.into(),
             content_type,
+            last_modified_unix_seconds,
+            last_modified_nanoseconds,
             user_metadata,
         }
     }
@@ -326,6 +332,8 @@ mod tests {
                     "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff",
                     "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"",
                     Some("text/plain".to_owned()),
+                    1_778_400_000,
+                    123,
                     BTreeMap::from([
                         ("a-key".to_owned(), "first".to_owned()),
                         ("z-key".to_owned(), "last".to_owned()),
@@ -341,6 +349,8 @@ mod tests {
                     "b94d27b9934d3e08a52e52d7da7dabfadeadf2c7f99a9c720f7d30a85e9e0ff",
                     "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"",
                     Some("text/plain".to_owned()),
+                    1_778_400_000,
+                    123,
                     BTreeMap::from([
                         ("a-key".to_owned(), "first".to_owned()),
                         ("z-key".to_owned(), "last".to_owned()),
