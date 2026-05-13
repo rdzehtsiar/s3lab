@@ -44,7 +44,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri};
 use http_body_util::LengthLimitError;
 use percent_encoding::percent_decode_str;
 use quick_xml::escape::unescape;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesText, Event};
 use quick_xml::reader::Reader;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1633,43 +1633,22 @@ async fn put_object_route_response(
         Ok(user_metadata) => user_metadata,
         Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
     };
-    let bytes = match read_put_object_body(body, &resource, is_head, request_id).await {
-        Ok(bytes) => bytes,
-        Err(response) => return Ok(response),
-    };
-    let body = match decode_put_object_body(
-        body_encoding,
-        bytes.as_ref(),
+    let body = match read_validated_put_object_body(PutObjectBodyInput {
+        state: &state,
+        headers: &headers,
+        presigned_payload_hash: route_request.presigned_payload_hash,
+        body,
+        encoding: body_encoding,
         checksum,
-        &headers,
-        &resource,
+        resource: &resource,
+        is_head,
         request_id,
-    ) {
+    })
+    .await
+    {
         Ok(body) => body,
         Err(response) => return Ok(*response),
     };
-    for checksum in &body.checksums {
-        if let Err(response) =
-            validate_put_object_checksum(checksum, &body.bytes, &resource, request_id)
-        {
-            return Ok(*response);
-        }
-    }
-    match validate_signed_put_object_payload_hash(
-        &headers,
-        route_request.presigned_payload_hash,
-        &body.bytes,
-        &resource,
-        request_id,
-    ) {
-        Ok(Some(outcome)) => {
-            state.record_trace(TraceEvent::PayloadVerification(
-                PayloadVerificationTrace::new(request_id.as_str(), outcome),
-            ));
-        }
-        Ok(None) => {}
-        Err(response) => return Ok(*response),
-    }
 
     let result = state.storage().put_object(PutObjectRequest {
         bucket: route_request.bucket.clone(),
@@ -1835,43 +1814,22 @@ async fn upload_part_route_response(
         Ok(body_encoding) => body_encoding,
         Err(rejection) => return Ok(route_error_response(rejection, is_head, request_id)),
     };
-    let bytes = match read_put_object_body(body, &resource, is_head, request_id).await {
-        Ok(bytes) => bytes,
-        Err(response) => return Ok(response),
-    };
-    let body = match decode_put_object_body(
-        body_encoding,
-        bytes.as_ref(),
+    let body = match read_validated_put_object_body(PutObjectBodyInput {
+        state: &state,
+        headers: &headers,
+        presigned_payload_hash: route_request.presigned_payload_hash,
+        body,
+        encoding: body_encoding,
         checksum,
-        &headers,
-        &resource,
+        resource: &resource,
+        is_head,
         request_id,
-    ) {
+    })
+    .await
+    {
         Ok(body) => body,
         Err(response) => return Ok(*response),
     };
-    for checksum in &body.checksums {
-        if let Err(response) =
-            validate_put_object_checksum(checksum, &body.bytes, &resource, request_id)
-        {
-            return Ok(*response);
-        }
-    }
-    match validate_signed_put_object_payload_hash(
-        &headers,
-        route_request.presigned_payload_hash,
-        &body.bytes,
-        &resource,
-        request_id,
-    ) {
-        Ok(Some(outcome)) => {
-            state.record_trace(TraceEvent::PayloadVerification(
-                PayloadVerificationTrace::new(request_id.as_str(), outcome),
-            ));
-        }
-        Ok(None) => {}
-        Err(response) => return Ok(*response),
-    }
 
     let result = state.storage().upload_part(UploadPartRequest {
         bucket: route_request.bucket.clone(),
@@ -2847,6 +2805,80 @@ fn reject_unsupported_checksum_algorithm(
     }
 }
 
+struct PutObjectBodyInput<'a> {
+    state: &'a ServerState,
+    headers: &'a HeaderMap,
+    presigned_payload_hash: RouteResponseResult<Option<String>>,
+    body: Body,
+    encoding: PutObjectBodyEncoding,
+    checksum: PutObjectChecksum,
+    resource: &'a str,
+    is_head: bool,
+    request_id: &'a S3RequestId,
+}
+
+async fn read_validated_put_object_body(
+    input: PutObjectBodyInput<'_>,
+) -> RouteResponseResult<PutObjectBody> {
+    let bytes = read_put_object_body(input.body, input.resource, input.is_head, input.request_id)
+        .await
+        .map_err(Box::new)?;
+    let body = decode_put_object_body(
+        input.encoding,
+        bytes.as_ref(),
+        input.checksum,
+        input.headers,
+        input.resource,
+        input.request_id,
+    )?;
+    validate_put_object_body_checksums(&body, input.resource, input.request_id)?;
+    record_put_object_payload_verification(
+        input.state,
+        input.headers,
+        input.presigned_payload_hash,
+        &body.bytes,
+        input.resource,
+        input.request_id,
+    )?;
+
+    Ok(body)
+}
+
+fn validate_put_object_body_checksums(
+    body: &PutObjectBody,
+    resource: &str,
+    request_id: &S3RequestId,
+) -> RouteResponseResult<()> {
+    for checksum in &body.checksums {
+        validate_put_object_checksum(checksum, &body.bytes, resource, request_id)?;
+    }
+
+    Ok(())
+}
+
+fn record_put_object_payload_verification(
+    state: &ServerState,
+    headers: &HeaderMap,
+    presigned_payload_hash: RouteResponseResult<Option<String>>,
+    bytes: &[u8],
+    resource: &str,
+    request_id: &S3RequestId,
+) -> RouteResponseResult<()> {
+    if let Some(outcome) = validate_signed_put_object_payload_hash(
+        headers,
+        presigned_payload_hash,
+        bytes,
+        resource,
+        request_id,
+    )? {
+        state.record_trace(TraceEvent::PayloadVerification(
+            PayloadVerificationTrace::new(request_id.as_str(), outcome),
+        ));
+    }
+
+    Ok(())
+}
+
 fn decode_put_object_body(
     body_encoding: PutObjectBodyEncoding,
     bytes: &[u8],
@@ -3026,6 +3058,17 @@ fn multipart_error_response(
     )
 }
 
+#[derive(Default)]
+struct CompleteMultipartUploadParseState {
+    parts: Vec<CompletedMultipartPart>,
+    in_part: bool,
+    current_field: Option<CompleteMultipartUploadField>,
+    part_number: Option<u32>,
+    etag: Option<String>,
+    root_seen: bool,
+    root_closed: bool,
+}
+
 fn parse_complete_multipart_upload_xml(
     bytes: &[u8],
     resource: &str,
@@ -3041,137 +3084,29 @@ fn parse_complete_multipart_upload_xml(
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
-    let mut parts = Vec::new();
-    let mut in_part = false;
-    let mut current_field: Option<CompleteMultipartUploadField> = None;
-    let mut part_number: Option<u32> = None;
-    let mut etag: Option<String> = None;
-    let mut root_seen = false;
-    let mut root_closed = false;
+    let mut state = CompleteMultipartUploadParseState::default();
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
                 let qname = element.name();
                 let name = element_name(qname.as_ref());
-                if !root_seen {
-                    if name != Some("CompleteMultipartUpload") {
-                        return Err(Box::new(invalid_argument_response(
-                            "CompleteMultipartUpload XML must use a CompleteMultipartUpload root element.",
-                            resource,
-                            request_id,
-                        )));
-                    }
-                    root_seen = true;
-                    continue;
-                }
-                if root_closed {
-                    return Err(Box::new(invalid_argument_response(
-                        "CompleteMultipartUpload XML has content after the root element.",
-                        resource,
-                        request_id,
-                    )));
-                }
-                match name {
-                    Some("Part") => {
-                        in_part = true;
-                        current_field = None;
-                        part_number = None;
-                        etag = None;
-                    }
-                    Some("PartNumber") if in_part => {
-                        current_field = Some(CompleteMultipartUploadField::PartNumber);
-                    }
-                    Some("ETag") if in_part => {
-                        current_field = Some(CompleteMultipartUploadField::Etag);
-                    }
-                    _ => {
-                        current_field = None;
-                    }
-                }
+                state.handle_complete_multipart_start(name, resource, request_id)?;
             }
             Ok(Event::Empty(element)) => {
                 let qname = element.name();
-                match element_name(qname.as_ref()) {
-                    Some("CompleteMultipartUpload") if !root_seen => {
-                        root_seen = true;
-                        root_closed = true;
-                    }
-                    _ => {
-                        current_field = None;
-                    }
-                }
+                state.handle_complete_multipart_empty(element_name(qname.as_ref()));
             }
             Ok(Event::Text(text)) => {
-                if !root_seen || root_closed {
-                    return Err(Box::new(invalid_argument_response(
-                        "CompleteMultipartUpload XML text must be inside the root element.",
-                        resource,
-                        request_id,
-                    )));
-                }
-                let Some(field) = current_field else {
-                    continue;
-                };
-                let value = text
-                    .decode()
-                    .ok()
-                    .and_then(|decoded| {
-                        unescape(decoded.as_ref())
-                            .ok()
-                            .map(|text| text.into_owned())
-                    })
-                    .ok_or_else(|| {
-                        Box::new(invalid_argument_response(
-                            "CompleteMultipartUpload XML contains malformed text.",
-                            resource,
-                            request_id,
-                        ))
-                    })?;
-                match field {
-                    CompleteMultipartUploadField::PartNumber => {
-                        part_number = Some(parse_completed_xml_part_number(
-                            value.trim(),
-                            resource,
-                            request_id,
-                        )?);
-                    }
-                    CompleteMultipartUploadField::Etag => {
-                        etag = Some(value.trim().to_owned());
-                    }
-                }
+                state.handle_complete_multipart_text(text, resource, request_id)?;
             }
             Ok(Event::End(element)) => {
                 let qname = element.name();
-                match element_name(qname.as_ref()) {
-                    Some("CompleteMultipartUpload") => {
-                        root_closed = true;
-                        current_field = None;
-                    }
-                    Some("Part") if in_part => {
-                        let Some(part_number) = part_number else {
-                            return Err(Box::new(invalid_argument_response(
-                                "CompleteMultipartUpload Part is missing PartNumber.",
-                                resource,
-                                request_id,
-                            )));
-                        };
-                        let Some(etag) = etag.take() else {
-                            return Err(Box::new(invalid_argument_response(
-                                "CompleteMultipartUpload Part is missing ETag.",
-                                resource,
-                                request_id,
-                            )));
-                        };
-                        parts.push(CompletedMultipartPart { part_number, etag });
-                        in_part = false;
-                        current_field = None;
-                    }
-                    Some("PartNumber" | "ETag") => {
-                        current_field = None;
-                    }
-                    _ => {}
-                }
+                state.handle_complete_multipart_end(
+                    element_name(qname.as_ref()),
+                    resource,
+                    request_id,
+                )?;
             }
             Ok(Event::Eof) => break,
             Err(_) => {
@@ -3185,7 +3120,7 @@ fn parse_complete_multipart_upload_xml(
         }
     }
 
-    if !root_seen || !root_closed {
+    if !state.root_seen || !state.root_closed {
         return Err(Box::new(invalid_argument_response(
             "CompleteMultipartUpload XML is missing the CompleteMultipartUpload root element.",
             resource,
@@ -3193,7 +3128,7 @@ fn parse_complete_multipart_upload_xml(
         )));
     }
 
-    if parts.is_empty() {
+    if state.parts.is_empty() {
         return Err(Box::new(multipart_error_response(
             S3ErrorCode::InvalidPart,
             "CompleteMultipartUpload requires at least one Part.",
@@ -3202,7 +3137,171 @@ fn parse_complete_multipart_upload_xml(
         )));
     }
 
-    Ok(parts)
+    Ok(state.parts)
+}
+
+impl CompleteMultipartUploadParseState {
+    fn handle_complete_multipart_start(
+        &mut self,
+        name: Option<&str>,
+        resource: &str,
+        request_id: &S3RequestId,
+    ) -> RouteResponseResult<()> {
+        if !self.root_seen {
+            return self.open_complete_multipart_root(name, resource, request_id);
+        }
+        if self.root_closed {
+            return Err(Box::new(invalid_argument_response(
+                "CompleteMultipartUpload XML has content after the root element.",
+                resource,
+                request_id,
+            )));
+        }
+
+        match name {
+            Some("Part") => self.start_part(),
+            Some("PartNumber") if self.in_part => {
+                self.current_field = Some(CompleteMultipartUploadField::PartNumber);
+            }
+            Some("ETag") if self.in_part => {
+                self.current_field = Some(CompleteMultipartUploadField::Etag);
+            }
+            _ => self.current_field = None,
+        }
+
+        Ok(())
+    }
+
+    fn open_complete_multipart_root(
+        &mut self,
+        name: Option<&str>,
+        resource: &str,
+        request_id: &S3RequestId,
+    ) -> RouteResponseResult<()> {
+        if name != Some("CompleteMultipartUpload") {
+            return Err(Box::new(invalid_argument_response(
+                "CompleteMultipartUpload XML must use a CompleteMultipartUpload root element.",
+                resource,
+                request_id,
+            )));
+        }
+
+        self.root_seen = true;
+        Ok(())
+    }
+
+    fn start_part(&mut self) {
+        self.in_part = true;
+        self.current_field = None;
+        self.part_number = None;
+        self.etag = None;
+    }
+
+    fn handle_complete_multipart_empty(&mut self, name: Option<&str>) {
+        if name == Some("CompleteMultipartUpload") && !self.root_seen {
+            self.root_seen = true;
+            self.root_closed = true;
+        } else {
+            self.current_field = None;
+        }
+    }
+
+    fn handle_complete_multipart_text(
+        &mut self,
+        text: BytesText<'_>,
+        resource: &str,
+        request_id: &S3RequestId,
+    ) -> RouteResponseResult<()> {
+        if !self.root_seen || self.root_closed {
+            return Err(Box::new(invalid_argument_response(
+                "CompleteMultipartUpload XML text must be inside the root element.",
+                resource,
+                request_id,
+            )));
+        }
+        let Some(field) = self.current_field else {
+            return Ok(());
+        };
+
+        let value = decode_complete_multipart_text(text, resource, request_id)?;
+        match field {
+            CompleteMultipartUploadField::PartNumber => {
+                self.part_number = Some(parse_completed_xml_part_number(
+                    value.trim(),
+                    resource,
+                    request_id,
+                )?);
+            }
+            CompleteMultipartUploadField::Etag => {
+                self.etag = Some(value.trim().to_owned());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_complete_multipart_end(
+        &mut self,
+        name: Option<&str>,
+        resource: &str,
+        request_id: &S3RequestId,
+    ) -> RouteResponseResult<()> {
+        match name {
+            Some("CompleteMultipartUpload") => {
+                self.root_closed = true;
+                self.current_field = None;
+            }
+            Some("Part") if self.in_part => self.finish_part(resource, request_id)?,
+            Some("PartNumber" | "ETag") => self.current_field = None,
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn finish_part(&mut self, resource: &str, request_id: &S3RequestId) -> RouteResponseResult<()> {
+        let Some(part_number) = self.part_number else {
+            return Err(Box::new(invalid_argument_response(
+                "CompleteMultipartUpload Part is missing PartNumber.",
+                resource,
+                request_id,
+            )));
+        };
+        let Some(etag) = self.etag.take() else {
+            return Err(Box::new(invalid_argument_response(
+                "CompleteMultipartUpload Part is missing ETag.",
+                resource,
+                request_id,
+            )));
+        };
+
+        self.parts
+            .push(CompletedMultipartPart { part_number, etag });
+        self.in_part = false;
+        self.current_field = None;
+        Ok(())
+    }
+}
+
+fn decode_complete_multipart_text(
+    text: BytesText<'_>,
+    resource: &str,
+    request_id: &S3RequestId,
+) -> RouteResponseResult<String> {
+    text.decode()
+        .ok()
+        .and_then(|decoded| {
+            unescape(decoded.as_ref())
+                .ok()
+                .map(|text| text.into_owned())
+        })
+        .ok_or_else(|| {
+            Box::new(invalid_argument_response(
+                "CompleteMultipartUpload XML contains malformed text.",
+                resource,
+                request_id,
+            ))
+        })
 }
 
 fn parse_completed_xml_part_number(

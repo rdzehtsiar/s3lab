@@ -641,28 +641,13 @@ pub fn verify_signature(
         authorization.signed_headers(),
         request.payload_hash,
     )?;
-    let string_to_sign = build_string_to_sign(
+    verify_canonical_signature(
+        canonical_request,
         request.request_datetime,
         authorization.credential().scope(),
-        &canonical_request,
-    );
-    let scope = authorization.credential().scope();
-    let signing_key = derive_signing_key(
+        authorization.signature(),
         secret_access_key,
-        scope.date(),
-        scope.region(),
-        scope.service(),
-    );
-    let expected_signature = signature_hex(&signing_key, &string_to_sign);
-
-    if !signatures_match(&expected_signature, authorization.signature()) {
-        return Err(SigV4VerificationDiagnostic::SignatureMismatch);
-    }
-
-    Ok(SigV4Verification {
-        canonical_request,
-        string_to_sign,
-    })
+    )
 }
 
 /// Verify parsed SigV4 presigned query authorization against request components.
@@ -688,12 +673,23 @@ pub fn verify_query_signature(
         authorization.signed_headers(),
         authorization.payload_hash(),
     )?;
-    let string_to_sign = build_string_to_sign(
+    verify_canonical_signature(
+        canonical_request,
         authorization.request_datetime(),
         authorization.credential().scope(),
-        &canonical_request,
-    );
-    let scope = authorization.credential().scope();
+        authorization.signature(),
+        secret_access_key,
+    )
+}
+
+fn verify_canonical_signature(
+    canonical_request: String,
+    request_datetime: &str,
+    scope: &SigV4CredentialScope,
+    signature: &str,
+    secret_access_key: &str,
+) -> Result<SigV4Verification, SigV4VerificationDiagnostic> {
+    let string_to_sign = build_string_to_sign(request_datetime, scope, &canonical_request);
     let signing_key = derive_signing_key(
         secret_access_key,
         scope.date(),
@@ -702,7 +698,7 @@ pub fn verify_query_signature(
     );
     let expected_signature = signature_hex(&signing_key, &string_to_sign);
 
-    if !signatures_match(&expected_signature, authorization.signature()) {
+    if !signatures_match(&expected_signature, signature) {
         return Err(SigV4VerificationDiagnostic::SignatureMismatch);
     }
 

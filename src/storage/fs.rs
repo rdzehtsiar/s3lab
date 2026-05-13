@@ -844,7 +844,7 @@ impl<C> FilesystemStorage<C> {
                     temporary: None,
                 });
                 continue;
-            };
+            }
 
             let temporary = match create_temporary_sibling_dir(&target) {
                 Ok(temporary) => temporary,

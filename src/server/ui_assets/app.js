@@ -43,7 +43,7 @@ function initialize() {
     setView(button.dataset.view);
   });
   refresh.addEventListener("click", loadData);
-  window.addEventListener("hashchange", () => setView(location.hash.replace("#", "") || "dashboard", false));
+  globalThis.addEventListener("hashchange", () => setView(location.hash.replace("#", "") || "dashboard", false));
   setView(state.view, false);
   loadData();
 }
@@ -82,11 +82,18 @@ async function loadObjects() {
 }
 
 async function fetchJson(path) {
-  const response = await fetch(path, { headers: { accept: "application/json" } });
+  const response = await fetch(apiPath(path), { headers: { accept: "application/json" } });
   if (!response.ok) {
     throw new Error(`${path} returned ${response.status}`);
   }
   return response.json();
+}
+
+function apiPath(path) {
+  if (typeof path === "string" && /^\/api\/[A-Za-z0-9._~/%-]+$/.test(path)) {
+    return path;
+  }
+  throw new Error("Invalid local API path.");
 }
 
 function setView(viewId, updateHash = true) {
@@ -284,14 +291,21 @@ function table(headers, rows) {
   if (!rows.length) {
     return `<div class="placeholder empty">No local records.</div>`;
   }
+  const headerHtml = headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("");
+  const bodyHtml = rows.map((row) => tableRow(row)).join("");
   return `
     <div class="table-wrap">
       <table>
-        <thead><tr>${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("")}</tr></thead>
-        <tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${tableCell(cell)}</td>`).join("")}</tr>`).join("")}</tbody>
+        <thead><tr>${headerHtml}</tr></thead>
+        <tbody>${bodyHtml}</tbody>
       </table>
     </div>
   `;
+}
+
+function tableRow(row) {
+  const cells = row.map((cell) => `<td>${tableCell(cell)}</td>`).join("");
+  return `<tr>${cells}</tr>`;
 }
 
 function renderPlaceholder(heading, body) {
