@@ -41,7 +41,9 @@ Milestone 4 adds local storage durability tools for the current object model: a 
 
 Milestone 5 adds narrow multipart upload support for the local path-style endpoint: create a multipart upload, upload parts, list parts, complete the upload into a readable object, list the completed object, and abort an active upload. See [Milestone 5 Smoke Tests](./docs/milestone5-smoke-tests.md) for offline AWS CLI recipes.
 
-Current limitations include no virtual-host style routing, no session-token presigned URLs, no configurable credentials, no strict authentication mode, no broad multipart compatibility claim beyond the documented local workflow, no trace persistence/API/UI, no hosted backend, no production storage guarantee, no broad S3 compatibility claim, no full compatibility matrix, no full streaming chunk-signature validation, and no cross-process write locking guarantee.
+Milestone 6 adds an embedded local inspector UI served from the same Rust binary. By default, `serve` starts the S3 endpoint at `127.0.0.1:9000` and the inspector UI at `127.0.0.1:9001`; the inspector bind address can be changed with `--inspector-host` and `--inspector-port`. The inspector is a read-only local surface for recent requests, request details, buckets, objects, multipart uploads, and snapshots. See [Milestone 6 Smoke Tests](./docs/milestone6-smoke-tests.md) for the offline inspector workflow.
+
+Current limitations include no virtual-host style routing, no session-token presigned URLs, no configurable credentials, no strict authentication mode, no broad multipart compatibility claim beyond the documented local workflow, process-local in-memory request traces, read-only inspector APIs/UI, placeholder replay sessions and failure rules pages, status-only compatibility matrix page, no hosted backend, no production storage guarantee, no broad S3 compatibility claim, no full compatibility matrix, no full streaming chunk-signature validation, and no cross-process write locking guarantee.
 
 ## Intended Users
 
